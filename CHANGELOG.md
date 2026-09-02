@@ -23,6 +23,40 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `install.sh`: no-sudo bootstrap that locates or builds llama.cpp with CUDA, optionally with both patches applied.
 - BENCHMARKS.md: the full measurement record, including retractions.
 
+### Verified
+
+- End-to-end smoke test on an RTX 3060 (2026-09-02): every phase passed.
+  37.86 t/s flagship at 11,830 MiB peak, 0.8% spread, `revv compare` at 2.01x
+  time-to-done, toggle in 3.4 s, clean teardown and orphan reaping. Thinking
+  suppression, the one open risk, was confirmed against a positive control and
+  the GGUF's embedded chat template was shown byte-identical to the external
+  one on 25/25 HumanEval tasks — so no template file ships.
+
+### Fixed
+
+- `revv bench`'s thinking canary could not detect the failure it documented:
+  every request sent `chat_template_kwargs` itself, which is merged over the
+  server default and masked a broken server-side flag. The measured requests
+  now send no kwarg, and a three-arm probe (no kwarg / kwarg false / positive
+  control) reports PASS, FAIL or INCONCLUSIVE explicitly.
+- Launch flag migrated from the upstream-deprecated
+  `--chat-template-kwargs '{"enable_thinking":false}'` to `--reasoning off`.
+  Identical mechanism; revv probes `--help` and falls back automatically on
+  builds that predate it.
+- `revv down` accepts `--url`, like every other subcommand, and works without
+  a run file so an instance on a non-default port can be stopped.
+- `revv --version` reports the git short SHA when running from a checkout, and
+  `revv doctor` no longer trusts llama.cpp's build number when git-describe
+  metadata is missing — it reports the commit, which is what actually
+  identifies the build.
+- `install.sh` pins `CMAKE_CUDA_ARCHITECTURES` to the detected card instead of
+  building the whole default fan-out, honours `CUDAARCHS`, falls back to
+  `native`, and clears a stale CMake cache entry.
+- `revv bench` compares against 37.9 t/s, measured with the bench protocol,
+  rather than the 34.4/36.7 certification figures taken with a different
+  prompt. `revv compare`'s default budget is 2048 tokens so the STOCK arm
+  finishes instead of hitting the cap.
+
 ### Naming
 
 - Released as **revv**, by Mericanii. The project was developed under the

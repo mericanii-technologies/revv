@@ -372,6 +372,78 @@ If your numbers disagree with this document, that's useful information —
 post them. The protocol above is written so it can be attacked; if it's
 underspecified somewhere, that's a bug in this document.
 
+## 15. End-to-end verification of the shipped tool (2026-09-02)
+
+Everything above was measured with research harnesses. This section is
+different: it is `revv` itself, installed from this repository onto an RTX 3060
+box and driven through its own commands. Every phase of `TEST_3060.md` passed.
+
+| what | measured |
+|---|---|
+| flagship, patched build, `revv bench` | **37.86 t/s**, spread 0.8% |
+| peak VRAM for the flags revv actually launches | **11,830 MiB** |
+| v1.1 candidate (ASCII-pruned) | **40.10 t/s**, peak **11,502 MiB** |
+| `revv compare`, revv vs STOCK | 38.4 vs 22.5 t/s decode; 2.01x time-to-done |
+| toggle latency | 3.4 s and 3.8 s |
+| teardown | GPU to 1 MiB, 0 stray processes; orphan reaping worked |
+
+**The harness gap, stated plainly.** `revv bench` reads the flagship at
+37.86 t/s where the certification in Section 3 reads 34.39 t/s for the same
+build on the same card. This is not a discrepancy to be resolved — it is two
+different prompts producing different MTP acceptance rates. `revv bench`
+therefore compares your machine against 37.9, the figure measured with the
+protocol it actually runs. **Do not compare 40.10 against 34.39**; the only
+internally consistent comparison is the three-row table below, all taken with
+one harness in one session:
+
+| build | decode t/s | peak VRAM |
+|---|---:|---:|
+| v1.1 candidate (ASCII prune + merged kernel) | 40.10 | 11,502 MiB |
+| ASCII prune + stock kernel | 38.92 | 11,500 MiB |
+| flagship + merged kernel | 37.86 | 11,830 MiB |
+
+Isolating the two effects: the kernel patch is **+3.03%** here against the
++2.5% in Section 5, and the ASCII prune is **+5.92% and −328 MiB** against a
+prior +5.73% / −332 MiB. Both reproduce.
+
+**Peak VRAM is 11,830, not 11,958.** The 11,958 figure comes from the
+certification harness, whose command line differs from what revv launches (no
+`--cache-ram 0`, no `--no-cache-idle-slots`). 11,830 was independently measured
+before and is the reproducible number for revv's actual flags. revv keeps
+warning at the higher figure, because being conservative about VRAM on a card
+with 214 MiB of headroom is the correct bias.
+
+**The thinking substitution, closed.** revv uses the GGUF's embedded chat
+template and disables thinking server-side; the certification used an external
+template and a per-request kwarg. Both differences were tested:
+
+| arm | request body | reasoning emitted |
+|---|---|---|
+| A — server-side flag only | no kwarg | **0 chars** |
+| B — per-request kwarg | `enable_thinking:false` | 0 chars |
+| C — positive control | `enable_thinking:true` | **803 chars** |
+
+Arm C is what makes arm A meaningful. And a 25-task HumanEval run under revv's
+embedded template produced **byte-identical completions on 25/25 tasks** versus
+the certified run under the external template, so revv does not ship a template
+file and does not need to.
+
+**What the v1.1 candidate is, and is not.** It is the ASCII-vocab-pruned
+flagship (vocab 127,947) on the merged build: faster, and roomier at 542 MiB
+free versus 214 MiB. Its 25-task spot-check was byte-identical to the certified
+baseline, which is strong evidence of output-neutrality on that workload but is
+**not** a certification — 25 tasks bounds pass@1 only to roughly [86.7%, 100%].
+The full 164-task run has not been done. v1.1 therefore ships no headline
+accuracy number and is not the default. The prune is also ASCII/English+code by
+construction, so non-ASCII workloads are out of scope for it.
+
+**This test also found four defects in revv**, all since fixed: `revv bench`
+could not detect the failure it documented (it sent the masking kwarg itself),
+the version string reported an unreliable build number, `revv down` rejected
+`--url`, and `install.sh` built the full CUDA architecture fan-out instead of
+the detected card's. The bench defect is the instructive one: a canary that
+tests the wrong path is worse than no canary, because it reports PASS.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce byte-identical inputs:

@@ -24,6 +24,24 @@ produced them, including the ones that went against us.
 Peak VRAM at the certified config: **11,958 MiB** on a 12GB card. Full protocol,
 hardware, and raw numbers are in [BENCHMARKS.md](./BENCHMARKS.md).
 
+**Verified end-to-end on an RTX 3060: 37.9 t/s flagship, 40.1 t/s v1.1
+candidate** (byte-identical outputs, pending full-quality certification). That
+is `revv` installed from this repo and driven through its own commands, not a
+lab harness — every phase of [TEST_3060.md](./TEST_3060.md) passed. Two notes
+that keep those numbers honest:
+
+- 37.9 and 36.7 are *the same build on the same card*, measured by two
+  different harnesses. `revv bench` uses a different prompt than the
+  certification did, which changes MTP acceptance and reads ~10% higher. Use
+  37.9 when comparing against your own `revv bench`; use 36.7 when comparing
+  against the certification. Never mix them.
+- The **v1.1 candidate is not what ships.** It is an ASCII-vocab-pruned build
+  that measured 40.1 t/s at 11,502 MiB, and whose completions were
+  byte-identical to the certified baseline on a **25-task** HumanEval
+  spot-check. 25 tasks is a spot-check, not a certification; the full 164-task
+  run has not been done, so v1.1 carries no headline accuracy number and is not
+  the default.
+
 Two honesty notes, up front, so nobody has to dig for them:
 
 - The 36.7 t/s figure is the kernel-patched build. The same shipping config on

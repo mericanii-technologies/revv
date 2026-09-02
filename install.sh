@@ -50,6 +50,10 @@ Options:
 Environment:
   REVV_HOME        Where revv stores its binaries, source checkout, and build
                   manifest. Defaults to $HOME/.revv.
+  CUDAARCHS        Passed through verbatim as -DCMAKE_CUDA_ARCHITECTURES when
+                  building llama.cpp with CUDA. Defaults to the compute
+                  capability of the detected GPU(s), or 'native' if that
+                  can't be determined.
 
 If neither --patched nor --stock is given and a build is needed, this
 script prompts when run from an interactive terminal, and otherwise
@@ -357,6 +361,66 @@ MANIFEST_EOF
     echo "wrote build manifest: $BUILD_MANIFEST"
 }
 
+# Picks the -DCMAKE_CUDA_ARCHITECTURES value. Building the full default
+# fan-out (50/61/70/75/80/86/89/90...) is far slower and produces a much
+# larger binary than a build pinned to the card(s) actually present, so we
+# try hard to detect it rather than let cmake fall back on its own default.
+#
+# Sets CUDA_ARCH_REASON as a side effect, for logging by the caller.
+detect_cuda_archs() {
+    if [ -n "$CUDAARCHS" ]; then
+        CUDA_ARCH_REASON="from CUDAARCHS"
+        printf '%s\n' "$CUDAARCHS"
+        return 0
+    fi
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        CUDA_ARCH_REASON="could not detect; letting CMake probe the local card"
+        printf 'native\n'
+        return 0
+    fi
+
+    raw=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
+
+    # Convert each "8.6"-style line to "86", dedupe, and join with ';'
+    # (CMake's list separator). Bail to "BAD" on anything that doesn't look
+    # like a compute capability -- e.g. "N/A" -- so the caller falls back
+    # to 'native' instead of handing cmake garbage.
+    result=$(printf '%s\n' "$raw" | tr -d ' \r' | awk '
+        NF == 0 { next }
+        !/^[0-9]+\.[0-9]+$/ { bad = 1; exit }
+        {
+            gsub(/\./, "", $0)
+            if (!($0 in seen)) {
+                seen[$0] = 1
+                out = out (out == "" ? "" : ";") $0
+                n++
+            }
+        }
+        END {
+            if (bad || out == "") { print "BAD"; exit }
+            print out
+            print n
+        }
+    ')
+    archs=$(printf '%s\n' "$result" | sed -n '1p')
+
+    if [ "$archs" = "BAD" ] || [ -z "$archs" ]; then
+        CUDA_ARCH_REASON="could not detect; letting CMake probe the local card"
+        printf 'native\n'
+        return 0
+    fi
+
+    count=$(printf '%s\n' "$result" | sed -n '2p')
+    if [ "$count" -gt 1 ]; then
+        CUDA_ARCH_REASON="detected, $count GPUs"
+    else
+        first_cc=$(printf '%s\n' "$raw" | tr -d ' \r' | head -n 1)
+        CUDA_ARCH_REASON="detected from nvidia-smi compute_cap $first_cc"
+    fi
+    printf '%s\n' "$archs"
+}
+
 do_build() {
     check_build_tools
     setup_llama_src
@@ -373,9 +437,32 @@ do_build() {
     fi
 
     njobs=$(nproc_portable)
+
+    CUDA_ARCH=$(detect_cuda_archs)
+    echo "CUDA architecture: $CUDA_ARCH ($CUDA_ARCH_REASON)"
+    echo "  (pinned instead of the default arch fan-out -- significantly"
+    echo "  faster to build and a much smaller binary)"
+
+    # cmake caches CMAKE_CUDA_ARCHITECTURES in build/CMakeCache.txt. If a
+    # previous run configured it with a different value, cmake will happily
+    # keep using the stale one instead of picking up ours -- drop just the
+    # cache file (not the whole build dir) so the configure step below
+    # genuinely re-runs with the architecture we just chose.
+    cache_file="$LLAMA_SRC/build/CMakeCache.txt"
+    if [ -f "$cache_file" ]; then
+        cached_arch=$(sed -n 's/^CMAKE_CUDA_ARCHITECTURES:STRING=//p' "$cache_file")
+        if [ -n "$cached_arch" ] && [ "$cached_arch" != "$CUDA_ARCH" ]; then
+            echo "warning: cached CMAKE_CUDA_ARCHITECTURES ($cached_arch) differs from"
+            echo "         the target ($CUDA_ARCH) -- removing stale $cache_file"
+            echo "         so cmake reconfigures with the new value."
+            rm -f "$cache_file"
+        fi
+    fi
+
     echo "configuring build (cmake, CUDA on)..."
     if ! (cd "$LLAMA_SRC" && cmake -B build -DGGML_CUDA=ON \
-          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF); then
+          -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF \
+          -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH"); then
         fail "cmake configure failed" \
 "See the cmake output above. Common causes: the CUDA toolkit is not fully
 installed, or a stale build directory is left over from a previous failed

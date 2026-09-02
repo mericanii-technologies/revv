@@ -31,6 +31,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 __version__ = "1.0.0"
 
+
+def _git_sha() -> Optional[str]:
+    """Short SHA of the revv checkout, when revv is running from a git tree."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "-C", here, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = out.stdout.strip()
+    return sha if out.returncode == 0 and sha else None
+
+
+def version_string() -> str:
+    sha = _git_sha()
+    return "revv %s (%s)" % (__version__, sha) if sha else "revv %s" % __version__
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -69,6 +86,26 @@ THINK_LEAK_TOKENS = 350
 
 # The headline figure, used wherever "what revv delivers" is meant.
 CERT_TS = CERT_TS_PATCHED
+
+# What `revv bench` itself measures on the reference box.
+#
+# These are NOT the same numbers as CERT_* above and must not be compared with
+# them. The certification harness and the bench harness use different prompts,
+# which changes MTP acceptance and therefore decode rate: on one box, in one
+# session, the same flagship build reads 37.86 t/s under this protocol and
+# 34.39 under the certification protocol. Bench compares your machine against
+# the figure measured with the protocol bench actually runs, otherwise every
+# result would read a few percent high.
+BENCH_REF_PATCHED = 37.86     # flagship + kernel patch, RTX 3060, revv bench
+BENCH_REF_NOSPEC = 22.5       # same weights, speculation off (revv compare, STOCK)
+BENCH_PEAK_MIB = 11830        # peak during requests for the flags revv launches
+
+# v1.1 candidate: the ASCII-vocab-pruned flagship on the same merged build.
+# Faster and roomier, and byte-identical to the certified baseline on a 25-task
+# HumanEval spot-check -- but 25 tasks is not a certification, so it is not the
+# default and is not quoted as a quality result.
+V11_TS = 40.10
+V11_PEAK_MIB = 11502
 
 # A 12GB card has ~12044 MiB usable. The certified config peaks at 11958.
 # That is 86 MiB of headroom, so an X server or a stray process is the
@@ -1046,7 +1083,15 @@ def llama_server_version(exe: str) -> Optional[str]:
     blob = (out.stderr or "") + (out.stdout or "")
     m = re.search(r"version:\s*(\d+)\s*\(([0-9a-f]+)\)", blob)
     if m:
-        return "build %s (%s)" % (m.group(1), m.group(2))
+        build, commit = m.group(1), m.group(2)
+        # A clone without git-describe metadata reports "build 1" while the
+        # commit stays correct. Real llama.cpp build numbers are five digits,
+        # so anything tiny is metadata loss, not an ancient binary. Verify by
+        # commit, never by build number.
+        if len(build) < 4:
+            return "commit %s (build number unreliable: reported %s)" % (
+                commit, build)
+        return "build %s (%s)" % (build, commit)
     for line in blob.splitlines():
         if "version" in line.lower():
             return line.strip()
@@ -1805,17 +1850,52 @@ def build_server_argv(exe: str, model: str, tier: str, port: int,
             # per 8K tokens. It is off on both counts.
             "--cache-ram", "0",
             "--no-cache-idle-slots",
-            # --chat-template-kwargs is read by the jinja engine, so --jinja
-            # must be set and must come first. Disabling thinking is the
-            # largest single effect in the stack: ~2.8x wall-clock per task.
+            # The thinking switch is read by the jinja engine, so --jinja must
+            # be set and must come first. Disabling thinking is the largest
+            # single effect in the stack: ~2.8x wall-clock per task.
             "--jinja",
-            "--chat-template-kwargs", '{"enable_thinking":false}',
-        ]
+        ] + thinking_off_flags(exe)
         if use_spec:
             argv += ["--spec-type", SPEC_TYPE,
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
     argv += list(passthrough)
     return argv
+
+
+_HELP_CACHE = {}    # type: Dict[str, str]
+
+
+def server_supports(exe: str, flag: str) -> bool:
+    """Does this llama-server build accept `flag`?
+
+    Probed from --help once per binary. Needed because --chat-template-kwargs
+    is deprecated upstream in favour of --reasoning, but older builds have only
+    the former, and revv has to run on both.
+    """
+    text = _HELP_CACHE.get(exe)
+    if text is None:
+        try:
+            out = subprocess.run([exe, "--help"], capture_output=True,
+                                 text=True, timeout=30)
+            text = (out.stdout or "") + (out.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            text = ""
+        _HELP_CACHE[exe] = text
+    return flag in text
+
+
+def thinking_off_flags(exe: str) -> List[str]:
+    """The flags that disable thinking server-side, for this build.
+
+    `--reasoning off` and `--chat-template-kwargs '{"enable_thinking":false}'`
+    are the same mechanism: arg.cpp maps both onto
+    default_template_kwargs["enable_thinking"]="false", which the server seeds
+    every request from. --reasoning is simply the spelling that is not on an
+    upstream removal path.
+    """
+    if server_supports(exe, "--reasoning"):
+        return ["--reasoning", "off"]
+    return ["--chat-template-kwargs", '{"enable_thinking":false}']
 
 
 def _free_port() -> int:
@@ -2361,7 +2441,7 @@ def cmd_toggle(args: argparse.Namespace) -> int:
 # The demo. Same prompt, same weights, same GPU, both modes, one table.
 # ---------------------------------------------------------------------------
 
-def _timed_generation(base: str, thinking_off: bool, max_tokens: int,
+def _timed_generation(base: str, max_tokens: int,
                       timeout: float) -> Tuple[float, float, int, float]:
     """Return (decode t/s, time to first token, completion tokens, wall s).
 
@@ -2376,9 +2456,9 @@ def _timed_generation(base: str, thinking_off: bool, max_tokens: int,
         "seed": 1234,
         "stream": True,
         "cache_prompt": False,
+        # No chat_template_kwargs: whether the model thinks must be decided by
+        # the running mode, which is the thing being compared.
     }
-    if thinking_off:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
     req = urllib.request.Request(
         base.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -2434,8 +2514,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
             print("\r  %-5s generating...     " % mode.upper(), end="")
             sys.stdout.flush()
             tps, ttft, n_tok, wall = _timed_generation(
-                base, thinking_off=(mode == MODE_REVV),
-                max_tokens=args.max_tokens, timeout=args.timeout)
+                base, max_tokens=args.max_tokens, timeout=args.timeout)
             rows.append((mode, tps, ttft, n_tok, wall))
             print("\r  %-5s done.               " % mode.upper())
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -2587,23 +2666,33 @@ def cmd_up(args: argparse.Namespace) -> int:
 
 
 def cmd_down(args: argparse.Namespace) -> int:
-    run = read_run_file()
-    if not run:
+    run = read_run_file() or {}
+    url = getattr(args, "url", None)
+    if not run and not url:
         print("revv is not running (no %s)." % RUN_FILE)
         return 0
-    pid = int(run.get("pid") or 0)
-    base = "http://%s:%s" % (run.get("host"), run.get("port"))
+    # An explicit --url is authoritative: it is how you stop an instance that
+    # is not the one in the run file, e.g. started on another port.
+    base = url.rstrip("/") if url else \
+        "http://%s:%s" % (run.get("host"), run.get("port"))
 
-    # Ask the supervisor for the backend pid first: if the supervisor is
-    # already gone we still have to make sure no llama-server is orphaned.
+    # Ask the supervisor for both pids first. If it is already gone we still
+    # have to make sure no llama-server is left orphaned holding VRAM.
+    pid = int(run.get("pid") or 0)
     backend_pid = 0
     try:
         st = _control(base, "status", timeout=3)
         backend_pid = int(st.get("backend_pid") or 0)
+        pid = int(st.get("supervisor_pid") or 0) or pid
     except (urllib.error.URLError, OSError, ValueError):
-        # The supervisor is unreachable, which is exactly the case where an
-        # orphan is most likely. Fall back to the pid it wrote to disk.
+        # Unreachable is exactly the case where an orphan is most likely, so
+        # fall back to what the supervisor wrote to disk.
         backend_pid = int(run.get("backend_pid") or 0)
+        if url and not run:
+            die("nothing is listening at %s" % base,
+                "Check the port, or run `revv down` with no --url to stop\n"
+                "the instance recorded in %s" % RUN_FILE)
+            return 1
 
     if not pid_alive(pid):
         print("revv supervisor (pid %d) is already gone." % pid)
@@ -2749,9 +2838,9 @@ def _bench_once(base: str, timeout: float) -> BenchResult:
         "seed": 1234,
         "stream": False,
         "cache_prompt": False,  # a warm prefix would replay the previous answer
-        # Belt and braces: serve already sets this server-side, but a leaked
-        # reasoning block is the one failure that silently invalidates a result.
-        "chat_template_kwargs": {"enable_thinking": False},
+        # Deliberately NO chat_template_kwargs. A per-request kwarg is merged
+        # OVER the server's default, so sending it here would mask a broken
+        # server-side flag and measure a configuration nobody ships.
     }
     t0 = time.time()
     body = _post_json(base + "/v1/chat/completions", payload, timeout)
@@ -2777,6 +2866,84 @@ def _bench_once(base: str, timeout: float) -> BenchResult:
         return BenchResult(n_tok / wall, n_tok, wall, "wall-clock",
                            len(reasoning))
     raise RuntimeError("server returned no token counts")
+
+
+# The thinking probe.
+#
+# A per-request chat_template_kwargs is merged OVER the server's default, so a
+# probe that sends the kwarg cannot tell a working server-side flag from a
+# broken one -- it tests the request path instead. Arm A therefore sends
+# nothing and measures the shipped configuration; arm C turns thinking ON to
+# prove the detector actually fires. Without arm C, a zero in arm A is
+# unfalsifiable: a model that never emits reasoning_content would look the same
+# as one that is correctly suppressed.
+PROBE_PROMPT = "What is 17 * 23? Answer briefly."
+PROBE_MAX_TOKENS = 220
+
+
+def _probe_reasoning(base: str, kwargs: Optional[Dict[str, bool]],
+                     timeout: float) -> int:
+    """Return the number of reasoning characters the server emitted."""
+    payload = {
+        "messages": [{"role": "user", "content": PROBE_PROMPT}],
+        "max_tokens": PROBE_MAX_TOKENS,
+        "temperature": 0.0,
+        "top_k": 1,
+        "seed": 1234,
+        "stream": False,
+        "cache_prompt": False,
+    }   # type: Dict[str, object]
+    if kwargs is not None:
+        payload["chat_template_kwargs"] = kwargs
+    body = _post_json(base + "/v1/chat/completions", payload, timeout)
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return 0
+    msg = choices[0].get("message")
+    if not isinstance(msg, dict):
+        return 0
+    return len(msg.get("reasoning_content") or "")
+
+
+def thinking_check(base: str, timeout: float) -> Tuple[bool, str]:
+    """Three-arm check. Returns (ok, printable report)."""
+    arms = [
+        ("A  server-side flag only  (no kwarg)", None),
+        ("B  per-request kwarg      (false)   ", {"enable_thinking": False}),
+        ("C  positive control       (true)    ", {"enable_thinking": True}),
+    ]
+    results = []
+    for label, kwargs in arms:
+        try:
+            n = _probe_reasoning(base, kwargs, timeout)
+        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+            return False, "    probe failed: %s" % exc
+        results.append((label, n))
+
+    lines = ["    %-38s %s" % (label, "%d reasoning chars" % n)
+             for label, n in results]
+    a, c = results[0][1], results[2][1]
+    if a == 0 and c > 0:
+        lines.append("    %s thinking is off in the shipped configuration,"
+                     % green("PASS:"))
+        lines.append("          and arm C proves the detector fires when it is on.")
+        return True, "\n".join(lines)
+    if a > 0:
+        lines.append("    %s the server-side flag is NOT taking effect."
+                     % red("FAIL:"))
+        lines.append("          The model is thinking on every request: ~2.8x")
+        lines.append("          slower per task, and the BENCHMARKS.md quality")
+        lines.append("          numbers do not apply. Check that --jinja is set")
+        lines.append("          and that your GGUF's chat template honours")
+        lines.append("          enable_thinking.")
+        return False, "\n".join(lines)
+    lines.append("    %s arm A is clean but the positive control never fired,"
+                 % yellow("INCONCLUSIVE:"))
+    lines.append("          so this probe cannot distinguish 'thinking correctly")
+    lines.append("          suppressed' from 'this template never emits a")
+    lines.append("          reasoning block at all'. Treat the speed numbers as")
+    lines.append("          valid and the thinking state as unverified.")
+    return True, "\n".join(lines)
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
@@ -2834,41 +3001,40 @@ def cmd_bench(args: argparse.Namespace) -> int:
                                   if runs[0].source == "server"
                                   else "wall clock (server timings absent)"))
 
-    # The thinking canary. Every quality number this project published before
-    # 2026-09-02 was wrong because this check did not exist.
     if leaked:
-        print("\n  " + red("thinking is LEAKING"))
-        print("    The server returned a reasoning block, so enable_thinking is")
-        print("    not taking effect. The model is burning its budget on")
-        print("    reasoning: ~2.8x slower per task, and the quality numbers in")
-        print("    BENCHMARKS.md do not apply. Check that --jinja is set and")
-        print("    that your GGUF's chat template honours enable_thinking.")
+        print("\n  " + red("thinking is LEAKING") + " -- the measured requests"
+              " returned reasoning blocks.")
 
     # Compare against the figure that matches the build actually installed,
     # not the headline. Flagging a healthy stock build as "slow" would be noise.
     manifest = read_build_manifest()
     patched = bool(manifest and "mmvq_iquant_decode.patch"
                    in (manifest.get("patches") or []))
-    target = CERT_TS_PATCHED if patched else CERT_TS_STOCK
+    # Compare against the patched figure only when we know the build is
+    # patched; the +2.5% would otherwise be charged to the user's hardware.
+    target = BENCH_REF_PATCHED if patched else BENCH_REF_PATCHED / 1.025
     target_label = ("kernel-patched build" if patched else
                     "stock build" if manifest else
                     "stock build (assumed: unknown provenance)")
 
-    print("\n  " + bold("certified reference (RTX 3060 12GB, sm_86, c=16384)"))
-    print("    %-44s %6.1f t/s" % ("MTP n=2, q8_0 KV, kernel-patched",
-                                   CERT_TS_PATCHED))
-    print("    %-44s %6.1f t/s" % ("MTP n=2, q8_0 KV, stock llama.cpp",
-                                   CERT_TS_STOCK))
+    print("\n  " + bold("reference (RTX 3060 12GB, sm_86, c=16384, this "
+                        "same protocol)"))
+    print("    %-44s %6.1f t/s" % ("flagship, MTP n=2, q8_0 KV, patched",
+                                   BENCH_REF_PATCHED))
     print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
-                                   CERT_TS_NOSPEC))
-    print("    comparing against the %s" % target_label)
+                                   BENCH_REF_NOSPEC))
+    print("    %-44s %6.1f t/s" % ("v1.1 candidate (ASCII prune, not default)",
+                                   V11_TS))
+    print("    comparing against the %s (%.1f t/s)" % (target_label, target))
+    print(dim("    Certification used a different prompt and reads 34.4-36.7"))
+    print(dim("    t/s for the same build; see BENCHMARKS.md. Do not mix them."))
 
     print("\n  " + bold("reading"))
     ratio = mean / target
     if ratio >= 0.95:
         print("    %s within 5%% of the reference (%.1f t/s)."
               % (green("on target:"), target))
-    elif mean < CERT_TS_NOSPEC * 1.15:
+    elif mean < BENCH_REF_NOSPEC * 1.10:
         print("    %s %.1f t/s sits in the no-speculation regime."
               % (red("speculation is not running:"), mean))
         print("    Almost always a model without the MTP draft head. Check:")
@@ -2882,6 +3048,11 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("    %s %.0f%% of reference. Check nvidia-smi for other"
               % (red("well below:"), ratio * 100))
         print("    processes, and confirm -ngl put every layer on the GPU.")
+    print("\n  " + bold("thinking check") + dim("  (3 arms, ~%d tokens each)")
+          % PROBE_MAX_TOKENS)
+    ok, report = thinking_check(base, args.timeout)
+    print(report)
+
     print("\n  Numbers off? That is the useful case -- open an issue with this")
     print("  output, `revv doctor`, and your GPU model. BENCHMARKS.md documents")
     print("  exactly how the reference figures were produced.")
@@ -2898,7 +3069,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="revv, by Mericanii -- Qwen3.8-27B on consumer NVIDIA GPUs.",
         epilog="Start with: revv doctor")
     p.add_argument("--version", action="version",
-                   version="revv %s" % __version__)
+                   version=version_string())
     sub = p.add_subparsers(dest="command")
 
     sub.add_parser("doctor", help="check this machine and report what is possible")
@@ -2947,7 +3118,10 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--timeout", type=float, default=600.0,
                    help="seconds to wait for the model to load")
 
-    sub.add_parser("down", help="stop the background stack and its llama-server")
+    d = sub.add_parser("down",
+                       help="stop the background stack and its llama-server")
+    d.add_argument("--url", help="stop a specific instance instead of the "
+                                 "one recorded in the run file")
 
     st = sub.add_parser("status", help="show mode, model, port, uptime, VRAM")
     st.add_argument("--url", help="query a specific instance")
@@ -2961,7 +3135,9 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("compare",
                        help="run the same prompt through both modes, side by side")
     c.add_argument("--url", default="http://127.0.0.1:8080")
-    c.add_argument("--max-tokens", type=int, default=1024)
+    # STOCK thinks out loud and needs room to actually finish; capping it
+    # turns the headline ratio into a lower bound instead of a measurement.
+    c.add_argument("--max-tokens", type=int, default=2048)
     c.add_argument("--timeout", type=float, default=900.0)
 
     b = sub.add_parser("bench", help="time a running server against the reference")
