@@ -134,7 +134,11 @@ revv mode than stock before revv learned to check. **Models without a draft
 head may see little or no gain — `revv inspect` will tell you before you
 serve.** revv now picks its flags per model, says which levers apply, and when
 none do it says so plainly and serves the best-known stock config instead of
-staging a meaningless A/B.
+staging a meaningless A/B. If your model has no built-in draft head you can
+still get speculation by supplying your own drafter — `revv serve --draft
+small-model.gguf` (experimental, uncertified; community MTP drafts exist for
+some families, revv will not download one for you, and `revv bench` reports
+the acceptance rate so you can judge whether that pair is worth it).
 
 ## Roadmap
 

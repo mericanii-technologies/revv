@@ -174,6 +174,20 @@ KV_BYTES_PER_ELEM = {"f16": 2.0, "q8_0": 34.0 / 32.0, "q4_0": 18.0 / 32.0}
 COMPUTE_OVERHEAD_MIB = 666
 
 
+def is_certified_file(info: "GGUFInfo") -> bool:
+    """Is this the exact file the measured numbers came from?
+
+    Matched on size as well as name, because `revv adopt` registers ollama
+    blobs whose filename is a content hash. Name-only matching silently
+    demoted the certified model to the geometric KV estimate, which
+    over-estimates threefold on this hybrid architecture and cost the user
+    two-thirds of their context for no reason.
+    """
+    if info.file_size == BUILDS[DEFAULT_BUILD]["size"]:
+        return True
+    return os.path.basename(info.path) == str(BUILDS[DEFAULT_BUILD]["file"])
+
+
 def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
     """KV cache cost per token, or None if the header does not say enough.
 
@@ -183,7 +197,7 @@ def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
     carry no KV at all. Over-estimating is the safe direction: it makes revv
     reach for a smaller context rather than OOM.
     """
-    if os.path.basename(info.path) == str(BUILDS[DEFAULT_BUILD]["file"]):
+    if is_certified_file(info):
         return KV_MIB_PER_TOKEN.get(kv)
     if not (info.n_layer and info.n_embd and info.n_head and info.n_head_kv):
         return None
@@ -1459,7 +1473,15 @@ def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
                 "If its chat template also has no thinking mode, revv has no\n"
                 "lever left and will serve it with the best-known stock config\n"
                 "rather than pretend to tune it. revv serve will tell you which\n"
-                "case you are in." % (info.arch or "unknown"))
+                "case you are in.\n"
+                "\n"
+                "No built-in draft head. Speculation is still available via an\n"
+                "external drafter: revv serve --draft <file.gguf>. Community MTP\n"
+                "drafts exist for some models (the Gemma-4 family on HF, for\n"
+                "one). Experimental and uncertified -- revv will not download a\n"
+                "third-party drafter for you, and acceptance is a property of\n"
+                "the target/drafter pair, so measure it with revv bench."
+                % (info.arch or "unknown"))
     if info.has_mtp_head:
         return ("COMPATIBLE (has draft head -- full speed expected, "
                 "numbers not certified)",
@@ -1471,7 +1493,14 @@ def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
             "No blk.N.nextn.* tensors. Quantizers below ~8.4 GiB strip the\n"
             "MTP head, and some conversion scripts drop it. Without it\n"
             "speculative decoding cannot run and you lose ~40% of decode\n"
-            "speed. revv will start the server with speculation disabled.")
+            "speed. revv will start the server with speculation disabled.\n"
+            "\n"
+            "No built-in draft head. Speculation is still available via an\n"
+            "external drafter: revv serve --draft <file.gguf>. Community MTP\n"
+            "drafts exist for some models (the Gemma-4 family on HF, for one).\n"
+            "Experimental and uncertified -- revv will not download a\n"
+            "third-party drafter for you, and acceptance is a property of the\n"
+            "target/drafter pair, so measure it with revv bench.")
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -2012,18 +2041,29 @@ class LaunchPlan:
     """
 
     def __init__(self, ctx: int, kv: str, use_spec: bool, thinking_off: bool,
-                 notes: List[str], estimated_peak: Optional[int]) -> None:
+                 notes: List[str], estimated_peak: Optional[int],
+                 draft_path: Optional[str] = None,
+                 draft_spec_type: Optional[str] = None) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
         self.thinking_off = thinking_off
         self.notes = notes
         self.estimated_peak = estimated_peak
+        # An external drafter: a second, smaller GGUF that proposes tokens the
+        # target model verifies. Experimental and uncertified -- acceptance is
+        # a property of the PAIR, so a drafter that works well for one target
+        # can be worthless for a finetune of it.
+        self.draft_path = draft_path
+        self.draft_spec_type = draft_spec_type
 
     @property
     def levers(self) -> List[str]:
         active = []
-        if self.use_spec:
+        if self.draft_path:
+            active.append("speculation via external drafter %s [experimental]"
+                          % os.path.basename(self.draft_path))
+        elif self.use_spec:
             active.append("speculation (MTP n=%d)" % SPEC_N_MAX)
         if self.thinking_off:
             active.append("thinking off")
@@ -2039,36 +2079,91 @@ class LaunchPlan:
         there is nothing left for revv to change. Pretending otherwise would
         make `revv compare` a fake A/B.
         """
-        return not self.use_spec and not self.thinking_off and self.kv == "f16"
+        return (not self.use_spec and not self.draft_path
+                and not self.thinking_off and self.kv == "f16")
+
+
+def draft_overhead_mib(draft: Optional["GGUFInfo"], ctx: int,
+                       kv: str) -> int:
+    """VRAM the external drafter adds: its weights plus its own KV cache."""
+    if draft is None:
+        return 0
+    weights = draft.file_size / (1024.0 * 1024.0)
+    rate = kv_mib_per_token(draft, kv) or 0.0
+    return int(round(weights + ctx * rate))
 
 
 def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
-                free_mib: Optional[int]) -> LaunchPlan:
+                free_mib: Optional[int],
+                draft: Optional["GGUFInfo"] = None) -> LaunchPlan:
     t = TIERS[tier]
     preferred = explicit_ctx if explicit_ctx is not None else int(t["ctx"])
     notes = []      # type: List[str]
 
+    # An external drafter takes precedence: the user asked for it explicitly,
+    # and it is the only way to speculate on a file with no built-in head.
+    draft_spec_type = None      # type: Optional[str]
+    if draft is not None:
+        draft_spec_type = ("draft-mtp" if draft.has_mtp_head
+                           else "draft-simple")
+        notes.append("external drafter %s (%s, %s) -- speculation is "
+                     "EXPERIMENTAL and uncertified; acceptance depends on the "
+                     "target/drafter pair, so check it with revv bench"
+                     % (os.path.basename(draft.path), draft.dominant_quant,
+                        gib(draft.file_size)))
+        if draft.n_vocab and info.n_vocab and draft.n_vocab != info.n_vocab:
+            notes.append("WARNING vocab mismatch: target %s vs drafter %s. "
+                         "llama-server will usually refuse this pair"
+                         % ("{:,}".format(info.n_vocab),
+                            "{:,}".format(draft.n_vocab)))
+
     use_spec = info.has_mtp_head
-    if not use_spec:
+    if not use_spec and draft is None:
         notes.append("no MTP draft head in this file, so speculative decoding "
-                     "is off (that is where most of revv's speed comes from)")
+                     "is off (that is where most of revv's speed comes from); "
+                     "an external drafter can supply it: --draft <file.gguf>")
     thinking_off = info.supports_thinking
     if not thinking_off:
         notes.append("this model's chat template has no thinking switch, so "
                      "there is nothing to disable")
 
     # Context: the largest rung that fits, measured at q8_0 so the choice is
-    # about capacity rather than precision.
+    # about capacity rather than precision. An EXPLICIT --ctx is honoured
+    # exactly and never snapped to the ladder -- silently handing a user more
+    # context than they asked for is how you turn a deliberate choice into an
+    # OOM.
     ctx = preferred
-    if free_mib is not None:
+    if explicit_ctx is not None:
+        peak = model_peak_mib(info, ctx, str(t["kv"]))
+        if peak is not None and free_mib is not None:
+            peak += draft_overhead_mib(draft, ctx, str(t["kv"]))
+            if peak + VRAM_MARGIN_MIB > free_mib:
+                notes.append("--ctx %s needs ~%s but only %s is free; expect a "
+                             "CUDA OOM" % ("{:,}".format(ctx), mib(peak),
+                                           mib(free_mib)))
+    elif free_mib is not None:
         chosen = None
         for cand in CONTEXT_LADDER:
             if cand > preferred:
                 continue
             peak = model_peak_mib(info, cand, "q8_0")
+            if peak is not None:
+                peak += draft_overhead_mib(draft, cand, "q8_0")
             if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
                 chosen = cand
                 break
+        if chosen is None:
+            # Nothing fits at q8_0. Retry at q4_0 before giving up context:
+            # halving the cache is cheaper than an eighth of the context.
+            for cand in CONTEXT_LADDER:
+                if cand > preferred:
+                    continue
+                peak = model_peak_mib(info, cand, "q4_0")
+                if peak is not None:
+                    peak += draft_overhead_mib(draft, cand, "q4_0")
+                if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
+                    chosen = cand
+                    break
         if chosen is None:
             chosen = CONTEXT_LADDER[-1]
         if chosen != preferred:
@@ -2084,6 +2179,8 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         pass                            # tier was forced; keep its setting
     else:
         f16_peak = model_peak_mib(info, ctx, "f16")
+        if f16_peak is not None:
+            f16_peak += draft_overhead_mib(draft, ctx, "f16")
         if f16_peak is not None and f16_peak + VRAM_MARGIN_MIB <= free_mib:
             if kv != "f16":
                 notes.append("f16 KV fits (~%s of %s free) and is the faster "
@@ -2093,6 +2190,8 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         else:
             for cand in ("q8_0", "q4_0"):
                 peak = model_peak_mib(info, ctx, cand)
+                if peak is not None:
+                    peak += draft_overhead_mib(draft, ctx, cand)
                 if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
                     kv = cand
                     break
@@ -2103,8 +2202,15 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                              "cache is %s to fit"
                              % (mib(f16_peak), mib(free_mib), kv))
 
-    return LaunchPlan(ctx, kv, use_spec, thinking_off, notes,
-                      model_peak_mib(info, ctx, kv))
+    peak = model_peak_mib(info, ctx, kv)
+    if peak is not None:
+        peak += draft_overhead_mib(draft, ctx, kv)
+        if free_mib is not None and peak + VRAM_MARGIN_MIB > free_mib:
+            notes.append("WARNING estimated peak ~%s exceeds %s free once the "
+                         "drafter is counted; reduce --ctx if this OOMs"
+                         % (mib(peak), mib(free_mib)))
+    return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
+                      draft.path if draft else None, draft_spec_type)
 
 
 def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
@@ -2139,7 +2245,16 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
         # does not implement is simply a lie in the log.
         if plan.thinking_off:
             argv += thinking_off_flags(exe)
-        if plan.use_spec:
+        if plan.draft_path:
+            # An external drafter. draft-mtp when the file carries an MTP head,
+            # draft-simple for an ordinary small model used as the drafter.
+            argv += ["--spec-type", plan.draft_spec_type or "draft-simple",
+                     "--spec-draft-model", plan.draft_path,
+                     # Keep the drafter on the GPU; a CPU drafter's latency
+                     # eats the entire speculation win at batch 1.
+                     "--spec-draft-ngl", "99",
+                     "--spec-draft-n-max", str(SPEC_N_MAX)]
+        elif plan.use_spec:
             argv += ["--spec-type", SPEC_TYPE,
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
     argv += list(passthrough)
@@ -2298,12 +2413,15 @@ class _Stats:
         self.n_requests = 0
 
 
-def _sse_token_count(body: bytes) -> Tuple[int, Optional[float], Optional[int]]:
+def _sse_token_count(body: bytes) -> Tuple[int, Optional[float],
+                                           Optional[int], int, int]:
     """Walk a server-sent-event body: (content chunks, t/s if the server
     reported it, completion tokens if reported)."""
     chunks = 0
     tps = None      # type: Optional[float]
     n_tok = None    # type: Optional[int]
+    draft_n = 0
+    draft_acc = 0
     for raw in body.split(b"\n"):
         if not raw.startswith(b"data: "):
             continue
@@ -2326,10 +2444,13 @@ def _sse_token_count(body: bytes) -> Tuple[int, Optional[float], Optional[int]]:
         if isinstance(timings, dict) and timings.get("predicted_per_second"):
             tps = float(timings["predicted_per_second"])
             n_tok = int(timings.get("predicted_n") or 0) or None
+        if isinstance(timings, dict) and timings.get("draft_n"):
+            draft_n = int(timings.get("draft_n") or 0)
+            draft_acc = int(timings.get("draft_n_accepted") or 0)
         usage = obj.get("usage")
         if isinstance(usage, dict) and usage.get("completion_tokens"):
             n_tok = int(usage["completion_tokens"])
-    return chunks, tps, n_tok
+    return chunks, tps, n_tok, draft_n, draft_acc
 
 
 def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
@@ -2484,7 +2605,7 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
             n_tok = None        # type: Optional[int]
             tps = None          # type: Optional[float]
             if body.startswith(b"data:") or b"\ndata: " in body[:4096]:
-                chunks, tps, n_tok = _sse_token_count(body)
+                chunks, tps, n_tok, _, _ = _sse_token_count(body)
                 if tps is None and t_first is not None and chunks > 1:
                     tps = (chunks - 1) / max(now - t_first, 1e-6)
                 if n_tok is None:
@@ -2599,7 +2720,20 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
         die("cannot read %s: %s" % (model, exc))
         return 1
     mode = MODE_STOCK if args.stock else MODE_REVV
-    plan = plan_launch(info, tier, args.ctx, free_mib)
+
+    draft_info = None       # type: Optional[GGUFInfo]
+    if args.draft:
+        if not os.path.isfile(args.draft):
+            die("no such draft model: %s" % args.draft,
+                "--draft takes a path to a .gguf file you already have.\n"
+                "revv never downloads third-party drafters for you.")
+            return 1
+        try:
+            draft_info = read_gguf(args.draft)
+        except GGUFError as exc:
+            die("cannot read the draft model: %s" % exc)
+            return 1
+    plan = plan_launch(info, tier, args.ctx, free_mib, draft_info)
 
     if args.print_command:
         argv = build_server_argv(exe, model, plan, args.port, mode,
@@ -2777,12 +2911,19 @@ class GenResult:
     """
 
     def __init__(self, server_tps: Optional[float], client_tps: float,
-                 ttft: float, n_tok: int, wall: float) -> None:
+                 ttft: float, n_tok: int, wall: float, draft_n: int = 0,
+                 draft_accepted: int = 0) -> None:
         self.server_tps = server_tps
         self.client_tps = client_tps
         self.ttft = ttft
         self.n_tok = n_tok
         self.wall = wall
+        self.draft_n = draft_n
+        self.draft_accepted = draft_accepted
+
+    @property
+    def acceptance(self) -> Optional[float]:
+        return self.draft_accepted / self.draft_n if self.draft_n else None
 
     @property
     def tps(self) -> float:
@@ -2843,7 +2984,8 @@ def _timed_generation(base: str, max_tokens: int,
             body += line
     t_end = time.time()
     wall = t_end - t0
-    chunks, server_tps, n_tok = _sse_token_count(bytes(body))
+    chunks, server_tps, n_tok, draft_n, draft_acc = _sse_token_count(
+        bytes(body))
     if t_first is None:
         t_first = t0
     if n_tok is None:
@@ -2851,7 +2993,8 @@ def _timed_generation(base: str, max_tokens: int,
     # Client-observed decode rate: tokens after the first, over the time spent
     # streaming them. Never mixed with the server figure -- reported alongside.
     client_tps = (chunks - 1) / max(t_end - t_first, 1e-6) if chunks > 1 else 0.0
-    return GenResult(server_tps, client_tps, t_first - t0, int(n_tok), wall)
+    return GenResult(server_tps, client_tps, t_first - t0, int(n_tok), wall,
+                     draft_n, draft_acc)
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -2934,6 +3077,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
     if stock.wall > 0:
         print("  time to done  %.2fx faster  (%.1fs -> %.1fs)"
               % (stock.wall / fast.wall, stock.wall, fast.wall))
+    for mode, res in rows:
+        if res.acceptance is not None:
+            print("  acceptance    %s %.3f (%d/%d drafted tokens kept)"
+                  % (mode.upper(), res.acceptance, res.draft_accepted,
+                     res.draft_n))
     if fast.n_tok and stock.n_tok > fast.n_tok:
         print("  tokens spent  %d -> %d  (STOCK thinks out loud; revv does not)"
               % (stock.n_tok, fast.n_tok))
@@ -3033,7 +3181,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     if args.model:
         argv.append(args.model)
     for flag, value in (("--port", args.port), ("--host", args.host),
-                        ("--ctx", args.ctx), ("--tier", args.tier)):
+                        ("--ctx", args.ctx), ("--tier", args.tier),
+                        ("--draft", args.draft)):
         if value is not None:
             argv += [flag, str(value)]
     if args.stock:
@@ -3238,12 +3387,25 @@ def _post_json(url: str, payload: Dict[str, object],
 
 class BenchResult:
     def __init__(self, ts: float, n_tok: int, wall: float, source: str,
-                 reasoning_chars: int) -> None:
+                 reasoning_chars: int, draft_n: int = 0,
+                 draft_accepted: int = 0) -> None:
         self.ts = ts
         self.n_tok = n_tok
         self.wall = wall
         self.source = source
         self.reasoning_chars = reasoning_chars
+        self.draft_n = draft_n
+        self.draft_accepted = draft_accepted
+
+    @property
+    def acceptance(self) -> Optional[float]:
+        """Fraction of drafted tokens the target model kept.
+
+        Only meaningful with speculation on. It is a property of the
+        target/drafter PAIR, not of either model alone -- which is why an
+        external drafter has to be measured rather than assumed.
+        """
+        return self.draft_accepted / self.draft_n if self.draft_n else None
 
 
 def _bench_once(base: str, timeout: float) -> BenchResult:
@@ -3273,15 +3435,19 @@ def _bench_once(base: str, timeout: float) -> BenchResult:
             reasoning = msg.get("reasoning_content") or ""
 
     timings = body.get("timings")
+    d_n, d_acc = 0, 0
+    if isinstance(timings, dict):
+        d_n = int(timings.get("draft_n") or 0)
+        d_acc = int(timings.get("draft_n_accepted") or 0)
     if isinstance(timings, dict) and timings.get("predicted_per_second"):
         # llama-server's own decode rate: excludes prefill, and is the exact
         # quantity the re-certification table reports.
         return BenchResult(float(timings["predicted_per_second"]),
                            int(timings.get("predicted_n") or n_tok), wall,
-                           "server", len(reasoning))
+                           "server", len(reasoning), d_n, d_acc)
     if n_tok:
         return BenchResult(n_tok / wall, n_tok, wall, "wall-clock",
-                           len(reasoning))
+                           len(reasoning), d_n, d_acc)
     raise RuntimeError("server returned no token counts")
 
 
@@ -3417,6 +3583,20 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print("    measured by %s" % ("llama-server timings"
                                   if runs[0].source == "server"
                                   else "wall clock (server timings absent)"))
+    total_draft = sum(r.draft_n for r in runs)
+    if total_draft:
+        acc = sum(r.draft_accepted for r in runs) / float(total_draft)
+        print("    acceptance  %.3f  (%d of %d drafted tokens kept)"
+              % (acc, sum(r.draft_accepted for r in runs), total_draft))
+        # The certified built-in head sits at 0.781 on a novel prompt. An
+        # external drafter is a different pair and has no reference value.
+        if acc < 0.35:
+            print("    %s acceptance this low usually means the drafter is a"
+                  % yellow("note:"))
+            print("          poor match for this target; speculation may be a")
+            print("          net loss. Compare against --stock to be sure.")
+    elif any(r.source == "server" for r in runs):
+        print("    acceptance  n/a (no speculation active)")
 
     if leaked:
         print("\n  " + red("thinking is LEAKING") + " -- the measured requests"
@@ -3520,6 +3700,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--tier", help="force a tier instead of detecting one")
         sp.add_argument("--stock", action="store_true",
                         help="start in STOCK mode (llama.cpp defaults)")
+        sp.add_argument("--draft", metavar="FILE.GGUF",
+                        help="external draft model for speculative decoding, "
+                             "for targets with no built-in head "
+                             "(experimental, uncertified)")
 
     s = sub.add_parser(
         "serve", help="run the stack in the foreground (verbose; for debugging)",

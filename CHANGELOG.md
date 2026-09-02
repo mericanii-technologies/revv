@@ -40,6 +40,36 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the GGUF's embedded chat template was shown byte-identical to the external
   one on 25/25 HumanEval tasks — so no template file ships.
 
+### Added
+
+- **External draft models.** `revv serve --draft <file.gguf>` / `revv up
+  --draft ...` enables speculative decoding on targets with no built-in MTP
+  head, via llama-server's `--spec-draft-model`. revv reads the drafter's
+  header to choose `draft-mtp` or `draft-simple`, keeps it on the GPU, charges
+  its weights and KV against free VRAM when sizing context, and warns on a
+  vocabulary mismatch before llama-server refuses the pair. Experimental and
+  uncertified: revv never downloads a third-party drafter, and `revv bench`
+  now reports the acceptance rate, because acceptance is a property of the
+  target/drafter PAIR — a drafter that suits a base model can be worthless on
+  a finetune of it. `revv compare` reports acceptance per mode too.
+
+### Fixed
+
+- **The certified model was demoted when adopted from ollama.** Model identity
+  was matched on filename, but `revv adopt` registers ollama blobs whose
+  filename is a content hash, so the certified file fell through to the
+  geometric KV estimate — which over-estimates threefold on this hybrid
+  architecture and cost two-thirds of the context (ctx 4,096 + q4_0 instead of
+  8,192 + q8_0 at 11,744 MiB free). Identity is now matched on exact file size
+  as well as name.
+- An explicit `--ctx` below the smallest ladder rung was silently snapped
+  upward (`--ctx 2048` became 4096), quietly handing out more context than
+  asked for. Explicit contexts are now honoured exactly, with a warning if the
+  arithmetic says they will not fit.
+- When no context fitted at q8_0, the planner jammed context to the floor and
+  KV to q4_0 together; it now retries the ladder at q4_0 first, since halving
+  the cache is cheaper than losing seven-eighths of the context.
+
 ### Changed
 
 - **revv now picks its flags per model instead of applying the Qwen-certified
