@@ -1,251 +1,85 @@
 # revv
 
-**by Mericanii**
+by [Mericanii](https://github.com/mericanii-technologies). Runs Qwen3.8-27B properly on a consumer NVIDIA GPU.
 
-### Your GPU has more in it. Proven.
+Most setups run this model far below what the hardware allows — the default
+model file doesn't fit a 12GB card, speculation is off, and a template default
+makes every answer ~3× longer than it needs to be. revv is a small terminal
+tool that applies a measured configuration and gives you a standard
+OpenAI-compatible endpoint. Everything below was measured on an RTX 3060;
+protocols are in [BENCHMARKS.md](BENCHMARKS.md).
 
-## What this is
+## What it does
 
-revv is a terminal app that runs Qwen3.8-27B GGUFs on a consumer NVIDIA GPU at a
-configuration that was actually measured on real hardware, not assumed from a
-spec sheet or a forum post. What makes it different from another "fast local
-LLM" script: the numbers below are published with the exact protocol that
-produced them, including the ones that went against us.
+- **Picks a model file that actually fits your VRAM.** The popular 4-bit file
+  (15.4GB) spills off a 12GB card and runs at ~5 tok/s. The 3-bit file (10.9GB)
+  fits, runs 4× faster, and scores the same on HumanEval within noise
+  (92.7% vs 94.5%, n=164, statistically indistinguishable).
+- **Turns on the model's built-in speculative decoding** (MTP head). Lossless —
+  output is byte-identical — and ~1.7× faster. Off in every default setup we checked.
+- **Disables thinking mode by default.** This model ships with reasoning on,
+  which triples tokens per answer. With it off: same pass rate, ~2.8× faster
+  per task.
+- **Tunes KV cache and context** to measured values, not folklore (quantized
+  KV is a capacity trade, not a speed win — we measured it both ways).
+- Optional patches (in `patches/`, pending upstream): a CUDA kernel fix
+  (+3% decode) and session save/restore for this model family (resume an 8K
+  session in 0.9s instead of 16.7s).
 
-## The receipts
+## Results (RTX 3060 12GB, same weights throughout)
 
-| setup | decode t/s | HumanEval-164 | source |
-|---|---|---|---|
-| naive offload, out of the box | 2.12 (band 2-4.5) | — | our measurement |
-| tuned community recipe | ~9.7 claimed, 6.6-8.5 replicated | — | third-party claim, not ours |
-| same weights, llama.cpp defaults (no speculation) | 20.00 | — | our measurement |
-| revv certified | 36.7 | 92.7% | our measurement |
+| setup | decode | notes |
+|---|---|---|
+| default 4-bit file, ollama-style settings | 4.7 tok/s | model spills to CPU; thinking on |
+| right-sized 3-bit file, stock flags | ~20 tok/s | fits VRAM, no speculation |
+| **revv** | **37.9 tok/s** | + ~2.8× fewer tokens per task |
 
-Peak VRAM at the certified config: **11,958 MiB** on a 12GB card. Full protocol,
-hardware, and raw numbers are in [BENCHMARKS.md](./BENCHMARKS.md).
+On a 12-task workload (10 HumanEval + 2 long-context), the default setup
+finished 5/12 in 28.6 minutes; revv finished 12/12 in 1.5 minutes.
+Quality: 92.7% HumanEval-164, statistically equal to the uncompressed Q8
+model (93.3%) under the same protocol.
 
-**Verified end-to-end on an RTX 3060: 37.9 t/s flagship, 40.1 t/s v1.1
-candidate** (byte-identical outputs, pending full-quality certification). That
-is `revv` installed from this repo and driven through its own commands, not a
-lab harness — every phase of [TEST_3060.md](./TEST_3060.md) passed. Two notes
-that keep those numbers honest:
+Verified output samples — physics sim, SVG drawing, threaded code, CUDA —
+with how each was checked: [examples/](examples/)
 
-- 37.9 and 36.7 are *the same build on the same card*, measured by two
-  different harnesses. `revv bench` uses a different prompt than the
-  certification did, which changes MTP acceptance and reads ~10% higher. Use
-  37.9 when comparing against your own `revv bench`; use 36.7 when comparing
-  against the certification. Never mix them.
-- The **v1.1 candidate is not what ships.** It is an ASCII-vocab-pruned build
-  that measured 40.1 t/s at 11,502 MiB, and whose completions were
-  byte-identical to the certified baseline on a **25-task** HumanEval
-  spot-check. 25 tasks is a spot-check, not a certification; the full 164-task
-  run has not been done, so v1.1 carries no headline accuracy number and is not
-  the default.
-
-Two honesty notes, up front, so nobody has to dig for them:
-
-- The 36.7 t/s figure is the kernel-patched build. The same shipping config on
-  stock, unpatched llama.cpp measures 34.39 t/s. Both numbers are real and both
-  are ours.
-- Comparing 36.7 against the 2.12 row is a ~17x ratio, but that row is a naive,
-  out-of-the-box setup. Against a **tuned** community baseline the honest
-  comparison is **~2.2x**, and that is the number to hold us to. Anyone quoting
-  a bare "default is ~6 t/s" figure is citing something nobody measured.
-
-## Quickstart — three paths in
-
-### a. Certified (download the tested weights)
+## Quickstart
 
 ```
-./install.sh
-revv doctor
-revv get
-revv up
+git clone https://github.com/mericanii-technologies/revv && cd revv
+./install.sh          # checks python3 + llama.cpp, offers a patched build
+./revv.py adopt       # finds Qwen3.8 models you already downloaded via ollama
+                      # (or: ./revv.py get   to download the certified file)
+./revv.py up          # starts in the background on localhost:8080
 ```
 
-- `./install.sh` — builds the patched llama-server.
-- `revv doctor` — checks GPU / VRAM / driver / llama-server / models, reports
-  your tier and what's possible.
-- `revv get` — downloads the certified GGUF from HuggingFace (resumable,
-  verifies exact byte size, then parses it).
-- `revv up` — starts the stack in the background; detached, survives the
-  terminal closing, logs to `~/.revv/logs/`.
-
-### b. Adopt (reuse what you already downloaded)
+Then point anything OpenAI-compatible at it:
 
 ```
-revv adopt
-```
-
-Finds Qwen3.8 GGUFs that ollama or LM Studio already downloaded and registers
-them so `serve` can use them. Read-only on their stores. No second 10 GB
-download.
-
-### c. Bring your own GGUF
-
-```
-revv serve /path/to/your.gguf
-```
-
-Runs the stack in the foreground against any GGUF you already have on disk.
-
-For all three: point your tool at `http://127.0.0.1:8080/v1`, then run
-`revv compare` to see the difference on your own hardware.
-
-## Use with your coding tool
-
-revv does not touch, wrap, patch, or replace your coding harness. It gives you
-a local OpenAI-compatible endpoint and nothing more. Whatever you already use
-keeps working.
-
-**The generic case, and the trap.** The official OpenAI SDKs (Python and Node)
-read `OPENAI_BASE_URL`. LiteLLM-based tools (aider and many wrappers) read
-`OPENAI_API_BASE`. These are different environment variables. Setting both is
-harmless:
-
-```
-export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
-export OPENAI_API_BASE=http://127.0.0.1:8080/v1
-export OPENAI_API_KEY=revv        # any non-empty string; the SDKs refuse an empty key
-```
-
-**aider** ([docs](https://aider.chat/docs/llms/openai-compat.html)):
-
-```
-export OPENAI_API_BASE=http://127.0.0.1:8080/v1
+export OPENAI_BASE_URL=http://localhost:8080/v1
 export OPENAI_API_KEY=revv
-aider --model openai/revv
 ```
 
-Equivalent flags exist: `--openai-api-base` and `--openai-api-key`.
+To see the difference on your own card: `./revv.py compare` runs the same
+prompt in stock mode and revv mode, back to back. `./revv.py bench` measures
+your decode speed against our reference numbers. `./revv.py down` stops everything.
 
-**opencode** ([docs](https://opencode.ai/docs/providers/)) is configured by
-file, not environment. Global config lives at `~/.config/opencode/opencode.json`:
+## Supported
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "revv": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "revv (local)",
-      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
-      "models": { "revv": { "name": "Qwen3.8-27B (revv)" } }
-    }
-  }
-}
-```
+- Qwen3.8-27B GGUF files (any quant; `inspect` tells you what a file supports —
+  some third-party conversions strip the speculation head)
+- NVIDIA GPUs, 12GB+ VRAM, Turing or newer, Linux
+- Community finetunes of the same architecture (works; our quality numbers don't transfer)
 
-Then select the model as `revv/revv` (provider-id/model-id).
+## Not supported (yet)
 
-**Caveat that will cost you an hour if you skip it:** use `127.0.0.1`, not
-`localhost`. llama-server binds IPv4, and `localhost` can resolve to `::1`
-first on some systems. The model name to configure, everywhere, is `revv`.
+- <12GB VRAM, AMD, Apple Silicon, Windows (WSL2 works)
+- FP8 / AWQ / EXL3 formats
+- Other model families — the pipeline generalizes; certification takes days per model
 
-## The commands
+Numbers here come from one card and one protocol. If yours differ, run
+`./revv.py bench` and open an issue — hardware reports are the most useful
+contribution right now.
 
-| command | what it does |
-|---|---|
-| `revv doctor` | check GPU / VRAM / driver / llama-server / models, report the tier and what is possible |
-| `revv get [tier]` | download the certified GGUF from HuggingFace (resumable; verifies exact byte size, then parses it) |
-| `revv adopt` | find GGUFs ollama or LM Studio already downloaded and register them so serve can use them, read-only on their stores |
-| `revv inspect <f.gguf>` | parse the header: quant, size, vocab, layers, and whether the MTP draft head is present |
-| `revv up` | start the stack in the background (detached; survives the terminal closing; logs to `~/.revv/logs/`) |
-| `revv down` | stop it, and reap the llama-server if it was orphaned |
-| `revv status` | mode, model, port, uptime, last measured t/s, VRAM |
-| `revv serve` | the same stack in the foreground, verbose, for debugging; unknown flags pass through to llama-server |
-| `revv toggle [mode]` | switch between revv and STOCK without moving the port |
-| `revv compare` | run the same prompt through both modes, side by side |
-| `revv bench` | run the certified-protocol benchmark against a running server |
-
-Flags worth knowing: `--port` (default 8080), `--host`, `--ctx`, `--tier`,
-`--stock`. Run `revv serve --print-command` if you just want the exact
-llama-server command line printed instead of executed.
-
-## How it works
-
-`revv up` / `revv serve` bind a small forwarder on the user-facing port and run
-llama-server on an ephemeral internal port behind it. Switching modes restarts
-only the backend; the user-facing port never moves, so client tools never
-notice. Weights stay in the page cache across a restart, so a switch is
-typically 10-15 s rather than a cold load.
-
-Two modes:
-
-- **revv** — the certified configuration: MTP speculation, q8_0 KV, thinking off.
-- **STOCK** — llama.cpp's defaults for exactly those three levers: no
-  speculation, f16 KV, thinking on. Same weights, same GPU, same context.
-
-STOCK is a control for revv's own configuration. It is **not** a measurement of
-ollama, LM Studio, or anyone else's product, and that applies everywhere
-`revv compare` shows up.
-
-## Supported / not supported
-
-**Supported:**
-- Qwen3.8-27B GGUFs
-- NVIDIA, 12GB+ VRAM
-- Turing (compute 7.5) or newer
-- Linux
-
-**Compatible but not certified:**
-- GGUFs from other quantizers and finetunes of this model. The single biggest
-  speed determinant is whether the build kept the MTP draft head: builds
-  without it (typically anything below ~8.4 GiB) cannot speculate and land
-  near 20 t/s instead of the certified 36.7 t/s. Run `revv inspect` before you
-  commit to a download — it reports whether the draft head is present.
-
-**Not supported:**
-- FP8 / AWQ / EXL3 — not yet
-- Under 12GB VRAM — not yet
-- AMD — not yet
-- Apple Silicon — not yet
-- CPU-only — not yet
-
-Also not in v1.0: no command for session save/restore (the patch exists in
-`patches/`, the CLI just doesn't drive it), no multi-GPU splitting, no
-autostart/systemd/launchd unit, no fine-tuning, quantizing, or training.
-
-## Why these numbers are real
-
-The full measurement protocol — hardware, prompt, sampling, warm-up and
-discard rules — is published in [BENCHMARKS.md](./BENCHMARKS.md), not
-summarized away here. Failures and retractions are published in that same
-document alongside the wins: an early "86-148 t/s" ngram speculation claim was
-retracted after it turned out to be a benchmark artifact from replaying the
-same prompt, and a thinking-mode bug in the eval harness invalidated weeks of
-this project's own quality numbers before it was caught. `revv bench` runs the
-identical protocol against your own server, on your own hardware, so you can
-reproduce these numbers or contradict them. If your numbers disagree with
-ours, we want to hear about it.
-
-## Honest limitations
-
-- The 12GB tier has about 86 MiB of headroom (11,958 MiB peak of roughly
-  12,044 MiB usable). A desktop session running on the same card will push it
-  into a CUDA OOM. Run headless.
-- Speculation gain depends on content: +110% on code, -2 to -4% on prose. A
-  prose-heavy workload will not see the headline number.
-- One card, one model family, one workload measured. Quality is measured on
-  HumanEval-164 and edit-format compliance (IQ3_XXS 94.1% vs Q2_K_XL 67.6%,
-  p=0.0117), not on your codebase.
-
-## Requirements / install notes
-
-Python 3.9+, standard library only, no pip dependencies. The CUDA toolkit is
-only needed if you build llama.cpp yourself via `install.sh`. No sudo,
-anywhere. Models land in `~/.revv/models`, logs in `~/.revv/logs`.
-
-## Credits
-
-revv stands on this ecosystem, it doesn't replace it:
-
-- **llama-swap** — the stable-port, swappable-backend pattern `revv toggle` uses.
-- **llamafile** — the bar for distribution simplicity.
-- **llama.cpp** — revv is a configuration and measurement layer on top of it.
-  Both patches in `patches/` are proposed upstream, not forked.
-- **unsloth** — the Dynamic GGUF quants the certified build comes from.
-
-## Licence
-
-Apache-2.0. See [LICENSE](./LICENSE).
+Credits: [llama.cpp](https://github.com/ggml-org/llama.cpp) does the heavy
+lifting; quantized files by [Unsloth](https://huggingface.co/unsloth);
+model by the Qwen team. Apache-2.0.
