@@ -110,8 +110,63 @@ V11_PEAK_MIB = 11502
 # A 12GB card has ~12044 MiB usable. The certified config peaks at 11958.
 # That is 86 MiB of headroom, so an X server or a stray process is the
 # difference between "works" and "CUDA out of memory".
-VRAM_MIN_MIB = 11900
 VRAM_IDLE_WARN_MIB = 250
+
+# ---------------------------------------------------------------------------
+# Fitting the model to the VRAM that is actually available.
+#
+# Total VRAM is the wrong number to plan against. Windows/WSL2 reserves roughly
+# 1-1.5 GB of a card for the desktop compositor, so a "12GB" card there offers
+# noticeably less than 12 GB to CUDA, and the certified c=16384 config OOMs on
+# hardware that a total-VRAM check waves through. revv plans against
+# nvidia-smi's memory.free instead.
+#
+# Cost model:  peak(ctx, kv) = FOOTPRINT_BASE_MIB + ctx * KV_MIB_PER_TOKEN[kv]
+# FOOTPRINT_BASE_MIB is weights plus compute buffers, back-solved from the
+# measured 11,830 MiB peak at c=16384 with q8_0 KV -- the flags revv actually
+# launches, on an RTX 3060. The KV rate comes from the measured ~368 MiB per
+# 16K tokens at q4_0 (~23 KiB/token), doubled for q8_0 and again for f16.
+#
+# Corroborated by a fresh WSL2 install: this predicts 11,462 MiB at c=8192, and
+# that machine reported 12,006 MiB in use with ~544 MiB reserved by Windows.
+# ---------------------------------------------------------------------------
+
+KV_MIB_PER_TOKEN = {"q4_0": 0.0225, "q8_0": 0.0449, "f16": 0.0898}
+FOOTPRINT_BASE_MIB = 11830 - 16384 * KV_MIB_PER_TOKEN["q8_0"]
+
+# Descending. Below 4096 the model is too cramped to be useful for code work.
+CONTEXT_LADDER = [65536, 49152, 32768, 24576, 16384, 12288, 8192, 6144, 4096]
+
+# Headroom left unclaimed: CUDA allocators fragment, and the 12GB tier has
+# historically sat 86 MiB from the ceiling.
+VRAM_MARGIN_MIB = 250
+
+
+def estimated_peak_mib(ctx: int, kv: str) -> int:
+    return int(round(FOOTPRINT_BASE_MIB
+                     + ctx * KV_MIB_PER_TOKEN.get(kv, KV_MIB_PER_TOKEN["q8_0"])))
+
+
+def plan_context(free_mib: int, kv: str, preferred_ctx: int
+                 ) -> Optional[Tuple[int, int]]:
+    """Largest ladder context <= preferred that fits, with margin.
+
+    None means even the smallest rung does not fit, i.e. this card cannot run
+    the model. Saying so up front is kinder than a CUDA OOM three minutes into
+    loading weights.
+    """
+    for ctx in CONTEXT_LADDER:
+        if ctx > preferred_ctx:
+            continue
+        peak = estimated_peak_mib(ctx, kv)
+        if peak + VRAM_MARGIN_MIB <= free_mib:
+            return ctx, peak
+    return None
+
+
+# The least free VRAM that can run anything at all: the smallest ladder rung.
+VRAM_MIN_FREE_MIB = (estimated_peak_mib(CONTEXT_LADDER[-1], "q8_0")
+                     + VRAM_MARGIN_MIB)
 
 # Turing (7.5) is the floor: the i-quant kernels revv relies on take a code
 # path that does not exist on older architectures.
@@ -166,7 +221,7 @@ DEFAULT_BUILD = "IQ3_XXS"
 # are the same certified weights with the extra VRAM spent on context, which
 # is a derived setting, not a measured one.
 TIERS: Dict[str, Dict[str, object]] = {
-    "12gb": {"min_mib": VRAM_MIN_MIB, "ctx": 16384, "kv": "q8_0",
+    "12gb": {"min_mib": VRAM_MIN_FREE_MIB, "ctx": 16384, "kv": "q8_0",
              "certified": True,
              "desc": "certified: 36.7 t/s, 92.7% HumanEval, 11,958 MiB peak"},
     "16gb": {"min_mib": 15000, "ctx": 32768, "kv": "q8_0",
@@ -1004,16 +1059,21 @@ def download(
 
 class GPU:
     def __init__(self, name: str, total_mib: int, used_mib: int,
-                 driver: str, cc: Optional[Tuple[int, int]]) -> None:
+                 free_mib: int, driver: str,
+                 cc: Optional[Tuple[int, int]]) -> None:
         self.name = name
         self.total_mib = total_mib
         self.used_mib = used_mib
+        # Reported by the driver, NOT total-minus-used: on WSL2 the host
+        # reserves memory that shows up in neither total nor used.
+        self.free_mib = free_mib
         self.driver = driver
         self.cc = cc
 
     @property
-    def free_mib(self) -> int:
-        return self.total_mib - self.used_mib
+    def reserved_mib(self) -> int:
+        """VRAM the driver accounts for in neither used nor free."""
+        return max(0, self.total_mib - self.used_mib - self.free_mib)
 
 
 def detect_gpus() -> Tuple[List[GPU], Optional[str]]:
@@ -1021,7 +1081,8 @@ def detect_gpus() -> Tuple[List[GPU], Optional[str]]:
     exe = shutil.which("nvidia-smi")
     if exe is None:
         return [], "nvidia-smi not found on PATH"
-    query = "name,memory.total,memory.used,driver_version,compute_cap"
+    query = ("name,memory.total,memory.used,memory.free,driver_version,"
+             "compute_cap")
     try:
         out = subprocess.run(
             [exe, "--query-gpu=" + query, "--format=csv,noheader,nounits"],
@@ -1036,27 +1097,28 @@ def detect_gpus() -> Tuple[List[GPU], Optional[str]]:
     gpus: List[GPU] = []
     for line in out.stdout.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
         try:
-            total, used = int(parts[1]), int(parts[2])
+            total, used, free = int(parts[1]), int(parts[2]), int(parts[3])
         except ValueError:
             continue
-        cc: Optional[Tuple[int, int]] = None
+        cc = None   # type: Optional[Tuple[int, int]]
         # compute_cap is not supported by every driver version; absence is not
         # an error, it just means we cannot check the Turing floor.
-        if len(parts) >= 5 and re.match(r"^\d+\.\d+$", parts[4]):
-            major, minor = parts[4].split(".")
+        if len(parts) >= 6 and re.match(r"^\d+\.\d+$", parts[5]):
+            major, minor = parts[5].split(".")
             cc = (int(major), int(minor))
-        gpus.append(GPU(parts[0], total, used, parts[3], cc))
+        gpus.append(GPU(parts[0], total, used, free, parts[4], cc))
     if not gpus:
         return [], "nvidia-smi ran but reported no GPUs"
     return gpus, None
 
 
-def tier_for(total_mib: int) -> Optional[str]:
+def tier_for(free_mib: int) -> Optional[str]:
+    """Tier from FREE VRAM. Total lies wherever the host reserves memory."""
     for name in TIER_ORDER:
-        if total_mib >= int(TIERS[name]["min_mib"]):
+        if free_mib >= int(TIERS[name]["min_mib"]):
             return name
     return None
 
@@ -1190,34 +1252,54 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         for i, g in enumerate(gpus):
             cc_txt = ("compute capability %d.%d" % g.cc) if g.cc else \
                      "compute capability unknown (old driver)"
-            status(OK if g.total_mib >= VRAM_MIN_MIB else FAIL,
-                   "GPU %d: %s" % (i, g.name),
-                   "%s total, %s in use\ndriver %s, %s"
-                   % (mib(g.total_mib), mib(g.used_mib), g.driver, cc_txt))
+            detail = ("%s total, %s in use, %s free\ndriver %s, %s"
+                      % (mib(g.total_mib), mib(g.used_mib), mib(g.free_mib),
+                         g.driver, cc_txt))
+            if g.reserved_mib > 0:
+                detail += ("\n%s reserved by the host (WSL2/desktop) and not "
+                           "available to CUDA" % mib(g.reserved_mib))
+            status(OK if g.free_mib >= VRAM_MIN_FREE_MIB else FAIL,
+                   "GPU %d: %s" % (i, g.name), detail)
             if g.cc is not None and g.cc < MIN_COMPUTE_CAPABILITY:
                 status(FAIL, "architecture too old (need Turing / 7.5 or newer)")
                 problems += 1
-        best = max(gpus, key=lambda g: g.total_mib)
-        tier = tier_for(best.total_mib)
+        best = max(gpus, key=lambda g: g.free_mib)
+        tier = tier_for(best.free_mib)
         if tier is None:
-            status(FAIL, "%s is below the %s floor"
-                   % (mib(best.total_mib), mib(VRAM_MIN_MIB)),
-                   "The certified config peaks at %s during generation.\n"
-                   "Nothing in revv v1.0 fits a smaller card honestly."
-                   % mib(CERT_PEAK_MIB))
+            status(FAIL, "only %s free; revv needs at least %s"
+                   % (mib(best.free_mib), mib(VRAM_MIN_FREE_MIB)),
+                   "The weights alone are 10.2 GiB. Even the smallest context\n"
+                   "revv will run (%d) needs %s.\n"
+                   "If this card has %s total, something else is holding it:\n"
+                   "close other GPU processes, or run headless."
+                   % (CONTEXT_LADDER[-1],
+                      mib(estimated_peak_mib(CONTEXT_LADDER[-1], "q8_0")),
+                      mib(best.total_mib)))
             problems += 1
         else:
             t = TIERS[tier]
             status(OK, "tier: %s" % tier.upper(), str(t["desc"]))
-            # The 12GB tier has 86 MiB of headroom. A desktop session eats that.
-            if tier == "12gb" and best.used_mib > VRAM_IDLE_WARN_MIB:
-                status(WARN, "%s already in use on a 12GB card"
-                       % mib(best.used_mib),
-                       "The certified config peaks at %s of ~12,044 usable.\n"
-                       "A display server will push it into CUDA OOM.\n"
-                       "Run headless, or use: revv serve --ctx 8192"
-                       % mib(CERT_PEAK_MIB))
+            plan = plan_context(best.free_mib, str(t["kv"]), int(t["ctx"]))
+            if plan is None:
+                status(FAIL, "no context size fits in %s free"
+                       % mib(best.free_mib))
                 problems += 1
+            else:
+                ctx, peak = plan
+                if ctx == int(t["ctx"]):
+                    status(OK, "context: %s" % "{:,}".format(ctx),
+                           "the full size for this tier; ~%s peak, %s free"
+                           % (mib(peak), mib(best.free_mib)))
+                else:
+                    status(WARN, "context: %s (reduced from %s)"
+                           % ("{:,}".format(ctx),
+                              "{:,}".format(int(t["ctx"]))),
+                           "%s at the full size needs ~%s but only %s is free.\n"
+                           "revv will use %s automatically; override with --ctx."
+                           % ("{:,}".format(int(t["ctx"])),
+                              mib(estimated_peak_mib(int(t["ctx"]),
+                                                     str(t["kv"]))),
+                              mib(best.free_mib), "{:,}".format(ctx)))
         if len(gpus) > 1:
             status(WARN, "%d GPUs found; revv uses one" % len(gpus),
                    "Multi-GPU split is untested. Pin with CUDA_VISIBLE_DEVICES.")
@@ -1734,12 +1816,13 @@ def cmd_get(args: argparse.Namespace) -> int:
                 print("%s %s -- assuming the 12GB tier." % (yellow("note:"), err))
                 tier = "12gb"
             else:
-                best = max(gpus, key=lambda g: g.total_mib)
-                detected = tier_for(best.total_mib)
+                best = max(gpus, key=lambda g: g.free_mib)
+                detected = tier_for(best.free_mib)
                 if detected is None:
-                    die("%s has %s; revv needs at least %s"
-                        % (best.name, mib(best.total_mib), mib(VRAM_MIN_MIB)),
-                        "Nothing in v1.0 fits a smaller card. See README.md.")
+                    die("%s has only %s free (of %s)"
+                        % (best.name, mib(best.free_mib), mib(best.total_mib)),
+                        "revv needs %s free. See README.md."
+                        % mib(VRAM_MIN_FREE_MIB))
                 tier = detected
                 print("Detected %s -> %s tier." % (best.name, tier.upper()))
         # Every tier ships the same weights; see the note on BUILDS.
@@ -2239,30 +2322,72 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
     return Handler
 
 
-def _pick_tier(explicit: Optional[str], quiet: bool = False) -> str:
+def _pick_tier(explicit: Optional[str], quiet: bool = False
+               ) -> Tuple[str, Optional[int]]:
+    """Return (tier, free_mib). free_mib is None when the tier was forced."""
     if explicit is not None:
         if explicit not in TIERS:
             die("unknown tier: %s" % explicit,
                 "one of: %s" % ", ".join(sorted(TIERS)))
-        return explicit
+        return explicit, None
     gpus, err = detect_gpus()
     if err is not None:
         die("cannot detect a GPU: %s" % err,
             "revv v1.0 is NVIDIA-only. If nvidia-smi works but revv cannot see\n"
             "it, force a tier:  revv serve --tier 12gb")
-    best = max(gpus, key=lambda g: g.total_mib)
-    detected = tier_for(best.total_mib)
+    best = max(gpus, key=lambda g: g.free_mib)
+    detected = tier_for(best.free_mib)
     if detected is None:
-        die("%s has %s; the certified config peaks at %s"
-            % (best.name, mib(best.total_mib), mib(CERT_PEAK_MIB)),
-            "Trade capability for fit with a smaller context:\n"
-            "  revv serve --tier 12gb --ctx 8192")
-    if detected == "12gb" and best.used_mib > VRAM_IDLE_WARN_MIB and not quiet:
-        print("%s %s is already in use on a 12GB card, and the certified "
-              "config peaks at %s.\n         Run headless or add --ctx 8192 "
-              "if this OOMs."
-              % (yellow("warning:"), mib(best.used_mib), mib(CERT_PEAK_MIB)))
-    return str(detected)
+        die("%s has only %s free (of %s total)"
+            % (best.name, mib(best.free_mib), mib(best.total_mib)),
+            "revv needs %s free: the weights are 10.2 GiB before any context.\n"
+            "Close other GPU processes and try again. On WSL2 the host\n"
+            "reserves 1-1.5 GB, which can put a 12GB card under the line."
+            % mib(VRAM_MIN_FREE_MIB))
+    if best.reserved_mib > 0 and not quiet:
+        print("%s %s of %s is reserved by the host and unavailable to CUDA."
+              % (dim("note:"), mib(best.reserved_mib), mib(best.total_mib)))
+    return str(detected), best.free_mib
+
+
+def resolve_context(tier: str, explicit: Optional[int],
+                    free_mib: Optional[int], quiet: bool = False) -> int:
+    """Pick the context size, sizing to free VRAM unless told otherwise."""
+    t = TIERS[tier]
+    preferred = int(t["ctx"])
+    kv = str(t["kv"])
+    if explicit is not None:
+        # An explicit --ctx is obeyed, but the user still gets told when the
+        # arithmetic says it will not fit.
+        if free_mib is not None:
+            peak = estimated_peak_mib(explicit, kv)
+            if peak + VRAM_MARGIN_MIB > free_mib and not quiet:
+                print("%s --ctx %d needs ~%s but only %s is free. Expect a "
+                      "CUDA OOM."
+                      % (yellow("warning:"), explicit, mib(peak),
+                         mib(free_mib)))
+        return explicit
+    if free_mib is None:
+        return preferred
+    plan = plan_context(free_mib, kv, preferred)
+    if plan is None:
+        die("no context size fits in %s of free VRAM" % mib(free_mib),
+            "revv needs at least %s free." % mib(VRAM_MIN_FREE_MIB))
+        return preferred
+    ctx, peak = plan
+    if not quiet:
+        if ctx == preferred:
+            print("  context  %s (full size for this tier, ~%s peak of %s free)"
+                  % ("{:,}".format(ctx), mib(peak), mib(free_mib)))
+        else:
+            print("  context  %s %s"
+                  % ("{:,}".format(ctx),
+                     yellow("(reduced from %s: it needs ~%s, only %s free)"
+                            % ("{:,}".format(preferred),
+                               mib(estimated_peak_mib(preferred, kv)),
+                               mib(free_mib)))))
+            print("           override with --ctx if you know better")
+    return ctx
 
 
 def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
@@ -2272,7 +2397,7 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
             "./install.sh   # builds it into %s" % BIN_DIR)
         return 1
     model = resolve_model(args.model)
-    tier = _pick_tier(args.tier)
+    tier, free_mib = _pick_tier(args.tier, quiet=args.print_command)
 
     # A model without the draft head cannot speculate, and passing the flags
     # anyway makes llama-server fail to start with an opaque message.
@@ -2285,23 +2410,23 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     mode = MODE_STOCK if args.stock else MODE_REVV
 
     if args.print_command:
-        argv = build_server_argv(exe, model, tier, args.port, args.ctx, mode,
+        ctx = resolve_context(tier, args.ctx, free_mib, quiet=True)
+        argv = build_server_argv(exe, model, tier, args.port, ctx, mode,
                                  use_spec, passthrough)
         print(" ".join(_shell_quote(a) for a in argv))
         return 0
 
     print(bold("revv %s  --  serve" % __version__))
     print("  model    %s" % os.path.basename(model))
-    print("  tier     %s   ctx %s   KV %s"
-          % (tier.upper(), args.ctx if args.ctx else TIERS[tier]["ctx"],
-             TIERS[tier]["kv"]))
+    print("  tier     %s   KV %s" % (tier.upper(), TIERS[tier]["kv"]))
+    ctx = resolve_context(tier, args.ctx, free_mib)
     if not use_spec:
         print("  %s no MTP draft head in this model, so speculation is off."
               % yellow("note:"))
         print("         Expect roughly %.0f t/s rather than %.0f."
               % (CERT_TS_NOSPEC, CERT_TS))
 
-    backend = Backend(exe, model, tier, args.ctx, use_spec, passthrough,
+    backend = Backend(exe, model, tier, ctx, use_spec, passthrough,
                       os.path.join(REVV_HOME, "logs", "llama-server.log"))
     print("\n  starting llama-server (first load pages ~%s off disk)..."
           % gib(info.file_size))

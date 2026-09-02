@@ -70,9 +70,10 @@ sudo apt install -y cuda-toolkit-13-3   # or newest cuda-toolkit-13-x listed
 export PATH=/usr/local/cuda/bin:$PATH   # add to ~/.bashrc too
 # then follow the Linux steps above
 
-# WSL2 VRAM note: Windows typically reserves ~1-1.5GB of the GPU, so on a 12GB
-# card use `./revv.py up --ctx 8192` if the default context doesn't fit —
-# doctor will warn you. (Auto-sizing to free VRAM is coming.)
+# WSL2 VRAM note: Windows typically reserves ~1-1.5GB of the GPU. revv reads
+# free VRAM (not total) and automatically picks the largest context that fits,
+# so on WSL2 it will usually choose 8192 instead of 16384 and tell you why.
+# `./revv.py doctor` shows the reservation and the choice. --ctx overrides it.
 ```
 
 **Windows native (PowerShell, no WSL) — manual config, untested by us:**
@@ -123,6 +124,26 @@ your decode speed against our reference numbers. `./revv.py down` stops everythi
   some third-party conversions strip the speculation head)
 - NVIDIA GPUs, 12GB+ VRAM, Turing or newer, Linux
 - Community finetunes of the same architecture (works; our quality numbers don't transfer)
+
+## Roadmap
+
+**1. A prebuilt Linux CUDA binary, hosted on Releases.** This is the top
+priority and it is a commitment, not an aspiration. Right now the single
+biggest thing standing between a new user and a working setup is not revv and
+not the model — it is the CUDA build gauntlet: cmake, then the CUDA toolkit,
+then a host-compiler version nvcc accepts, then a glibc that toolkit accepts.
+A real fresh install burned about half an hour walking that chain before
+landing on `cuda-toolkit-13-3`. `install.sh` now detects the common mismatches
+early and tells you the fix instead of failing deep in a build, but detecting a
+problem is a consolation prize. A prebuilt binary deletes the problem. Until it
+ships, building from source is the supported path.
+
+**2. Auto-sizing beyond context.** revv now sizes context to free VRAM. The
+same treatment for KV precision and speculation depth is the natural next step.
+
+**3. Certification on a second GPU tier.** Everything here is one card. A 16GB
+and a 24GB tier need their own measurements before they stop being derived
+settings.
 
 ## Not supported (yet)
 

@@ -23,6 +23,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `install.sh`: no-sudo bootstrap that locates or builds llama.cpp with CUDA, optionally with both patches applied.
 - BENCHMARKS.md: the full measurement record, including retractions.
 
+### Roadmap
+
+- **A prebuilt Linux CUDA binary on Releases is the next priority.** The
+  from-source CUDA build (cmake, toolkit, host compiler, glibc) is the largest
+  obstacle to a first working install; a fresh WSL2 setup spent roughly 30
+  minutes on toolchain mismatches alone. `install.sh` now catches the common
+  ones early, but the real fix is not making people build at all.
+
 ### Verified
 
 - End-to-end smoke test on an RTX 3060 (2026-09-02): every phase passed.
@@ -31,6 +39,18 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   suppression, the one open risk, was confirmed against a positive control and
   the GGUF's embedded chat template was shown byte-identical to the external
   one on 25/25 HumanEval tasks — so no template file ships.
+
+### Changed
+
+- **Context and tier are now chosen from FREE VRAM, not total.** Windows/WSL2
+  reserves 1-1.5 GB of the GPU, so the certified c=16384 config OOMed on a
+  12GB card that passed a total-VRAM check. `doctor`, `serve` and `up` read
+  `nvidia-smi memory.free`, report any host reservation, and automatically
+  select the largest context that fits with a 250 MiB margin, printing what
+  was chosen and why. `--ctx` still overrides, and warns if the arithmetic
+  says it will not fit.
+- `install.sh` preflights the CUDA/host-compiler/glibc combination and fails
+  early with both remedies rather than dying deep in a build.
 
 ### Fixed
 

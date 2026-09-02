@@ -444,6 +444,36 @@ the version string reported an unreliable build number, `revv down` rejected
 the detected card's. The bench defect is the instructive one: a canary that
 tests the wrong path is worse than no canary, because it reports PASS.
 
+## 16. Compatibility reports from other machines (anecdotal)
+
+Section 15 is our own hardware. This section is other people's, and it is
+labelled anecdotal because it is: no controlled protocol, no repeated trials,
+and in some cases no numbers at all. It is here because a compatibility claim
+that only ever gets tested on the author's box is worth very little.
+
+| machine | OS | config reached | outcome |
+|---|---|---|---|
+| RTX 3060 12GB (second unit) | Windows 11 + WSL2 (Ubuntu) | ctx 8192, q8_0 KV, MTP n=2 | working, chat verified end to end. Decode t/s not yet reported. |
+
+What that run taught us, both of which are now fixed in the tool:
+
+1. **Total VRAM is not available VRAM.** Windows reserves roughly 1-1.5 GB of
+   the card under WSL2. The certified c=16384 config therefore OOMs on a 12GB
+   card that a total-VRAM check would pass, and the user had to discover
+   `--ctx 8192` by hand. At that setting the card reported 12,006 MiB of
+   12,288 in use. revv now plans against `memory.free` and picks the largest
+   context that fits with a 250 MiB margin — which on that machine is exactly
+   the 8192 the user arrived at manually. The cost model behind that choice
+   predicts 11,462 MiB at c=8192, consistent with the 12,006 observed once the
+   host reservation is added back.
+2. **The CUDA build is the real onboarding cost.** About 30 minutes went to
+   toolchain mismatches — CUDA 12.6 against glibc 2.43 and gcc-15 — before
+   `cuda-toolkit-13-3` worked. That is not a revv defect, but it is a revv
+   problem, and it is why a prebuilt binary is now the top roadmap item.
+
+If you run revv on hardware not listed above, `revv bench` output plus
+`revv doctor` is exactly the contribution that makes this table worth having.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce byte-identical inputs:

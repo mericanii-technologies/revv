@@ -54,11 +54,27 @@ Environment:
                   building llama.cpp with CUDA. Defaults to the compute
                   capability of the detected GPU(s), or 'native' if that
                   can't be determined.
+  REVV_SKIP_TOOLCHAIN_CHECK
+                  Set to any non-empty value to skip the CUDA/host-compiler
+                  preflight check and proceed straight to the build. Not
+                  recommended -- that check exists because known-bad pairs
+                  fail confusingly, deep inside the build, after a long wait.
 
 If neither --patched nor --stock is given and a build is needed, this
 script prompts when run from an interactive terminal, and otherwise
 defaults to --patched.
 EOF
+}
+
+# True (0) iff $1 is a plain non-negative integer. Used before doing any
+# arithmetic comparison on a version field we parsed out of tool output --
+# garbage input (missing tool, unexpected format) should degrade to
+# "skip the check", never to a shell arithmetic error.
+is_int() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 # Portable "how many cores do we have" with a safe fallback.
@@ -421,8 +437,164 @@ detect_cuda_archs() {
     printf '%s\n' "$archs"
 }
 
+# ---------------------------------------------------------------------------
+# CUDA / host-compiler / glibc preflight
+# ---------------------------------------------------------------------------
+#
+# A real fresh-user install lost ~30 minutes here: CUDA 12.6's headers
+# against glibc 2.43 + gcc-15 fail deep inside the nvcc build with
+# confusing template/__builtin errors that look like an llama.cpp bug but
+# are actually a toolchain mismatch -- and the previous version of this
+# script only surfaced that after cmake configure and part of a build had
+# already run. Catch it here instead, before any of that starts.
+
+# Is this WSL2? Only needs a case-insensitive substring match on
+# /proc/version, but the path is read from a variable (not hardcoded) so
+# tests can point it at a fixture instead of the real kernel file.
+is_wsl2() {
+    proc_version_file="${REVV_PROC_VERSION_FILE:-/proc/version}"
+    [ -r "$proc_version_file" ] || return 1
+    tr '[:upper:]' '[:lower:]' < "$proc_version_file" 2>/dev/null | grep -q microsoft
+}
+
+# Prints the maximum host-gcc major version a given CUDA major/minor
+# supports, per NVIDIA's documented compiler support matrix. Empty output
+# means "no data for this CUDA version" -- the caller skips the pair check
+# rather than risk a false failure on an untabulated CUDA release.
+max_host_gcc_for_cuda() {
+    cmaj="$1"
+    cmin="$2"
+    case "$cmaj" in
+        11)
+            printf '11\n'
+            ;;
+        12)
+            if [ "$cmin" -le 3 ]; then
+                printf '12\n'
+            elif [ "$cmin" -le 5 ]; then
+                printf '13\n'
+            else
+                printf '14\n'
+            fi
+            ;;
+        1[3-9]|[2-9][0-9])
+            printf '15\n'
+            ;;
+        *)
+            printf '\n'
+            ;;
+    esac
+}
+
+# Looks for an older g++ already installed that satisfies max gcc major
+# $1, newest-to-oldest so the suggestion is as close to the broken one as
+# possible. Prints the command name (e.g. "g++-13") and returns 0 if
+# found; returns 1 with no output otherwise.
+find_compatible_hostcxx() {
+    want_max="$1"
+    for cand in g++-14 g++-13 g++-12 g++-11; do
+        cand_major=${cand#g++-}
+        if [ "$cand_major" -le "$want_max" ] && command -v "$cand" >/dev/null 2>&1; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+check_toolchain() {
+    if [ -n "$REVV_SKIP_TOOLCHAIN_CHECK" ]; then
+        echo "REVV_SKIP_TOOLCHAIN_CHECK is set: skipping the CUDA/host-compiler"
+        echo "preflight check and proceeding anyway."
+        return 0
+    fi
+
+    cuda_release=$(nvcc --version 2>/dev/null | grep -o 'release [0-9][0-9]*\.[0-9][0-9]*' | head -n 1)
+    cuda_ver=${cuda_release#release }
+    CUDA_MAJOR=${cuda_ver%%.*}
+    CUDA_MINOR=${cuda_ver#*.}
+
+    hostcxx="${CUDAHOSTCXX:-g++}"
+    hostver=$("$hostcxx" -dumpfullversion -dumpversion 2>/dev/null | head -n 1)
+    if [ -z "$hostver" ]; then
+        hostver=$(gcc -dumpversion 2>/dev/null | head -n 1)
+    fi
+    HOST_GCC_MAJOR=${hostver%%.*}
+
+    glibc_line=$(ldd --version 2>/dev/null | head -n 1)
+    GLIBC_VER=$(printf '%s\n' "$glibc_line" | awk '{print $NF}')
+    GLIBC_MAJOR=${GLIBC_VER%%.*}
+    GLIBC_MINOR=${GLIBC_VER#*.}
+
+    printf 'toolchain: CUDA %s, g++ %s, glibc %s\n' \
+        "${cuda_ver:-unknown}" "${HOST_GCC_MAJOR:-unknown}" "${GLIBC_VER:-unknown}"
+
+    if is_int "$CUDA_MAJOR" && is_int "$GLIBC_MAJOR" && is_int "$GLIBC_MINOR"; then
+        if [ "$CUDA_MAJOR" -lt 13 ] \
+           && { [ "$GLIBC_MAJOR" -gt 2 ] || { [ "$GLIBC_MAJOR" -eq 2 ] && [ "$GLIBC_MINOR" -ge 42 ]; }; }; then
+            echo ""
+            echo "warning: glibc $GLIBC_VER is newer than CUDA $cuda_ver's headers expect."
+            echo "         CUDA toolkits before 13.x are known to break against glibc 2.42+"
+            echo "         (confusing nvcc template/__builtin errors, not an llama.cpp bug)."
+            echo "         cuda-toolkit-13-3 or newer resolves this."
+        fi
+    fi
+
+    if is_int "$CUDA_MAJOR" && is_int "$CUDA_MINOR" && is_int "$HOST_GCC_MAJOR"; then
+        max_gcc=$(max_host_gcc_for_cuda "$CUDA_MAJOR" "$CUDA_MINOR")
+        if [ -n "$max_gcc" ] && [ "$HOST_GCC_MAJOR" -gt "$max_gcc" ]; then
+            echo ""
+            echo "############################################################"
+            echo "# KNOWN-BAD TOOLCHAIN PAIR"
+            echo "############################################################"
+            echo "CUDA $cuda_ver supports host gcc up to major $max_gcc; found g++ $HOST_GCC_MAJOR."
+            echo "This combination fails deep inside the nvcc build with confusing"
+            echo "template/__builtin errors that look like an llama.cpp bug but are"
+            echo "actually this mismatch. Better to catch it now than burn 30 minutes"
+            echo "watching cmake configure and part of a build fail."
+
+            suggestion=$(find_compatible_hostcxx "$max_gcc") || suggestion=""
+
+            detail="Two ways to fix this:
+
+  a) (recommended) Install a newer CUDA toolkit -- cuda-toolkit-13-3 or
+     newer supports g++ $HOST_GCC_MAJOR."
+            if [ -n "$suggestion" ]; then
+                detail="$detail
+
+  b) Or point nvcc at the older compiler already on this machine:
+       CUDAHOSTCXX=$suggestion sh install.sh --patched"
+            else
+                detail="$detail
+
+  b) Or install an older host compiler nvcc supports, e.g.:
+       sudo apt install g++-$max_gcc
+     then:
+       CUDAHOSTCXX=g++-$max_gcc sh install.sh --patched"
+            fi
+
+            if is_wsl2; then
+                detail="$detail
+
+You're on WSL2: see this repo's README.md, WSL2 section, for the exact
+apt commands (NVIDIA's wsl-ubuntu repo keyring plus cuda-toolkit-13-3)
+for remedy (a)."
+            fi
+
+            detail="$detail
+
+Set REVV_SKIP_TOOLCHAIN_CHECK=1 to bypass this check and proceed anyway
+(not recommended -- you will very likely hit the build failure this is
+trying to save you from)."
+
+            fail "CUDA $cuda_ver + g++ $HOST_GCC_MAJOR is a known-bad host-compiler pair" "$detail"
+        fi
+    fi
+}
+
 do_build() {
     check_build_tools
+    check_toolchain
     setup_llama_src
 
     if [ "$MODE" = "patched" ]; then
