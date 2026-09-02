@@ -62,6 +62,23 @@ wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
 # then follow the Linux steps above inside Ubuntu
 ```
 
+**Windows native (PowerShell, no WSL) — manual config, untested by us:**
+the revv tool itself needs Linux for now (installer + daemon), but the
+configuration it applies works with llama.cpp's official Windows CUDA build:
+```powershell
+# 1. get llama.cpp: download the latest cudart+bin win-cuda zip from
+#    https://github.com/ggml-org/llama.cpp/releases and unzip
+# 2. get the certified model file (10.9GB):
+Invoke-WebRequest -Uri "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-IQ3_XXS.gguf" -OutFile Qwen3.8-27B-UD-IQ3_XXS.gguf
+# 3. run with the certified flags:
+.\llama-server.exe -m .\Qwen3.8-27B-UD-IQ3_XXS.gguf -ngl 99 -fa on -c 16384 `
+  -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 2 --parallel 1 `
+  --jinja --reasoning off --cache-ram 0 --port 8080
+```
+That's the whole trick minus the conveniences (no adopt/toggle/bench/patches).
+Our numbers are from Linux; Windows-native reports welcome. A native Windows
+revv is on the list.
+
 `./revv.py get` downloads the certified file (unsloth Qwen3.8-27B-UD-IQ3_XXS,
 10.9GB) with resume support. `./revv.py inspect <file>` explains any GGUF you
 already have.
