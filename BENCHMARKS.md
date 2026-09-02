@@ -451,9 +451,12 @@ labelled anecdotal because it is: no controlled protocol, no repeated trials,
 and in some cases no numbers at all. It is here because a compatibility claim
 that only ever gets tested on the author's box is worth very little.
 
-| machine | OS | config reached | outcome |
-|---|---|---|---|
-| RTX 3060 12GB (second unit) | Windows 11 + WSL2 (Ubuntu) | ctx 8192, q8_0 KV, MTP n=2 | working, chat verified end to end. Decode t/s not yet reported. |
+| machine | OS | config reached | `revv bench` decode | outcome |
+|---|---|---|---|---|
+| RTX 3060 12GB (second unit) | Windows 11 + WSL2 (Ubuntu) | ctx 8192, q8_0 KV, MTP n=2 | **revv 34.31 t/s** (91% of the 37.9 reference), **STOCK 22.09 t/s** (98% of the 22.5 reference), spread 0.3-0.4% | working, chat verified end to end |
+
+Those are raw figures from that user's box, quoted as reported. We have not
+set an "expected band" for WSL2 — one machine is not a band.
 
 What that run taught us, both of which are now fixed in the tool:
 
@@ -470,6 +473,56 @@ What that run taught us, both of which are now fixed in the tool:
    toolchain mismatches — CUDA 12.6 against glibc 2.43 and gcc-15 — before
    `cuda-toolkit-13-3` worked. That is not a revv defect, but it is a revv
    problem, and it is why a prebuilt binary is now the top roadmap item.
+
+### The instrument disagreement that run exposed
+
+On that same box, `revv compare` reported revv mode at **29.7 t/s** while
+`revv bench` reported **34.31 t/s** — a 14% disagreement between two of our own
+instruments on one machine, one model, one config. That is worth more attention
+than either number.
+
+The proposed explanation was cold-path cost: `bench` discards a warmup and
+`compare` did not, so the first CUDA graph build after a mode switch would land
+inside compare's timed window. **We tested it and it does not hold up as the
+explanation.** Two pieces of evidence:
+
+- A controlled experiment (restart-then-measure versus already-warm, 4 requests
+  each, 3 trials per mode) found no restart-specific penalty. The first-request
+  effect was at most 2.6% and inconsistent in sign between the two arms — within
+  this box's noise. Caveat, and it is a real one: that box is Apple Silicon, so
+  the specific CUDA-graph mechanism cannot reproduce there. The test constrains
+  the size of any general first-request effect; it cannot rule out a CUDA-only one.
+- The direction is wrong. On the RTX 3060 in Section 15, compare read *higher*
+  than bench (38.4 vs 37.86). On WSL2 it read *lower*. A fixed protocol bias
+  would push the same way on both machines.
+
+The mechanism that does fit: `compare` streams, and took its decode rate from
+the server's `timings` when present, falling back to a **client-side wall-clock
+rate** when absent. llama.cpp only attaches timings to the final streamed
+response unless `timings_per_token` is requested, and the exact shape of that
+final chunk varies across builds and across the OAI-compatibility path. When the
+fallback engages, the number includes everything between llama-server and the
+client — the revv proxy, SSE framing, and the host's loopback — which on WSL2 is
+materially slower than on native Linux and would depress the figure in exactly
+the direction and rough magnitude observed.
+
+Three changes follow, none of which required believing that story:
+
+1. `compare` now requests `timings_per_token`, so the server's own decode rate
+   is available on every chunk rather than one. On the test box this took the
+   proportion of chunks carrying timings from 1 of 33 to 31 of 33. compare and
+   bench now report the same quantity by construction.
+2. `compare` measures both ends and, when the client-observed rate falls more
+   than 5% below the server's, says so and names it as transport cost on that
+   host. Verified to fire on a replay of the WSL2 figures.
+3. `compare` discards one warmup exchange per mode. Not because the cold-path
+   theory was confirmed — it was not — but because `bench` has always done this,
+   and two instruments that share a name should not be different protocols.
+
+**Status: the 14% gap is explained by mechanism but not yet confirmed on the
+machine that produced it.** The next `revv compare` on that box settles it: if
+the transport note appears, the diagnosis is right; if the two instruments now
+simply agree, the fix landed. Either outcome is informative and we will record it.
 
 If you run revv on hardware not listed above, `revv bench` output plus
 `revv doctor` is exactly the contribution that makes this table worth having.

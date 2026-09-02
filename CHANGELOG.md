@@ -42,6 +42,19 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`revv compare` and `revv bench` now measure the same quantity.** A field
+  report showed them disagreeing by 14% on one machine (compare 29.7 t/s vs
+  bench 34.31). compare now requests `timings_per_token`, so llama-server's own
+  decode rate is available on every streamed chunk instead of only the final
+  one, whose shape varies by build; it reports the client-observed rate
+  alongside and flags a gap above 5% as transport cost on that host; and it
+  discards one warmup exchange per mode, as bench always has. The proposed
+  cold-path-after-toggle explanation was tested with a warm control arm and did
+  not hold: no restart-specific penalty above 2.6%, and the discrepancy runs in
+  opposite directions on two different machines.
+
+
+
 - **Context and tier are now chosen from FREE VRAM, not total.** Windows/WSL2
   reserves 1-1.5 GB of the GPU, so the certified c=16384 config OOMed on a
   12GB card that passed a total-VRAM check. `doctor`, `serve` and `up` read

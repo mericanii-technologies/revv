@@ -2566,11 +2566,43 @@ def cmd_toggle(args: argparse.Namespace) -> int:
 # The demo. Same prompt, same weights, same GPU, both modes, one table.
 # ---------------------------------------------------------------------------
 
-def _timed_generation(base: str, max_tokens: int,
-                      timeout: float) -> Tuple[float, float, int, float]:
-    """Return (decode t/s, time to first token, completion tokens, wall s).
+class GenResult:
+    """One timed generation, measured two ways on purpose.
 
-    Streams, because time-to-first-token is half the point: it separates
+    `server_tps` is llama-server's own decode rate -- the same quantity
+    `revv bench` reports, and the one to quote. `client_tps` is what this
+    client observed over the stream. The two differ by whatever is lost
+    between llama-server and here: the revv proxy, SSE framing, and the host's
+    loopback networking. On a native Linux box that gap is ~1%; a large gap is
+    a property of the host, not of the model, and `compare` says so rather
+    than silently reporting the lower number.
+    """
+
+    def __init__(self, server_tps: Optional[float], client_tps: float,
+                 ttft: float, n_tok: int, wall: float) -> None:
+        self.server_tps = server_tps
+        self.client_tps = client_tps
+        self.ttft = ttft
+        self.n_tok = n_tok
+        self.wall = wall
+
+    @property
+    def tps(self) -> float:
+        """The figure to report: the server's, when it gives us one."""
+        return self.server_tps if self.server_tps else self.client_tps
+
+    @property
+    def overhead_pct(self) -> Optional[float]:
+        if not self.server_tps or not self.client_tps:
+            return None
+        return (self.client_tps - self.server_tps) / self.server_tps * 100.0
+
+
+def _timed_generation(base: str, max_tokens: int,
+                      timeout: float) -> GenResult:
+    """Stream one generation and time it from both ends.
+
+    Streaming, because time-to-first-token is half the point: it separates
     prefill from decode without needing the server's own counters.
     """
     payload = {
@@ -2581,6 +2613,14 @@ def _timed_generation(base: str, max_tokens: int,
         "seed": 1234,
         "stream": True,
         "cache_prompt": False,
+        # Ask for the server's own decode rate on every chunk. Without this,
+        # timings ride only the final response (server-context.cpp: "populate
+        # timings if this is final response or timings_per_token is enabled"),
+        # whose shape varies across builds and OAI-compat paths. If we miss it
+        # we silently fall back to a client-side wall-clock rate that includes
+        # proxy and loopback cost -- which is how compare and bench came to
+        # disagree by 13% on one host while agreeing on another.
+        "timings_per_token": True,
         # No chat_template_kwargs: whether the model thinks must be decided by
         # the running mode, which is the thing being compared.
     }
@@ -2603,16 +2643,17 @@ def _timed_generation(base: str, max_tokens: int,
                     or b'"reasoning_content":"' in line):
                 t_first = time.time()
             body += line
-    wall = time.time() - t0
-    chunks, tps, n_tok = _sse_token_count(bytes(body))
+    t_end = time.time()
+    wall = t_end - t0
+    chunks, server_tps, n_tok = _sse_token_count(bytes(body))
     if t_first is None:
         t_first = t0
     if n_tok is None:
         n_tok = chunks
-    if tps is None:
-        tps = (chunks - 1) / max(time.time() - t_first, 1e-6) if chunks > 1 \
-            else 0.0
-    return float(tps), t_first - t0, int(n_tok), wall
+    # Client-observed decode rate: tokens after the first, over the time spent
+    # streaming them. Never mixed with the server figure -- reported alongside.
+    client_tps = (chunks - 1) / max(t_end - t_first, 1e-6) if chunks > 1 else 0.0
+    return GenResult(server_tps, client_tps, t_first - t0, int(n_tok), wall)
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -2627,8 +2668,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
     print(bold("revv %s  --  compare" % __version__))
     print("  model    %s" % start_status["model"])
     print("  prompt   the certified bench prompt, greedy, one request per mode")
-    print("  budget   %d tokens max; each mode stops when it is done\n"
+    print("  budget   %d tokens max; each mode stops when it is done"
           % args.max_tokens)
+    print("  warmup   one exchange per mode is run and discarded, so switching\n"
+          "           cost never lands inside a timed window (same rule as\n"
+          "           `revv bench`)\n")
 
     rows = []
     try:
@@ -2636,11 +2680,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
             print("  %-5s switching..." % mode.upper(), end="")
             sys.stdout.flush()
             _control(base, "mode", {"mode": mode})
+            # Discarded warmup. `revv bench` has always done this; compare did
+            # not, which made the two instruments different protocols wearing
+            # the same name. Aligning them removes restart cost as a variable
+            # whether or not it is large on any given host.
+            print("\r  %-5s warming up...     " % mode.upper(), end="")
+            sys.stdout.flush()
+            _timed_generation(base, max_tokens=min(args.max_tokens, 200),
+                              timeout=args.timeout)
             print("\r  %-5s generating...     " % mode.upper(), end="")
             sys.stdout.flush()
-            tps, ttft, n_tok, wall = _timed_generation(
+            res = _timed_generation(
                 base, max_tokens=args.max_tokens, timeout=args.timeout)
-            rows.append((mode, tps, ttft, n_tok, wall))
+            rows.append((mode, res))
             print("\r  %-5s done.               " % mode.upper())
     except (urllib.error.URLError, OSError, ValueError) as exc:
         die("comparison failed: %s" % exc,
@@ -2655,21 +2707,40 @@ def cmd_compare(args: argparse.Namespace) -> int:
     print("\n  %-7s %11s %8s %9s %9s" % ("mode", "decode t/s", "ttft",
                                          "tokens", "wall"))
     print("  " + "-" * 47)
-    for mode, tps, ttft, n_tok, wall in rows:
+    for mode, res in rows:
         print("  %-7s %11.1f %7.2fs %9d %8.1fs"
-              % (mode.upper(), tps, ttft, n_tok, wall))
+              % (mode.upper(), res.tps, res.ttft, res.n_tok, res.wall))
 
-    stock = rows[0]
-    revv = rows[1]
+    stock = rows[0][1]
+    fast = rows[1][1]
     print()
-    if stock[1] > 0:
-        print("  decode rate   %.2fx faster" % (revv[1] / stock[1]))
-    if stock[4] > 0:
+    if stock.tps > 0:
+        print("  decode rate   %.2fx faster" % (fast.tps / stock.tps))
+    if stock.wall > 0:
         print("  time to done  %.2fx faster  (%.1fs -> %.1fs)"
-              % (stock[4] / revv[4], stock[4], revv[4]))
-    if revv[3] and stock[3] > revv[3]:
+              % (stock.wall / fast.wall, stock.wall, fast.wall))
+    if fast.n_tok and stock.n_tok > fast.n_tok:
         print("  tokens spent  %d -> %d  (STOCK thinks out loud; revv does not)"
-              % (stock[3], revv[3]))
+              % (stock.n_tok, fast.n_tok))
+
+    # Transport diagnostic. These figures are llama-server's own, so they match
+    # `revv bench`. If this client saw materially fewer tokens per second than
+    # the server produced, the difference is the proxy plus SSE framing plus
+    # this host's loopback, and it is worth naming -- it is the most likely
+    # explanation for a compare/bench disagreement on any given box.
+    gaps = [r.overhead_pct for _, r in rows if r.overhead_pct is not None]
+    if gaps and min(gaps) < -5.0:
+        worst = min(gaps)
+        print("\n  %s this client observed %.0f%% fewer tokens/second than"
+              % (yellow("note:"), abs(worst)))
+        print("        llama-server reported. The table above quotes the")
+        print("        server's own figure, which is what `revv bench` uses.")
+        print("        The gap is transport cost on this host (proxy, SSE,")
+        print("        loopback) and is usually near zero on native Linux.")
+    if any(r.server_tps is None for _, r in rows):
+        print("\n  %s the server did not report decode timings, so the rates"
+              % yellow("note:"))
+        print("        above are client-side wall-clock and include transport.")
 
     print("\n  " + dim("STOCK = the same weights on the same GPU with"
                        " llama.cpp's defaults for"))
