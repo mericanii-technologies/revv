@@ -60,9 +60,19 @@ ollama pull qwen3.8:27b        # note: this pulls a 4-bit file that won't fit 12
 ```
 wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
 # then, inside Ubuntu — note: a working nvidia-smi does NOT mean the CUDA
-# toolkit is installed; install.sh needs cmake and nvcc to build llama-server:
-sudo apt update && sudo apt install -y cmake build-essential nvidia-cuda-toolkit
+# toolkit is installed; install.sh needs cmake and nvcc to build llama-server.
+# Use NVIDIA's WSL repo and a RECENT toolkit (Ubuntu's packaged CUDA and older
+# 12.x toolkits fail against new glibc/gcc — verified on a real setup):
+sudo apt update && sudo apt install -y cmake build-essential
+wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
+sudo apt install -y cuda-toolkit-13-3   # or newest cuda-toolkit-13-x listed
+export PATH=/usr/local/cuda/bin:$PATH   # add to ~/.bashrc too
 # then follow the Linux steps above
+
+# WSL2 VRAM note: Windows typically reserves ~1-1.5GB of the GPU, so on a 12GB
+# card use `./revv.py up --ctx 8192` if the default context doesn't fit —
+# doctor will warn you. (Auto-sizing to free VRAM is coming.)
 ```
 
 **Windows native (PowerShell, no WSL) — manual config, untested by us:**
