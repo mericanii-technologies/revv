@@ -42,6 +42,30 @@ model (93.3%) under the same protocol.
 Verified output samples — physics sim, SVG drawing, threaded code, CUDA —
 with how each was checked: [examples/](examples/)
 
+## Starting from zero (no model downloaded yet)
+
+**Linux:**
+```
+# either let revv fetch the certified file directly (recommended):
+git clone https://github.com/mericanii-technologies/revv && cd revv
+./install.sh && ./revv.py get && ./revv.py up
+
+# or, if you prefer ollama for model management:
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen3.8:27b        # note: this pulls a 4-bit file that won't fit 12GB cards
+./revv.py adopt                # revv finds it, warns about the fit, offers the right file
+```
+
+**Windows:** use WSL2 (revv needs Linux + the NVIDIA driver's WSL CUDA support):
+```
+wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
+# then follow the Linux steps above inside Ubuntu
+```
+
+`./revv.py get` downloads the certified file (unsloth Qwen3.8-27B-UD-IQ3_XXS,
+10.9GB) with resume support. `./revv.py inspect <file>` explains any GGUF you
+already have.
+
 ## Quickstart
 
 ```
@@ -73,12 +97,25 @@ your decode speed against our reference numbers. `./revv.py down` stops everythi
 ## Not supported (yet)
 
 - <12GB VRAM, AMD, Apple Silicon, Windows (WSL2 works)
+
+**Under 12GB — what we think would happen (unmeasured):** on an 8GB card
+(3070/3070 Ti class) the certified 10.9GB file spills to CPU and we'd expect
+~8-12 tok/s. The 2-bit file (6.8GB) fits and should be fast — possibly
+35-50 tok/s given the memory bandwidth — but quality drops measurably
+(~78% HumanEval vs 92.7%, and instruction-following degrades more than that
+number suggests). Fine for chat, not recommended for agent work. `revv doctor`
+will tell you which case you're in. If you try it anyway, `revv bench` +
+an issue report would genuinely help — nobody has published numbers for
+these cards yet. The proper 8GB tier arrives when a strong-enough smaller
+model exists.
 - FP8 / AWQ / EXL3 formats
 - Other model families — the pipeline generalizes; certification takes days per model
 
 Numbers here come from one card and one protocol. If yours differ, run
 `./revv.py bench` and open an issue — hardware reports are the most useful
 contribution right now.
+
+Feedback, hardware reports, questions: **contact@mericanii.com** or open an issue.
 
 Credits: [llama.cpp](https://github.com/ggml-org/llama.cpp) does the heavy
 lifting; quantized files by [Unsloth](https://huggingface.co/unsloth);
