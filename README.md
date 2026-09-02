@@ -59,7 +59,10 @@ ollama pull qwen3.8:27b        # note: this pulls a 4-bit file that won't fit 12
 **Windows:** use WSL2 (revv needs Linux + the NVIDIA driver's WSL CUDA support):
 ```
 wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
-# then follow the Linux steps above inside Ubuntu
+# then, inside Ubuntu — note: a working nvidia-smi does NOT mean the CUDA
+# toolkit is installed; install.sh needs cmake and nvcc to build llama-server:
+sudo apt update && sudo apt install -y cmake build-essential nvidia-cuda-toolkit
+# then follow the Linux steps above
 ```
 
 **Windows native (PowerShell, no WSL) — manual config, untested by us:**
