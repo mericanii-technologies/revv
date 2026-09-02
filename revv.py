@@ -1,0 +1,3011 @@
+#!/usr/bin/env python3
+"""revv -- by Mericanii.
+
+Runs Qwen3.8-27B GGUFs on consumer NVIDIA GPUs at a measured, published
+configuration. Every number this tool prints comes from BENCHMARKS.md.
+
+Python 3.9+, standard library only, no external dependencies. That is a
+hard constraint: revv has to run on a fresh box before anything is installed.
+"""
+
+import argparse
+import dataclasses
+import http.client
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import (Any, BinaryIO, Callable, Dict, List, NamedTuple, Optional,
+                    Sequence, Tuple)
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+__version__ = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+REVV_HOME = os.environ.get("REVV_HOME") or os.path.join(
+    os.path.expanduser("~"), ".revv")
+MODELS_DIR = os.path.join(REVV_HOME, "models")
+BIN_DIR = os.path.join(REVV_HOME, "bin")
+BUILD_MANIFEST = os.path.join(REVV_HOME, "build.json")
+
+# ---------------------------------------------------------------------------
+# The certified configuration.
+#
+# Measured on: RTX 3060 12GB (sm_86, driver 535.309.01), Ryzen 5 3600, DDR4,
+# Ubuntu 24.04, headless. Protocol: thinking off, greedy, 400 new tokens,
+# 1 discarded warmup + 4 measured requests, decode rate from llama-server's
+# own timings. Do not edit without a new measurement in BENCHMARKS.md.
+#
+# The two speed figures come from two different measurement sessions and are
+# both real; revv reports whichever matches the build actually installed.
+# ---------------------------------------------------------------------------
+
+CERT_TS_PATCHED = 36.7    # kernel-patched, MTP path A/B (stock arm 35.8 same session)
+CERT_TS_STOCK = 34.39     # upstream llama.cpp, shipping row of the re-certification
+CERT_TS_NOSPEC = 20.0     # same weights, speculation off -- the raw floor
+CERT_HUMANEVAL = 92.7     # HumanEval-164, thinking off, greedy
+CERT_PEAK_MIB = 11958     # peak DURING requests, not after load. See BENCHMARKS.md:
+                          # three configs pass a load-time check then OOM mid-request.
+CERT_ACCEPT = 0.781       # MTP draft acceptance, shipping config, novel prompt
+
+# The standing harness canary: under the corrected protocol a HumanEval task
+# averages 158.8 completion tokens. Above ~350 means the model is still
+# emitting reasoning and the thinking switch is not taking effect -- which is
+# exactly the bug that made every pre-2026-09-02 quality number wrong.
+THINK_LEAK_TOKENS = 350
+
+# The headline figure, used wherever "what revv delivers" is meant.
+CERT_TS = CERT_TS_PATCHED
+
+# A 12GB card has ~12044 MiB usable. The certified config peaks at 11958.
+# That is 86 MiB of headroom, so an X server or a stray process is the
+# difference between "works" and "CUDA out of memory".
+VRAM_MIN_MIB = 11900
+VRAM_IDLE_WARN_MIB = 250
+
+# Turing (7.5) is the floor: the i-quant kernels revv relies on take a code
+# path that does not exist on older architectures.
+MIN_COMPUTE_CAPABILITY = (7, 5)
+
+# ---------------------------------------------------------------------------
+# Model registry
+#
+# One model ships. More VRAM does NOT buy a bigger quant, it buys context:
+# above ~2.9bpw this model's HumanEval is statistically indistinguishable
+# from its own uncompressed anchor (IQ3_XXS 92.7% vs Q8 93.3%), so spending
+# gigabytes on more weight bits buys nothing measurable. See BENCHMARKS.md
+# section "Why one model".
+# ---------------------------------------------------------------------------
+
+HF_REPO = "unsloth/Qwen3.8-27B-GGUF"
+
+# Sizes are exact bytes from the HuggingFace blob API, cross-checked against
+# the rendered file tree. They are the download's integrity check: a truncated
+# or CDN-mangled file is caught before it ever reaches llama-server.
+BUILDS: Dict[str, Dict[str, object]] = {
+    "IQ3_XXS": {
+        "file": "Qwen3.8-27B-UD-IQ3_XXS.gguf",
+        "size": 10934860704,
+        "certified": True,
+        "humaneval": 92.7,
+        "note": "the shipping build",
+    },
+    "Q2_K_XL": {
+        "file": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
+        "size": 9828981664,
+        "certified": False,
+        "humaneval": 93.3,
+        "note": "1.03 GiB smaller and the same HumanEval, but edit-format "
+                "compliance is 67.6% vs 94.1% (p=0.0117) -- it breaks in agent "
+                "loops, not on benchmarks. Use it only if VRAM forces you to.",
+    },
+    "IQ2_XXS": {
+        "file": "Qwen3.8-27B-UD-IQ2_XXS.gguf",
+        "size": 7266070528,
+        "certified": False,
+        "humaneval": 78.0,
+        "note": "no MTP draft head (stripped below ~8.4 GiB): no speculation, "
+                "so ~20 t/s not ~37, and 15 points of HumanEval gone. "
+                "Small is doubly penalised. Not recommended.",
+    },
+}
+
+DEFAULT_BUILD = "IQ3_XXS"
+
+# Tier -> runtime configuration. Only the 12GB tier is certified; the others
+# are the same certified weights with the extra VRAM spent on context, which
+# is a derived setting, not a measured one.
+TIERS: Dict[str, Dict[str, object]] = {
+    "12gb": {"min_mib": VRAM_MIN_MIB, "ctx": 16384, "kv": "q8_0",
+             "certified": True,
+             "desc": "certified: 36.7 t/s, 92.7% HumanEval, 11,958 MiB peak"},
+    "16gb": {"min_mib": 15000, "ctx": 32768, "kv": "q8_0",
+             "certified": False,
+             "desc": "certified weights, context raised to 32K (not separately measured)"},
+    "24gb": {"min_mib": 23000, "ctx": 65536, "kv": "f16",
+             "certified": False,
+             "desc": "certified weights, 64K context and f16 KV (not separately measured)"},
+}
+
+TIER_ORDER = ["24gb", "16gb", "12gb"]  # highest first, for detection
+
+# Speculation is the whole speed story: MTP n=2 is +68% and measured
+# quality-neutral (135/164 with vs 136/164 without, p=1.0). n>=3 showed
+# greedy non-reproducibility in one observation and is not shipped.
+SPEC_TYPE = "draft-mtp"
+SPEC_N_MAX = 2
+
+
+# ---------------------------------------------------------------------------
+# Terminal output
+# ---------------------------------------------------------------------------
+
+def _use_color() -> bool:
+    return (sys.stdout.isatty()
+            and os.environ.get("NO_COLOR") is None
+            and os.environ.get("TERM", "") != "dumb")
+
+
+_COLOR = _use_color()
+
+
+def _c(code: str, text: str) -> str:
+    return "\033[%sm%s\033[0m" % (code, text) if _COLOR else text
+
+
+def bold(t: str) -> str:
+    return _c("1", t)
+
+
+def green(t: str) -> str:
+    return _c("32", t)
+
+
+def yellow(t: str) -> str:
+    return _c("33", t)
+
+
+def red(t: str) -> str:
+    return _c("31", t)
+
+
+def dim(t: str) -> str:
+    return _c("2", t)
+
+
+OK, WARN, FAIL = "ok", "warn", "fail"
+_TAG_COLOR = {OK: green, WARN: yellow, FAIL: red}
+
+
+def status(tag: str, text: str, detail: str = "") -> None:
+    # Pad on the uncoloured word: ANSI escapes are invisible on screen but not
+    # zero-width to str formatting, so padding the coloured string misaligns.
+    pad = " " * (6 - len(tag))
+    print("  [%s]%s%s" % (_TAG_COLOR[tag](tag), pad, text))
+    if detail:
+        for line in detail.splitlines():
+            print("         %s" % line)
+
+
+def die(msg: str, fix: str = "") -> None:
+    """Exit with a message that tells the user what to do about it."""
+    # stdout is block-buffered when piped; without this the error lands above
+    # the output it refers to.
+    sys.stdout.flush()
+    print("%s %s" % (red("error:"), msg), file=sys.stderr)
+    if fix:
+        print("\n%s\n  %s" % (bold("fix:"), fix.replace("\n", "\n  ")),
+              file=sys.stderr)
+    sys.exit(1)
+
+
+def gib(n: float) -> str:
+    return "%.2f GiB" % (n / (1024.0 ** 3))
+
+
+def mib(n: int) -> str:
+    return "{:,} MiB".format(n)
+
+
+# ---------------------------------------------------------------------------
+# GGUF header reader   [spliced: gguf unit]
+# ---------------------------------------------------------------------------
+
+GGUF_MAGIC = 0x46554747  # b"GGUF" read as a little-endian u32
+SUPPORTED_VERSIONS = (2, 3)
+DEFAULT_ALIGNMENT = 32
+QK_K = 256
+
+# GGUF key-value value type ids -> meaning (see module docstring / spec).
+_VT_UINT8 = 0
+_VT_INT8 = 1
+_VT_UINT16 = 2
+_VT_INT16 = 3
+_VT_UINT32 = 4
+_VT_INT32 = 5
+_VT_FLOAT32 = 6
+_VT_BOOL = 7
+_VT_STRING = 8
+_VT_ARRAY = 9
+_VT_UINT64 = 10
+_VT_INT64 = 11
+_VT_FLOAT64 = 12
+
+# Byte width of every *fixed-size* value type (everything except STRING and
+# ARRAY, which are variable-length and handled specially).
+_FIXED_SIZE: Dict[int, int] = {
+    _VT_UINT8: 1,
+    _VT_INT8: 1,
+    _VT_UINT16: 2,
+    _VT_INT16: 2,
+    _VT_UINT32: 4,
+    _VT_INT32: 4,
+    _VT_FLOAT32: 4,
+    _VT_BOOL: 1,
+    _VT_UINT64: 8,
+    _VT_INT64: 8,
+    _VT_FLOAT64: 8,
+}
+
+# ggml tensor type id -> canonical name. Gaps are real (removed/reserved
+# ids in upstream ggml); do not assume contiguity.
+GGML_TYPE_NAMES: Dict[int, str] = {
+    0: "F32",
+    1: "F16",
+    2: "Q4_0",
+    3: "Q4_1",
+    6: "Q5_0",
+    7: "Q5_1",
+    8: "Q8_0",
+    9: "Q8_1",
+    10: "Q2_K",
+    11: "Q3_K",
+    12: "Q4_K",
+    13: "Q5_K",
+    14: "Q6_K",
+    15: "Q8_K",
+    16: "IQ2_XXS",
+    17: "IQ2_XS",
+    18: "IQ3_XXS",
+    19: "IQ1_S",
+    20: "IQ4_NL",
+    21: "IQ3_S",
+    22: "IQ2_S",
+    23: "IQ4_XS",
+    24: "I8",
+    25: "I16",
+    26: "I32",
+    27: "I64",
+    28: "F64",
+    29: "IQ1_M",
+    30: "BF16",
+    34: "TQ1_0",
+    35: "TQ2_0",
+    39: "MXFP4",
+    40: "NVFP4",
+    41: "Q1_0",
+}
+
+# ggml type name -> (block_elems, bytes_per_block). Used to compute tensor
+# byte sizes from ne[] dims without touching the data section.
+BLOCK_SIZES: Dict[str, Tuple[int, int]] = {
+    "F32": (1, 4),
+    "F16": (1, 2),
+    "BF16": (1, 2),
+    "F64": (1, 8),
+    "I8": (1, 1),
+    "I16": (1, 2),
+    "I32": (1, 4),
+    "I64": (1, 8),
+    "Q4_0": (32, 18),
+    "Q4_1": (32, 20),
+    "Q5_0": (32, 22),
+    "Q5_1": (32, 24),
+    "Q8_0": (32, 34),
+    "Q8_1": (32, 40),
+    "IQ4_NL": (32, 18),
+    "MXFP4": (32, 17),
+    "NVFP4": (64, 36),
+    "Q1_0": (128, 18),
+    "Q2_K": (256, 2 + 2 + QK_K // 16 + QK_K // 4),
+    "Q3_K": (256, 2 + QK_K // 4 + QK_K // 8 + 12),
+    "Q4_K": (256, 2 + 2 + QK_K // 2 + 12),
+    "Q5_K": (256, 2 + 2 + QK_K // 2 + QK_K // 8 + 12),
+    "Q6_K": (256, 2 + QK_K // 2 + QK_K // 4 + QK_K // 16),
+    "Q8_K": (256, 4 + QK_K + QK_K // 8),
+    "IQ2_XXS": (256, 2 + QK_K // 4),
+    "IQ2_XS": (256, 2 + QK_K // 4 + QK_K // 32),
+    "IQ3_XXS": (256, 2 + QK_K // 4 + QK_K // 8),
+    "IQ1_S": (256, 2 + QK_K // 8 + QK_K // 16),
+    "IQ3_S": (256, 2 + QK_K // 4 + QK_K // 8 + QK_K // 32 + 4),
+    "IQ2_S": (256, 2 + QK_K // 4 + QK_K // 16),
+    "IQ4_XS": (256, 2 + 2 + QK_K // 2 + QK_K // 64),
+    "IQ1_M": (256, QK_K // 8 + QK_K // 16 + QK_K // 32),
+    "TQ1_0": (256, 2 + 4 * 13),
+    "TQ2_0": (256, 2 + 64),
+}
+
+
+class GGUFError(Exception):
+    """Raised for anything wrong with a GGUF file: bad magic, unsupported
+    version, truncation, or an unknown value/array-element type id."""
+
+
+@dataclasses.dataclass
+class TensorInfo:
+    name: str
+    dims: Tuple[int, ...]
+    type_name: str
+    n_bytes: Optional[int]
+
+
+@dataclasses.dataclass
+class GGUFInfo:
+    path: str
+    file_size: int
+    version: int
+    alignment: int
+    n_tensors: int
+    n_kv: int
+    arch: Optional[str]
+    name: Optional[str]
+    n_vocab: Optional[int]
+    n_layer: Optional[int]
+    n_ctx_train: Optional[int]
+    n_embd: Optional[int]
+    file_type: Optional[int]
+    dominant_quant: str
+    type_counts: Dict[str, int]
+    type_bytes: Dict[str, int]
+    mtp_tensors: List[str]
+    data_offset: int
+    tensor_data_bytes: int
+
+    @property
+    def has_mtp_head(self) -> bool:
+        return bool(self.mtp_tensors)
+
+
+class _ArrayMeta(NamedTuple):
+    """Placeholder stored in the kv dict for ARRAY-typed values: we record
+    only the element type and count (the payload has already been walked
+    and discarded, never materialized)."""
+
+    element_type: int
+    count: int
+
+
+class _Reader:
+    """Thin wrapper around a buffered binary file that turns short reads
+    (truncated file) into a GGUFError instead of silently returning fewer
+    bytes than requested."""
+
+    def __init__(self, f: BinaryIO, path: str) -> None:
+        self.f = f
+        self.path = path
+
+    def read(self, n: int) -> bytes:
+        start = self.f.tell()
+        data = self.f.read(n)
+        if len(data) < n:
+            raise GGUFError(
+                "file is truncated or incomplete: expected {} bytes at "
+                "offset {} but only got {} in {!r}; the file may not have "
+                "finished downloading -- re-download it".format(n, start, len(data), self.path)
+            )
+        return data
+
+    def seek_forward(self, n: int) -> None:
+        # A plain seek (no read) is how we skip large/uninteresting value
+        # payloads without paging them through Python; any resulting
+        # out-of-bounds position is caught by the next read() call.
+        if n:
+            self.f.seek(n, os.SEEK_CUR)
+
+    def tell(self) -> int:
+        return self.f.tell()
+
+
+def _read_u32(r: _Reader) -> int:
+    return struct.unpack("<I", r.read(4))[0]
+
+
+def _read_u64(r: _Reader) -> int:
+    return struct.unpack("<Q", r.read(8))[0]
+
+
+def _read_string(r: _Reader) -> str:
+    length = _read_u64(r)
+    data = r.read(length)
+    return data.decode("utf-8", errors="replace")
+
+
+def _skip_array_payload(r: _Reader, element_type: int, count: int) -> None:
+    """Walks (but does not store) `count` elements of `element_type`,
+    leaving the file cursor positioned right after the array."""
+    if element_type == _VT_STRING:
+        # Variable stride: each element must be walked individually.
+        for _ in range(count):
+            slen = _read_u64(r)
+            r.seek_forward(slen)
+    elif element_type == _VT_ARRAY:
+        # Nested arrays (rare/hypothetical): each element declares its own
+        # element_type + count per the spec's recursive definition.
+        for _ in range(count):
+            nested_type = _read_u32(r)
+            nested_count = _read_u64(r)
+            _skip_array_payload(r, nested_type, nested_count)
+    elif element_type in _FIXED_SIZE:
+        # Fixed stride: one bulk seek instead of `count` tiny reads.
+        r.seek_forward(_FIXED_SIZE[element_type] * count)
+    else:
+        raise GGUFError(
+            "unknown GGUF array element type id {} at offset {}".format(element_type, r.tell())
+        )
+
+
+def _read_value(r: _Reader, value_type: int) -> Any:
+    """Reads a scalar/string value fully, or for ARRAY walks and discards
+    the payload and returns an _ArrayMeta(element_type, count)."""
+    if value_type == _VT_UINT8:
+        return r.read(1)[0]
+    if value_type == _VT_INT8:
+        return struct.unpack("<b", r.read(1))[0]
+    if value_type == _VT_UINT16:
+        return struct.unpack("<H", r.read(2))[0]
+    if value_type == _VT_INT16:
+        return struct.unpack("<h", r.read(2))[0]
+    if value_type == _VT_UINT32:
+        return _read_u32(r)
+    if value_type == _VT_INT32:
+        return struct.unpack("<i", r.read(4))[0]
+    if value_type == _VT_FLOAT32:
+        return struct.unpack("<f", r.read(4))[0]
+    if value_type == _VT_BOOL:
+        return r.read(1)[0] != 0
+    if value_type == _VT_STRING:
+        return _read_string(r)
+    if value_type == _VT_ARRAY:
+        element_type = _read_u32(r)
+        count = _read_u64(r)
+        _skip_array_payload(r, element_type, count)
+        return _ArrayMeta(element_type, count)
+    if value_type == _VT_UINT64:
+        return _read_u64(r)
+    if value_type == _VT_INT64:
+        return struct.unpack("<q", r.read(8))[0]
+    if value_type == _VT_FLOAT64:
+        return struct.unpack("<d", r.read(8))[0]
+    raise GGUFError("unknown GGUF value type id {} at offset {}".format(value_type, r.tell()))
+
+
+def _is_mtp_tensor(name: str) -> bool:
+    """MTP / multi-token-prediction draft-head tensors, e.g.
+    'blk.64.nextn.embed_tokens.weight'. Case-insensitive."""
+    lower = name.lower()
+    if lower.split(".").count("nextn") > 0:
+        # covers ".nextn." and a leading/trailing "nextn" component too,
+        # but we still check the explicit prefix case below for names
+        # with no dot separator at all (just "nextn").
+        return True
+    if ".nextn." in lower:
+        return True
+    if lower.startswith("nextn."):
+        return True
+    return lower == "nextn"
+
+
+def read_gguf(path: str) -> GGUFInfo:
+    file_size = os.path.getsize(path)
+    with open(path, "rb") as raw:
+        r = _Reader(raw, path)
+
+        magic = _read_u32(r)
+        if magic != GGUF_MAGIC:
+            raise GGUFError(
+                "not a GGUF file: {!r} (magic 0x{:08x} != 0x{:08x}); "
+                "a .safetensors or .bin file is not a GGUF file".format(path, magic, GGUF_MAGIC)
+            )
+
+        version = _read_u32(r)
+        if version not in SUPPORTED_VERSIONS:
+            raise GGUFError(
+                "unsupported GGUF version {} (only versions {} are supported)".format(
+                    version, SUPPORTED_VERSIONS
+                )
+            )
+
+        tensor_count = _read_u64(r)
+        kv_count = _read_u64(r)
+
+        kv: Dict[str, Any] = {}
+        for _ in range(kv_count):
+            key = _read_string(r)
+            value_type = _read_u32(r)
+            kv[key] = _read_value(r, value_type)
+
+        tensor_infos: List[TensorInfo] = []
+        type_counts: Dict[str, int] = {}
+        type_bytes: Dict[str, int] = {}
+        mtp_tensors: List[str] = []
+        token_embd_dims: Optional[Tuple[int, ...]] = None
+
+        for _ in range(tensor_count):
+            name = _read_string(r)
+            n_dims = _read_u32(r)
+            dims = tuple(_read_u64(r) for _ in range(n_dims))
+            ggml_type = _read_u32(r)
+            _offset = _read_u64(r)  # relative to data section; unused here
+
+            type_name = GGML_TYPE_NAMES.get(ggml_type, "UNKNOWN({})".format(ggml_type))
+            block_info = BLOCK_SIZES.get(type_name)
+            if block_info is not None:
+                block_elems, bytes_per_block = block_info
+                n_bytes: Optional[int] = math.prod(dims) * bytes_per_block // block_elems
+            else:
+                n_bytes = None
+
+            tensor_infos.append(TensorInfo(name=name, dims=dims, type_name=type_name, n_bytes=n_bytes))
+
+            type_counts[type_name] = type_counts.get(type_name, 0) + 1
+            if n_bytes is not None:
+                type_bytes[type_name] = type_bytes.get(type_name, 0) + n_bytes
+
+            if _is_mtp_tensor(name):
+                mtp_tensors.append(name)
+
+            if name == "token_embd.weight":
+                token_embd_dims = dims
+
+        # --- alignment & data offset -------------------------------------------------
+        alignment_val = kv.get("general.alignment")
+        if alignment_val is None:
+            alignment = DEFAULT_ALIGNMENT
+        else:
+            alignment = int(alignment_val)
+            if alignment <= 0 or (alignment & (alignment - 1)) != 0:
+                raise GGUFError(
+                    "general.alignment must be a nonzero power of two, got {}".format(alignment_val)
+                )
+
+        offs = r.tell()
+        data_offset = ((offs + alignment - 1) // alignment) * alignment
+
+        # --- scalar metadata lookups ---------------------------------------------------
+        arch = kv.get("general.architecture")
+        arch = arch if isinstance(arch, str) else None
+
+        name_val = kv.get("general.name")
+        name_val = name_val if isinstance(name_val, str) else None
+
+        file_type_val = kv.get("general.file_type")
+        file_type = file_type_val if isinstance(file_type_val, int) else None
+
+        n_layer = kv.get("{}.block_count".format(arch)) if arch else None
+        n_layer = n_layer if isinstance(n_layer, int) else None
+
+        n_ctx_train = kv.get("{}.context_length".format(arch)) if arch else None
+        n_ctx_train = n_ctx_train if isinstance(n_ctx_train, int) else None
+
+        n_embd = kv.get("{}.embedding_length".format(arch)) if arch else None
+        n_embd = n_embd if isinstance(n_embd, int) else None
+
+        # --- n_vocab: tokens array count, then {arch}.vocab_size, then token_embd dims[1]
+        n_vocab: Optional[int] = None
+        tokens_meta = kv.get("tokenizer.ggml.tokens")
+        if isinstance(tokens_meta, _ArrayMeta) and tokens_meta.element_type == _VT_STRING:
+            n_vocab = tokens_meta.count
+        if n_vocab is None and arch:
+            vocab_size = kv.get("{}.vocab_size".format(arch))
+            if isinstance(vocab_size, int):
+                n_vocab = vocab_size
+        if n_vocab is None and token_embd_dims is not None and len(token_embd_dims) >= 2:
+            n_vocab = token_embd_dims[1]
+
+        # --- dominant quant: largest total bytes, excluding norm/bias-only float types
+        excluded = {"F32", "F16", "BF16"}
+        candidates = {k: v for k, v in type_bytes.items() if k not in excluded and v > 0}
+        if candidates:
+            dominant_quant = max(candidates, key=candidates.get)
+        elif type_bytes:
+            dominant_quant = max(type_bytes, key=type_bytes.get)
+        else:
+            dominant_quant = ""
+
+        tensor_data_bytes = sum(t.n_bytes for t in tensor_infos if t.n_bytes is not None)
+
+        return GGUFInfo(
+            path=path,
+            file_size=file_size,
+            version=version,
+            alignment=alignment,
+            n_tensors=tensor_count,
+            n_kv=kv_count,
+            arch=arch,
+            name=name_val,
+            n_vocab=n_vocab,
+            n_layer=n_layer,
+            n_ctx_train=n_ctx_train,
+            n_embd=n_embd,
+            file_type=file_type,
+            dominant_quant=dominant_quant,
+            type_counts=type_counts,
+            type_bytes=type_bytes,
+            mtp_tensors=mtp_tensors,
+            data_offset=data_offset,
+            tensor_data_bytes=tensor_data_bytes,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Resumable downloader   [spliced: download unit]
+# ---------------------------------------------------------------------------
+
+USER_AGENT = "revv/1.0"
+CHUNK_SIZE = 1024 * 1024  # 1 MiB, per spec
+BACKOFF_CAP_SECONDS = 30.0
+PROGRESS_WINDOW_SECONDS = 5.0  # moving-average window for the rate display
+TTY_REDRAW_INTERVAL_SECONDS = 0.1  # throttle redraws to ~10/s
+
+# Exceptions that indicate a transient network problem worth retrying.
+_RETRYABLE_EXCEPTIONS = (
+    socket.timeout,
+    urllib.error.URLError,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+)
+
+
+class DownloadError(Exception):
+    """Raised for any download failure; the message tells the user how to fix it."""
+
+
+def _build_request(url: str, method: str, range_header: Optional[str] = None) -> urllib.request.Request:
+    headers = {"User-Agent": USER_AGENT}
+    if range_header is not None:
+        headers["Range"] = range_header
+    return urllib.request.Request(url, headers=headers, method=method)
+
+
+def head_size(url: str, timeout: float = 30.0) -> Optional[int]:
+    """Content-Length of the final resource, following redirects. None if unknown."""
+    req = _build_request(url, "HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            length = resp.headers.get("Content-Length")
+    except (urllib.error.URLError, socket.timeout, http.client.HTTPException):
+        # HEAD is a best-effort probe; callers treat None as "unknown size",
+        # not a fatal error, so failures here should not raise.
+        return None
+    if length is None:
+        return None
+    try:
+        return int(length)
+    except ValueError:
+        return None
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds != seconds or seconds == float("inf"):  # nan or inf: rate unknown
+        return "--:--"
+    seconds_int = int(seconds)
+    hours, rem = divmod(seconds_int, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%02d:%02d" % (minutes, secs)
+
+
+class _ProgressReporter:
+    """Renders download progress to stderr; only instantiated when progress=True."""
+
+    def __init__(self, total: Optional[int]) -> None:
+        self._is_tty = sys.stderr.isatty()
+        self._total: Optional[int] = total
+        self._downloaded = 0
+        self._last_draw_time = 0.0
+        self._last_pct_step_reported = -10  # so 0% line is not force-printed
+        self._samples: List[Tuple[float, int]] = []
+
+    def set_total(self, total: Optional[int]) -> None:
+        self._total = total
+
+    def set_downloaded(self, n: int) -> None:
+        self._downloaded = n
+        now = time.time()
+        self._samples.append((now, n))
+        cutoff = now - PROGRESS_WINDOW_SECONDS
+        # Keep at least two samples so a rate can always be computed.
+        while len(self._samples) > 2 and self._samples[1][0] < cutoff:
+            self._samples.pop(0)
+
+    def note_retry(self, attempt: int, max_retries: int, backoff: float) -> None:
+        sys.stderr.write(
+            "download interrupted (attempt %d/%d), retrying in %.0fs...\n" % (attempt, max_retries, backoff)
+        )
+        sys.stderr.flush()
+
+    def _rate_bytes_per_sec(self) -> float:
+        if len(self._samples) < 2:
+            return 0.0
+        t0, b0 = self._samples[0]
+        t1, b1 = self._samples[-1]
+        dt = t1 - t0
+        if dt <= 0:
+            return 0.0
+        return (b1 - b0) / dt
+
+    def _format_line(self) -> str:
+        gib = 1024.0 ** 3
+        mib = 1024.0 ** 2
+        downloaded_gib = self._downloaded / gib
+        rate = self._rate_bytes_per_sec()
+        rate_mib_s = rate / mib
+        if self._total:
+            total_gib = self._total / gib
+            pct = min(100.0, self._downloaded * 100.0 / self._total)
+            remaining = max(0, self._total - self._downloaded)
+            eta = remaining / rate if rate > 0 else float("inf")
+            return "%.2f/%.2f GiB (%5.1f%%) %6.2f MiB/s ETA %s" % (
+                downloaded_gib,
+                total_gib,
+                pct,
+                rate_mib_s,
+                _format_eta(eta),
+            )
+        return "%.2f GiB downloaded, %6.2f MiB/s" % (downloaded_gib, rate_mib_s)
+
+    def maybe_draw(self) -> None:
+        now = time.time()
+        if self._is_tty:
+            if now - self._last_draw_time < TTY_REDRAW_INTERVAL_SECONDS:
+                return
+            self._last_draw_time = now
+            sys.stderr.write("\r" + self._format_line() + "    ")
+            sys.stderr.flush()
+            return
+        if not self._total:
+            return  # nothing sane to print every 10% without a known total
+        pct = self._downloaded * 100.0 / self._total
+        step = int(pct // 10) * 10
+        if step > self._last_pct_step_reported:
+            self._last_pct_step_reported = step
+            sys.stderr.write(self._format_line() + "\n")
+            sys.stderr.flush()
+
+    def finish(self) -> None:
+        if self._is_tty:
+            sys.stderr.write("\r" + self._format_line() + "    \n")
+            sys.stderr.flush()
+        elif self._total and self._last_pct_step_reported < 100:
+            self._last_pct_step_reported = 100
+            sys.stderr.write(self._format_line() + "\n")
+            sys.stderr.flush()
+
+
+def _attempt_download(
+    url: str,
+    part_path: str,
+    offset: int,
+    timeout: float,
+    reporter: Optional[_ProgressReporter],
+    known_total: Optional[int],
+) -> Optional[int]:
+    """Performs a single HTTP GET attempt, writing into part_path. Returns the
+    best-known total size (may be unchanged from known_total). Raises on any
+    transient network error so the caller's retry loop can resume from disk."""
+    range_header = "bytes=%d-" % offset if offset > 0 else None
+    req = _build_request(url, "GET", range_header)
+
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 416:
+            # .part already covers the full length; caller falls through to
+            # the size check rather than treating this as an error.
+            e.close()
+            return known_total if known_total is not None else offset
+        if e.code == 404:
+            e.close()
+            raise DownloadError(
+                "HTTP 404 Not Found for %s. The file may have been moved or "
+                "renamed upstream; double-check the URL." % url
+            ) from e
+        if 400 <= e.code < 500:
+            e.close()
+            raise DownloadError(
+                "HTTP %d %s for %s. This is a client-side error and will not "
+                "be retried; check the URL and any required credentials." % (e.code, e.reason, url)
+            ) from e
+        # 5xx and other unexpected codes are transient; HTTPError is itself a
+        # URLError subclass so re-raising lets the caller's retry loop catch it.
+        e.close()
+        raise
+
+    total = known_total
+    with resp:
+        status = resp.status
+        content_length = resp.headers.get("Content-Length")
+        content_range = resp.headers.get("Content-Range")
+
+        if status == 206:
+            if content_range:
+                try:
+                    total = int(content_range.rsplit("/", 1)[1])
+                except (ValueError, IndexError):
+                    pass
+            elif content_length is not None:
+                try:
+                    total = offset + int(content_length)
+                except ValueError:
+                    pass
+            write_offset = offset
+            truncate = False
+        else:
+            # Status 200 (or anything else without an exception): the server
+            # ignored our Range header, so the body is the WHOLE resource.
+            # Truncating and restarting from zero is the only way to avoid
+            # corrupting the .part file by appending a full body onto it.
+            if content_length is not None:
+                try:
+                    total = int(content_length)
+                except ValueError:
+                    pass
+            write_offset = 0
+            truncate = offset > 0
+
+        if reporter is not None:
+            reporter.set_total(total)
+            reporter.set_downloaded(write_offset)
+
+        mode = "r+b" if os.path.exists(part_path) else "wb"
+        f = open(part_path, mode)
+        try:
+            if truncate:
+                f.seek(0)
+                f.truncate(0)
+            f.seek(write_offset)
+            written = write_offset
+            while True:
+                chunk = resp.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                f.write(chunk)
+                written += len(chunk)
+                if reporter is not None:
+                    reporter.set_downloaded(written)
+                    reporter.maybe_draw()
+        finally:
+            # Runs on success, on a network exception, and on KeyboardInterrupt
+            # alike, so the .part file is always left flushed and resumable.
+            f.flush()
+            f.close()
+
+    return total
+
+
+def download(
+    url: str,
+    dest: str,
+    expected_size: Optional[int] = None,
+    progress: bool = True,
+    max_retries: int = 5,
+    timeout: float = 60.0,
+) -> int:
+    """Download url to dest, resuming if a partial file exists.
+    Returns the final byte size. Idempotent: if dest already exists and
+    (expected_size is None or matches), returns immediately without network I/O."""
+    dest_dir = os.path.dirname(os.path.abspath(dest))
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+
+    if os.path.exists(dest):
+        existing_size = os.path.getsize(dest)
+        if expected_size is None or existing_size == expected_size:
+            return existing_size
+
+    part_path = dest + ".part"
+    reporter = _ProgressReporter(expected_size) if progress else None
+    total_size = expected_size
+    attempt = 0
+
+    try:
+        while True:
+            part_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+            try:
+                total_size = _attempt_download(url, part_path, part_size, timeout, reporter, total_size)
+                break
+            except _RETRYABLE_EXCEPTIONS as e:
+                attempt += 1
+                if attempt > max_retries:
+                    raise DownloadError(
+                        "Download of %s failed after %d attempt(s): %s. A partial "
+                        "file was kept at %s; rerun the download to resume, or "
+                        "check your network connection." % (url, attempt, e, part_path)
+                    ) from e
+                backoff = min(2 ** (attempt - 1), BACKOFF_CAP_SECONDS)
+                if reporter is not None:
+                    reporter.note_retry(attempt, max_retries, backoff)
+                time.sleep(backoff)
+    except KeyboardInterrupt:
+        # The .part file was already flushed/closed by _attempt_download's
+        # finally block, so it is safe to resume on the next run.
+        sys.stderr.write("\ninterrupted - rerun the same command to resume\n")
+        sys.stderr.flush()
+        raise
+
+    final_size = os.path.getsize(part_path)
+    if expected_size is not None and final_size != expected_size:
+        raise DownloadError(
+            "Downloaded size %d bytes does not match expected size %d bytes for "
+            "%s. Delete %s and retry the download." % (final_size, expected_size, url, part_path)
+        )
+
+    os.replace(part_path, dest)
+    if reporter is not None:
+        reporter.finish()
+    return final_size
+
+
+
+# ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
+
+class GPU:
+    def __init__(self, name: str, total_mib: int, used_mib: int,
+                 driver: str, cc: Optional[Tuple[int, int]]) -> None:
+        self.name = name
+        self.total_mib = total_mib
+        self.used_mib = used_mib
+        self.driver = driver
+        self.cc = cc
+
+    @property
+    def free_mib(self) -> int:
+        return self.total_mib - self.used_mib
+
+
+def detect_gpus() -> Tuple[List[GPU], Optional[str]]:
+    """Return (gpus, error). error is a human-readable reason if detection failed."""
+    exe = shutil.which("nvidia-smi")
+    if exe is None:
+        return [], "nvidia-smi not found on PATH"
+    query = "name,memory.total,memory.used,driver_version,compute_cap"
+    try:
+        out = subprocess.run(
+            [exe, "--query-gpu=" + query, "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], "could not run nvidia-smi: %s" % exc
+    if out.returncode != 0:
+        detail = (out.stderr or out.stdout).strip().splitlines()
+        return [], "nvidia-smi failed: %s" % (detail[0] if detail else
+                                              "exit %d" % out.returncode)
+
+    gpus: List[GPU] = []
+    for line in out.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            total, used = int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        cc: Optional[Tuple[int, int]] = None
+        # compute_cap is not supported by every driver version; absence is not
+        # an error, it just means we cannot check the Turing floor.
+        if len(parts) >= 5 and re.match(r"^\d+\.\d+$", parts[4]):
+            major, minor = parts[4].split(".")
+            cc = (int(major), int(minor))
+        gpus.append(GPU(parts[0], total, used, parts[3], cc))
+    if not gpus:
+        return [], "nvidia-smi ran but reported no GPUs"
+    return gpus, None
+
+
+def tier_for(total_mib: int) -> Optional[str]:
+    for name in TIER_ORDER:
+        if total_mib >= int(TIERS[name]["min_mib"]):
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# llama-server discovery
+# ---------------------------------------------------------------------------
+
+def find_llama_server() -> Optional[str]:
+    """revv's own build wins over whatever is on PATH: we know its provenance."""
+    local = os.path.join(BIN_DIR, "llama-server")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return shutil.which("llama-server")
+
+
+def llama_server_version(exe: str) -> Optional[str]:
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # llama-server prints its version banner on stderr.
+    blob = (out.stderr or "") + (out.stdout or "")
+    m = re.search(r"version:\s*(\d+)\s*\(([0-9a-f]+)\)", blob)
+    if m:
+        return "build %s (%s)" % (m.group(1), m.group(2))
+    for line in blob.splitlines():
+        if "version" in line.lower():
+            return line.strip()
+    return None
+
+
+def read_build_manifest() -> Optional[Dict[str, object]]:
+    """install.sh records what it built and which patches went in.
+
+    There is no way to detect an applied source patch from a compiled binary,
+    so provenance is tracked at build time or not at all.
+    """
+    try:
+        with open(BUILD_MANIFEST, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# Local model inventory
+# ---------------------------------------------------------------------------
+
+def local_models() -> List[str]:
+    if not os.path.isdir(MODELS_DIR):
+        return []
+    return sorted(os.path.join(MODELS_DIR, f) for f in os.listdir(MODELS_DIR)
+                  if f.endswith(".gguf"))
+
+
+def resolve_model(arg: Optional[str]) -> str:
+    """Turn a path, an adopted name, a build name, a bare filename, or nothing
+    into a real path on disk."""
+    if arg:
+        if os.path.isfile(arg):
+            return arg
+        adopted = registry_lookup(arg)
+        if adopted is not None:
+            return adopted
+        if arg in BUILDS:
+            path = os.path.join(MODELS_DIR, str(BUILDS[arg]["file"]))
+            if os.path.isfile(path):
+                return path
+            die("build %s is not downloaded" % arg,
+                "revv get   # downloads the certified build")
+        candidate = os.path.join(MODELS_DIR, arg)
+        if os.path.isfile(candidate):
+            return candidate
+        die("no such model: %s" % arg,
+            "revv doctor   # lists the models revv can see\n"
+            "revv adopt    # registers GGUFs ollama or LM Studio already has")
+
+    found = local_models()
+    registered = sorted(load_registry())
+    if not found and not registered:
+        die("no models found in %s" % MODELS_DIR,
+            "revv get      # downloads the certified build (~10.2 GiB)\n"
+            "revv adopt    # reuses a GGUF ollama or LM Studio already has")
+    # Prefer the certified build wherever it is: it is the only one revv has
+    # numbers for.
+    certified = os.path.join(MODELS_DIR, str(BUILDS[DEFAULT_BUILD]["file"]))
+    if certified in found:
+        return certified
+    if len(found) == 1 and not registered:
+        return found[0]
+    if not found and len(registered) == 1:
+        path = registry_lookup(registered[0])
+        if path is not None:
+            return path
+    choices = [os.path.basename(f) for f in found] + registered
+    die("several models available, pick one",
+        "revv serve %s\n\navailable: %s"
+        % (choices[0], ", ".join(choices)))
+    return ""   # unreachable
+
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    print(bold("revv %s  --  doctor" % __version__))
+    problems = 0
+
+    print("\n" + bold("GPU"))
+    gpus, err = detect_gpus()
+    tier: Optional[str] = None
+    if err is not None:
+        status(FAIL, err)
+        print("         revv needs an NVIDIA GPU. There is no CPU or Apple\n"
+              "         Silicon path in v1.0 -- the whole configuration is\n"
+              "         CUDA-specific and would be dishonest to pretend at.")
+        problems += 1
+    else:
+        for i, g in enumerate(gpus):
+            cc_txt = ("compute capability %d.%d" % g.cc) if g.cc else \
+                     "compute capability unknown (old driver)"
+            status(OK if g.total_mib >= VRAM_MIN_MIB else FAIL,
+                   "GPU %d: %s" % (i, g.name),
+                   "%s total, %s in use\ndriver %s, %s"
+                   % (mib(g.total_mib), mib(g.used_mib), g.driver, cc_txt))
+            if g.cc is not None and g.cc < MIN_COMPUTE_CAPABILITY:
+                status(FAIL, "architecture too old (need Turing / 7.5 or newer)")
+                problems += 1
+        best = max(gpus, key=lambda g: g.total_mib)
+        tier = tier_for(best.total_mib)
+        if tier is None:
+            status(FAIL, "%s is below the %s floor"
+                   % (mib(best.total_mib), mib(VRAM_MIN_MIB)),
+                   "The certified config peaks at %s during generation.\n"
+                   "Nothing in revv v1.0 fits a smaller card honestly."
+                   % mib(CERT_PEAK_MIB))
+            problems += 1
+        else:
+            t = TIERS[tier]
+            status(OK, "tier: %s" % tier.upper(), str(t["desc"]))
+            # The 12GB tier has 86 MiB of headroom. A desktop session eats that.
+            if tier == "12gb" and best.used_mib > VRAM_IDLE_WARN_MIB:
+                status(WARN, "%s already in use on a 12GB card"
+                       % mib(best.used_mib),
+                       "The certified config peaks at %s of ~12,044 usable.\n"
+                       "A display server will push it into CUDA OOM.\n"
+                       "Run headless, or use: revv serve --ctx 8192"
+                       % mib(CERT_PEAK_MIB))
+                problems += 1
+        if len(gpus) > 1:
+            status(WARN, "%d GPUs found; revv uses one" % len(gpus),
+                   "Multi-GPU split is untested. Pin with CUDA_VISIBLE_DEVICES.")
+
+    print("\n" + bold("llama-server"))
+    exe = find_llama_server()
+    if exe is None:
+        status(FAIL, "llama-server not found",
+               "Looked in %s and on PATH." % BIN_DIR)
+        print("         Run ./install.sh to build it.")
+        problems += 1
+    else:
+        status(OK, exe, llama_server_version(exe) or "version unknown")
+        manifest = read_build_manifest()
+        if manifest is None:
+            status(WARN, "build provenance unknown",
+                   "This binary was not built by revv, so the kernel patch\n"
+                   "status cannot be determined. Expect ~%.1f t/s rather\n"
+                   "than %.1f if it is stock upstream."
+                   % (CERT_TS_STOCK, CERT_TS))
+        else:
+            patches = manifest.get("patches") or []
+            base = manifest.get("base_commit", "unknown")
+            if "mmvq_iquant_decode.patch" in patches:
+                status(OK, "kernel patch applied", "base commit %s" % base)
+            else:
+                status(WARN, "kernel patch NOT applied",
+                       "base commit %s\nExpect ~%.1f t/s instead of %.1f (-2.5%%).\n"
+                       "Rebuild with: ./install.sh --patched"
+                       % (base, CERT_TS_STOCK, CERT_TS))
+
+    print("\n" + bold("Models"))
+    found = local_models()
+    if not found:
+        status(WARN, "no models in %s" % MODELS_DIR, "Run: revv get")
+    for path in found:
+        name = os.path.basename(path)
+        try:
+            info = read_gguf(path)
+        except GGUFError as exc:
+            status(FAIL, name, str(exc))
+            problems += 1
+            continue
+        verdict, _ = classify(info, name)
+        tag = OK if verdict.startswith("CERTIFIED") else WARN
+        status(tag, "%s  %s  %s" % (name, gib(info.file_size),
+                                    info.dominant_quant), verdict)
+
+    print("\n" + bold("Verdict"))
+    if problems == 0 and tier is not None and exe is not None:
+        if tier == "12gb":
+            print("  Ready. The certified configuration on this box:")
+            print("    %.1f t/s decode, %.1f%% HumanEval-164, %s peak VRAM."
+                  % (CERT_TS, CERT_HUMANEVAL, mib(CERT_PEAK_MIB)))
+        else:
+            print("  Ready. Certified weights at the %s tier (%s)."
+                  % (tier.upper(), TIERS[tier]["ctx"]))
+            print("  Speed and quality were measured on 12GB; this tier only")
+            print("  raises the context, so expect the same or slightly better.")
+        print("\n  Next:  %s" % bold("revv serve"))
+        return 0
+    print("  %d problem(s) above. Fix those first." % problems)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# inspect
+# ---------------------------------------------------------------------------
+
+def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
+    """Return (verdict line, explanation).
+
+    Three states, and the distinction that matters is the draft head: without
+    it there is no speculative decoding, which is the difference between
+    ~37 t/s and ~20 t/s. Nothing else about a GGUF changes speed that much.
+    """
+    certified_name = str(BUILDS[DEFAULT_BUILD]["file"])
+    is_ours = (os.path.basename(filename) == certified_name
+               and info.dominant_quant == "IQ3_XXS")
+    if is_ours:
+        return ("CERTIFIED",
+                "This is the exact file the published numbers were measured on:\n"
+                "%.1f t/s, %.1f%% HumanEval-164, %s peak."
+                % (CERT_TS, CERT_HUMANEVAL, mib(CERT_PEAK_MIB)))
+    if info.has_mtp_head:
+        return ("COMPATIBLE (has draft head -- full speed expected, "
+                "numbers not certified)",
+                "The MTP draft head is present, so speculative decoding will\n"
+                "work and speed should land near the certified figure.\n"
+                "Quality is unmeasured: revv has no numbers for this file.")
+    return ("COMPATIBLE (no draft head -- speculation unavailable, "
+            "expect ~%.0f not ~%.0f t/s)" % (CERT_TS_NOSPEC, CERT_TS),
+            "No blk.N.nextn.* tensors. Quantizers below ~8.4 GiB strip the\n"
+            "MTP head, and some conversion scripts drop it. Without it\n"
+            "speculative decoding cannot run and you lose ~40% of decode\n"
+            "speed. revv will start the server with speculation disabled.")
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    path = args.file
+    if not os.path.isfile(path):
+        candidate = os.path.join(MODELS_DIR, path)
+        if os.path.isfile(candidate):
+            path = candidate
+        else:
+            die("no such file: %s" % args.file)
+    try:
+        info = read_gguf(path)
+    except GGUFError as exc:
+        die(str(exc))
+        return 1  # unreachable; keeps type checkers honest
+
+    print(bold(os.path.basename(path)))
+    print("  path            %s" % path)
+    print("  size            %s  (%s bytes)"
+          % (gib(info.file_size), "{:,}".format(info.file_size)))
+    print("  gguf version    %d" % info.version)
+    print("  architecture    %s" % (info.arch or "unknown"))
+    print("  quantization    %s" % info.dominant_quant)
+    print("  vocab           %s" % ("{:,}".format(info.n_vocab)
+                                    if info.n_vocab else "unknown"))
+    print("  layers          %s" % (info.n_layer if info.n_layer else "unknown"))
+    print("  train context   %s" % ("{:,}".format(info.n_ctx_train)
+                                    if info.n_ctx_train else "unknown"))
+    print("  tensors         %d" % info.n_tensors)
+
+    print("\n  " + bold("tensor types"))
+    ranked = sorted(info.type_bytes.items(), key=lambda kv: -kv[1])
+    for tname, nbytes in ranked:
+        print("    %-10s %5d tensors  %10s"
+              % (tname, info.type_counts.get(tname, 0), gib(nbytes)))
+
+    print("\n  " + bold("MTP draft head"))
+    if info.has_mtp_head:
+        print("    present -- %d tensors" % len(info.mtp_tensors))
+        for name in info.mtp_tensors[:6]:
+            print("      %s" % name)
+        if len(info.mtp_tensors) > 6:
+            print("      ... and %d more" % (len(info.mtp_tensors) - 6))
+    else:
+        print("    %s" % red("absent"))
+
+    verdict, why = classify(info, path)
+    print("\n  " + bold("verdict"))
+    colour = green if verdict.startswith("CERTIFIED") else yellow
+    print("    %s" % colour(verdict))
+    for line in why.splitlines():
+        print("    %s" % dim(line))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# adopt: reuse GGUFs already downloaded by ollama or LM Studio
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Found record
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class Found:
+    path: str          # absolute path to the GGUF (or, for ollama, its blob)
+    source: str         # "ollama" | "lmstudio"
+    label: str          # "qwen3:latest" or "TheBloke/foo/model-Q4"
+    size: int           # bytes
+
+
+# ---------------------------------------------------------------------------
+# Ollama discovery
+#
+# <root>/manifests/<registry>/<namespace>/<name>/<tag>  -- a JSON manifest
+# <root>/blobs/sha256-<hex>                              -- the actual data
+# We only ever open() these files for reading; nothing here writes into an
+# ollama tree.
+# ---------------------------------------------------------------------------
+
+_OLLAMA_MODEL_MEDIA_TYPE = "application/vnd.ollama.image.model"
+
+
+def _default_ollama_root() -> str:
+    env = os.environ.get("OLLAMA_MODELS")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".ollama", "models")
+
+
+def _ollama_label(manifest_path: str, manifests_dir: str) -> str:
+    # manifest_path is <manifests_dir>/<registry>/<namespace>/<name>/<tag>.
+    # "library" is ollama's default namespace and is conventionally dropped
+    # from the short name; any other namespace is kept so e.g. a third-party
+    # publisher's "foo/bar:latest" doesn't collide with the official "bar".
+    rel = os.path.relpath(manifest_path, manifests_dir)
+    parts = rel.split(os.sep)
+    tag = parts[-1]
+    name = parts[-2] if len(parts) >= 2 else tag
+    namespace = parts[-3] if len(parts) >= 3 else ""
+    if namespace and namespace != "library":
+        return "%s/%s:%s" % (namespace, name, tag)
+    return "%s:%s" % (name, tag)
+
+
+def _parse_ollama_manifest(manifest_path: str, manifests_dir: str,
+                            blobs_dir: str) -> Optional[Found]:
+    # Every failure mode here (unreadable file, bad JSON, missing/odd
+    # fields, absent blob) returns None rather than raising: one broken
+    # manifest must never take down a scan of an otherwise-healthy store.
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None  # unreadable (permissions, dangling symlink, ...)
+
+    try:
+        manifest = json.loads(raw)
+    except ValueError:
+        return None  # malformed or truncated JSON
+
+    if not isinstance(manifest, dict):
+        return None
+    layers = manifest.get("layers")
+    if not isinstance(layers, list):
+        return None
+
+    model_layer = None
+    for layer in layers:
+        if isinstance(layer, dict) and layer.get("mediaType") == _OLLAMA_MODEL_MEDIA_TYPE:
+            model_layer = layer
+            break
+    if model_layer is None:
+        return None  # no model-mediaType layer in this manifest
+
+    digest = model_layer.get("digest")
+    if not isinstance(digest, str) or ":" not in digest:
+        return None
+    algo, _, hexpart = digest.partition(":")
+    if algo != "sha256" or not hexpart:
+        return None
+
+    blob_path = os.path.join(blobs_dir, "sha256-%s" % hexpart)
+    if not os.path.isfile(blob_path):
+        return None  # manifest references a blob that isn't (or no longer) there
+
+    try:
+        size = int(model_layer.get("size") or os.path.getsize(blob_path))
+    except (TypeError, ValueError, OSError):
+        return None
+
+    label = _ollama_label(manifest_path, manifests_dir)
+    return Found(path=blob_path, source="ollama", label=label, size=size)
+
+
+def scan_ollama(root: Optional[str] = None) -> List[Found]:
+    if root is None:
+        root = _default_ollama_root()
+    manifests_dir = os.path.join(root, "manifests")
+    blobs_dir = os.path.join(root, "blobs")
+    found: List[Found] = []
+    if not os.path.isdir(manifests_dir):
+        return found
+
+    # onerror=no-op: a directory we can't list (permissions) is skipped
+    # rather than raising out of os.walk.
+    for dirpath, _dirnames, filenames in os.walk(manifests_dir, onerror=lambda _e: None):
+        for fname in filenames:
+            item = _parse_ollama_manifest(os.path.join(dirpath, fname),
+                                           manifests_dir, blobs_dir)
+            if item is not None:
+                found.append(item)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# LM Studio discovery
+# ---------------------------------------------------------------------------
+
+_LMSTUDIO_MAX_DEPTH = 6
+_MIN_GGUF_BYTES = 1024 * 1024  # below this, LM Studio left a partial download
+
+
+def _default_lmstudio_roots() -> List[str]:
+    roots: List[str] = []
+    env = os.environ.get("LMSTUDIO_MODELS_DIR")
+    if env:
+        roots.append(env)
+    home = os.path.expanduser("~")
+    roots.append(os.path.join(home, ".lmstudio", "models"))
+    roots.append(os.path.join(home, ".cache", "lm-studio", "models"))
+    roots.append(os.path.join(home, "Library", "Application Support", "LM Studio", "models"))
+    return roots
+
+
+def _scan_lmstudio_root(root: str) -> List[Found]:
+    results: List[Found] = []
+    root = os.path.abspath(root)
+    # os.walk defaults to followlinks=False, so a symlinked subdirectory is
+    # never descended into -- that alone satisfies "follow no symlinks out
+    # of the root" for directories. Symlinked *files* are still listed and
+    # opened normally, which is exactly what the test fixtures rely on to
+    # avoid copying multi-gigabyte models.
+    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda _e: None):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= _LMSTUDIO_MAX_DEPTH:
+            dirnames[:] = []  # prune: stop descending, but this dir's own files still count
+
+        for fname in filenames:
+            if not fname.lower().endswith(".gguf"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                size = os.path.getsize(fpath)
+            except OSError:
+                continue  # dangling symlink or a race with a deletion
+            if size < _MIN_GGUF_BYTES:
+                continue  # partial download
+
+            relfile = os.path.relpath(fpath, root)
+            label = os.path.splitext(relfile)[0].replace(os.sep, "/")
+            results.append(Found(path=fpath, source="lmstudio", label=label, size=size))
+    return results
+
+
+def scan_lmstudio(roots: Optional[List[str]] = None) -> List[Found]:
+    if roots is None:
+        roots = _default_lmstudio_roots()
+    found: List[Found] = []
+    for root in roots:
+        if root and os.path.isdir(root):
+            found.extend(_scan_lmstudio_root(root))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+def registry_path() -> str:
+    return os.path.join(REVV_HOME, "registry.json")
+
+
+def load_registry() -> Dict[str, Dict[str, str]]:
+    path = registry_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        status(WARN, "registry.json is corrupt or unreadable -- treating as empty", path)
+        return {}
+    if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
+        status(WARN, "registry.json has an unexpected shape -- treating as empty", path)
+        return {}
+    return data["models"]
+
+
+def save_registry(models: Dict[str, Dict[str, str]]) -> None:
+    # Atomic write: a crash or concurrent `revv adopt` mid-write leaves either
+    # the old registry or the new one on disk, never a half-written file.
+    os.makedirs(REVV_HOME, exist_ok=True)
+    path = registry_path()
+    tmp = path + ".tmp"
+    payload = {"version": 1, "models": models}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def registry_lookup(name: str) -> Optional[str]:
+    entry = load_registry().get(name)
+    if not entry:
+        return None
+    path = entry.get("path")
+    if not path or not os.path.exists(path):
+        # A stale entry (the source file moved/was deleted since adoption)
+        # must look exactly like "not registered", not surface a confusing
+        # llama-server error further down the call chain.
+        return None
+    return path
+
+
+# ---------------------------------------------------------------------------
+# adopt
+# ---------------------------------------------------------------------------
+
+def _slugify(label: str) -> str:
+    """"qwen3:latest" -> "qwen3-latest"; runs of non-alphanumerics collapse
+    to one "-" and leading/trailing "-" are dropped, without regex (not on
+    the allowed stdlib list for this module)."""
+    chars = [ch if ch.isalnum() else "-" for ch in label.lower()]
+    parts = [p for p in "".join(chars).split("-") if p]
+    return "-".join(parts)
+
+
+def _unique_name(base: str, path: str, models: Dict[str, Dict[str, str]]) -> str:
+    """A registry key for `path`: re-adopting the same path under the same
+    base name is idempotent (returns `base` again, no rename); a genuinely
+    different model that slugifies to the same base gets "-2", "-3", ..."""
+    if base not in models or models[base].get("path") == path:
+        return base
+    n = 2
+    while True:
+        candidate = "%s-%d" % (base, n)
+        if candidate not in models or models[candidate].get("path") == path:
+            return candidate
+        n += 1
+
+
+def cmd_adopt(args: argparse.Namespace) -> int:
+    # READ-ONLY GUARANTEE: this function (and everything it calls) only ever
+    # reads inside an Ollama or LM Studio directory -- no write, move,
+    # delete, or chmod. The only file it ever writes is revv's own
+    # registry.json, via save_registry()'s atomic tmp-then-replace.
+    source = getattr(args, "source", None)
+    do_all = bool(getattr(args, "all", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    ollama_root = _default_ollama_root()
+    lmstudio_roots = _default_lmstudio_roots()
+
+    found: List[Found] = []
+    searched: List[str] = []
+    if source in (None, "ollama"):
+        searched.append(os.path.join(ollama_root, "manifests"))
+        found.extend(scan_ollama(ollama_root))
+    if source in (None, "lmstudio"):
+        searched.extend(lmstudio_roots)
+        found.extend(scan_lmstudio(lmstudio_roots))
+
+    if not found:
+        # Neither tool installed is a perfectly normal machine, not an error.
+        print(bold("no models found."))
+        print("  looked in:")
+        for path in searched:
+            tag = "exists" if os.path.isdir(path) else "not found"
+            print("    %s  %s" % (path, dim("(%s)" % tag)))
+        return 0
+
+    models = load_registry()
+    adopted_names: List[str] = []
+    n_adopted = 0
+    n_skipped = 0
+
+    for item in sorted(found, key=lambda f: (f.source, f.label)):
+        print(bold("%s  %s" % (item.label, dim("(%s)" % item.source))))
+        try:
+            info = read_gguf(item.path)
+        except GGUFError as exc:
+            status(FAIL, "could not read GGUF header", str(exc))
+            n_skipped += 1
+            continue
+
+        is_qwen = info.arch is not None and info.arch.lower().startswith("qwen")
+        verdict, _why = classify(info, item.path)
+
+        status(OK, "size=%s  quant=%s  mtp=%s"
+               % (gib(item.size), info.dominant_quant,
+                  "yes" if info.has_mtp_head else "no"))
+        status(OK, "verdict: %s" % verdict)
+
+        if not is_qwen and not do_all:
+            status(WARN, "skipped (not a Qwen model: %s)" % (info.arch or "unknown"))
+            n_skipped += 1
+            continue
+        if not is_qwen and do_all:
+            status(WARN, "adopting anyway (--all): revv's numbers do not apply to this model")
+
+        base = _slugify(item.label) or "model"
+        name = _unique_name(base, item.path, models)
+        models[name] = {
+            "path": item.path,
+            "source": item.source,
+            "label": item.label,
+            "quant": info.dominant_quant,
+            "mtp": info.has_mtp_head,
+        }
+        adopted_names.append(name)
+        n_adopted += 1
+        status(OK, "registered as %s" % name)
+
+    if not dry_run:
+        save_registry(models)
+
+    print()
+    print(bold("%d adopted, %d skipped" % (n_adopted, n_skipped)))
+    if dry_run:
+        print("  (dry run -- registry not written)")
+    for name in adopted_names:
+        print("  next: %s" % green("revv serve %s" % name))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# get
+# ---------------------------------------------------------------------------
+
+def hf_url(filename: str) -> str:
+    return "https://huggingface.co/%s/resolve/main/%s?download=true" % (
+        HF_REPO, filename)
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    build = args.build
+    if build is None:
+        if args.tier:
+            tier = args.tier.lower()
+            if tier not in TIERS:
+                die("unknown tier: %s" % args.tier,
+                    "one of: %s" % ", ".join(sorted(TIERS)))
+        else:
+            gpus, err = detect_gpus()
+            if err is not None:
+                print("%s %s -- assuming the 12GB tier." % (yellow("note:"), err))
+                tier = "12gb"
+            else:
+                best = max(gpus, key=lambda g: g.total_mib)
+                detected = tier_for(best.total_mib)
+                if detected is None:
+                    die("%s has %s; revv needs at least %s"
+                        % (best.name, mib(best.total_mib), mib(VRAM_MIN_MIB)),
+                        "Nothing in v1.0 fits a smaller card. See README.md.")
+                tier = detected
+                print("Detected %s -> %s tier." % (best.name, tier.upper()))
+        # Every tier ships the same weights; see the note on BUILDS.
+        build = DEFAULT_BUILD
+
+    if build not in BUILDS:
+        die("unknown build: %s" % build,
+            "one of: %s" % ", ".join(sorted(BUILDS)))
+
+    spec = BUILDS[build]
+    filename = str(spec["file"])
+    dest = os.path.join(MODELS_DIR, filename)
+    if os.path.isfile(dest) and not args.force:
+        print("Already present: %s" % dest)
+        print("Run %s to verify it." % bold("revv inspect %s" % filename))
+        return 0
+
+    if not spec["certified"]:
+        print("%s %s is not the certified build." % (yellow("note:"), build))
+        print("       %s" % spec["note"])
+
+    url = hf_url(filename)
+    print("Downloading %s" % build)
+    print("  from  %s" % url.split("?")[0])
+    print("  to    %s" % dest)
+    size = head_size(url)
+    if size:
+        print("  size  %s" % gib(size))
+        free = shutil.disk_usage(os.path.dirname(dest) or ".").free \
+            if os.path.isdir(MODELS_DIR) else shutil.disk_usage(
+                os.path.expanduser("~")).free
+        if free < size * 1.05:
+            die("not enough disk space: %s free, need %s"
+                % (gib(free), gib(size * 1.05)),
+                "Free up space, or set REVV_HOME to a bigger volume:\n"
+                "REVV_HOME=/mnt/big/.revv revv get")
+    print()
+    try:
+        final = download(url, dest, expected_size=size)
+    except DownloadError as exc:
+        die(str(exc))
+        return 1
+    print("\nDownloaded %s" % gib(final))
+
+    try:
+        info = read_gguf(dest)
+    except GGUFError as exc:
+        die("the downloaded file does not parse as a GGUF: %s" % exc,
+            "Delete it and retry:\n  rm %s\n  revv get %s" % (dest, build))
+        return 1
+    verdict, _ = classify(info, dest)
+    print("Verified: %s, %s vocab, draft head %s"
+          % (info.dominant_quant,
+             "{:,}".format(info.n_vocab) if info.n_vocab else "?",
+             "present" if info.has_mtp_head else "ABSENT"))
+    print("Status:   %s" % verdict)
+    print("\nNext:  %s" % bold("revv serve"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# serve: a supervised llama-server behind a stable local port
+#
+# The user's tools point at one port and never move. Behind it revv runs
+# llama-server on an ephemeral port and can restart it in a different
+# configuration without the client noticing. That is what makes `revv toggle`
+# and `revv compare` possible, and it is the same trick llama-swap uses.
+# ---------------------------------------------------------------------------
+
+MODE_REVV = "revv"
+MODE_STOCK = "stock"
+
+# What llama-server advertises at /v1/models. In single-model mode the
+# "model" field of a request is ignored, but tools still want a name.
+MODEL_ALIAS = "revv"
+
+# STOCK is llama.cpp's own defaults for the three levers revv changes:
+# speculation, KV precision, and the thinking switch. Same weights, same GPU,
+# same context. It is a control for revv's configuration, NOT a measurement of
+# ollama or of anyone else's product.
+MODE_HELP = {
+    MODE_REVV: "certified: MTP speculation, quantized KV, thinking off",
+    MODE_STOCK: "llama.cpp defaults: no speculation, f16 KV, thinking on",
+}
+
+
+def build_server_argv(exe: str, model: str, tier: str, port: int,
+                      ctx: Optional[int], mode: str, use_spec: bool,
+                      passthrough: Sequence[str]) -> List[str]:
+    """Every flag in the revv arm is load-bearing; BENCHMARKS.md says why."""
+    t = TIERS[tier]
+    n_ctx = str(ctx if ctx is not None else t["ctx"])
+    argv = [exe, "-m", model, "-ngl", "99", "-c", n_ctx,
+            # Certified at one slot. Concurrency splits the context and was
+            # never measured, and the 12GB tier has 86 MiB of headroom.
+            "--parallel", "1",
+            # A stable id in /v1/models, so clients keep working across a mode
+            # switch and users have one short name to configure. Cosmetic: it
+            # is identical in both modes and cannot affect the measurement.
+            "-a", MODEL_ALIAS,
+            "--host", "127.0.0.1", "--port", str(port)]
+    if mode == MODE_REVV:
+        argv += [
+            "-fa", "on",
+            "-ctk", str(t["kv"]), "-ctv", str(t["kv"]),
+            # The RAM prompt cache delivers ZERO reuse on this hybrid
+            # architecture (measured against a control) while costing ~1 GB
+            # per 8K tokens. It is off on both counts.
+            "--cache-ram", "0",
+            "--no-cache-idle-slots",
+            # --chat-template-kwargs is read by the jinja engine, so --jinja
+            # must be set and must come first. Disabling thinking is the
+            # largest single effect in the stack: ~2.8x wall-clock per task.
+            "--jinja",
+            "--chat-template-kwargs", '{"enable_thinking":false}',
+        ]
+        if use_spec:
+            argv += ["--spec-type", SPEC_TYPE,
+                     "--spec-draft-n-max", str(SPEC_N_MAX)]
+    argv += list(passthrough)
+    return argv
+
+
+def _free_port() -> int:
+    """Ask the kernel for an unused port. Small race, local-only, acceptable."""
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+class Backend:
+    """Owns the llama-server child process and can restart it in a new mode."""
+
+    def __init__(self, exe: str, model: str, tier: str, ctx: Optional[int],
+                 use_spec: bool, passthrough: Sequence[str],
+                 log_path: str) -> None:
+        self.exe = exe
+        self.model = model
+        self.tier = tier
+        self.ctx = ctx
+        self.use_spec = use_spec
+        self.passthrough = list(passthrough)
+        self.log_path = log_path
+        self.proc = None            # type: Optional[subprocess.Popen]
+        self.port = 0
+        self.mode = MODE_REVV
+        self.lock = threading.Lock()
+        # Called after every successful start so the supervisor can persist the
+        # new backend pid. `revv down` needs that pid from DISK, because if the
+        # supervisor was killed the status endpoint died with it.
+        self.on_change = None       # type: Optional[Callable[[], None]]
+
+    def argv(self, mode: str, port: int) -> List[str]:
+        return build_server_argv(self.exe, self.model, self.tier, port,
+                                 self.ctx, mode, self.use_spec,
+                                 self.passthrough)
+
+    def start(self, mode: str, wait_s: float = 600.0) -> None:
+        self.port = _free_port()
+        self.mode = mode
+        argv = self.argv(mode, self.port)
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        log = open(self.log_path, "ab", 0)
+        log.write(b"\n=== revv: starting backend in %s mode ===\n"
+                  % mode.encode())
+        try:
+            self.proc = subprocess.Popen(argv, stdout=log, stderr=log,
+                                         stdin=subprocess.DEVNULL)
+        except OSError as exc:
+            raise RuntimeError("could not start %s: %s" % (self.exe, exc))
+        if not self._await_health(wait_s):
+            self.stop()
+            raise RuntimeError(
+                "llama-server did not become healthy.\n"
+                "Last lines of %s:\n%s" % (self.log_path, _tail(self.log_path)))
+        if self.on_change is not None:
+            self.on_change()
+
+    def _await_health(self, wait_s: float) -> bool:
+        url = "http://127.0.0.1:%d/health" % self.port
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                return False    # died during load, usually CUDA OOM
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        return True
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(0.4)
+        return False
+
+    def stop(self) -> None:
+        proc = self.proc
+        self.proc = None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+    def switch(self, mode: str) -> None:
+        """Restart in the other mode. The weights stay in the page cache, so
+        this is a reload from RAM, not from disk."""
+        with self.lock:
+            if mode == self.mode and self.proc is not None:
+                return
+            self.stop()
+            self.start(mode)
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+
+def _tail(path: str, n: int = 15) -> str:
+    try:
+        with open(path, "rb") as fh:
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return "(no log)"
+    return "\n".join("  " + ln for ln in lines[-n:])
+
+
+class _Stats:
+    """Rolling telemetry for the console log and the response header.
+
+    This is instrumentation, not measurement: `revv bench` and `revv compare`
+    are the instruments that follow the certified protocol.
+    """
+
+    def __init__(self) -> None:
+        self.last_tps = 0.0
+        self.n_requests = 0
+
+
+def _sse_token_count(body: bytes) -> Tuple[int, Optional[float], Optional[int]]:
+    """Walk a server-sent-event body: (content chunks, t/s if the server
+    reported it, completion tokens if reported)."""
+    chunks = 0
+    tps = None      # type: Optional[float]
+    n_tok = None    # type: Optional[int]
+    for raw in body.split(b"\n"):
+        if not raw.startswith(b"data: "):
+            continue
+        payload = raw[6:].strip()
+        if payload == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(payload.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        choices = obj.get("choices")
+        if isinstance(choices, list) and choices:
+            delta = choices[0].get("delta") or {}
+            # Reasoning tokens are tokens. In STOCK mode the model may spend
+            # its whole budget in the reasoning channel and emit no content at
+            # all; ignoring that would report zero work done.
+            if delta.get("content") or delta.get("reasoning_content"):
+                chunks += 1
+        timings = obj.get("timings")
+        if isinstance(timings, dict) and timings.get("predicted_per_second"):
+            tps = float(timings["predicted_per_second"])
+            n_tok = int(timings.get("predicted_n") or 0) or None
+        usage = obj.get("usage")
+        if isinstance(usage, dict) and usage.get("completion_tokens"):
+            n_tok = int(usage["completion_tokens"])
+    return chunks, tps, n_tok
+
+
+def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
+    class Handler(BaseHTTPRequestHandler):
+        # HTTP/1.0 with connection-close lets us stream a body of unknown
+        # length straight through without re-chunking it. Local hop, so the
+        # cost of a new connection per request is irrelevant.
+        protocol_version = "HTTP/1.0"
+        server_version = "revv/" + __version__
+
+        def log_message(self, fmt: str, *a: object) -> None:
+            pass    # we print our own, more useful, one-liner
+
+        def _control(self, path: str) -> bool:
+            if not path.startswith("/_revv/"):
+                return False
+            body = b""
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                body = self.rfile.read(length)
+            action = path[len("/_revv/"):].split("?")[0]
+            if action == "status":
+                self._json(200, self._status_obj())
+            elif action in ("toggle", "mode"):
+                want = MODE_STOCK if backend.mode == MODE_REVV else MODE_REVV
+                if action == "mode" and body:
+                    try:
+                        want = json.loads(body.decode("utf-8"))["mode"]
+                    except (ValueError, KeyError, TypeError):
+                        self._json(400, {"error": "expected {\"mode\": \"revv\""
+                                                  " or \"stock\"}"})
+                        return True
+                if want not in (MODE_REVV, MODE_STOCK):
+                    self._json(400, {"error": "unknown mode: %s" % want})
+                    return True
+                t0 = time.time()
+                try:
+                    backend.switch(want)
+                except RuntimeError as exc:
+                    self._json(500, {"error": str(exc)})
+                    return True
+                obj = self._status_obj()
+                obj["switch_seconds"] = round(time.time() - t0, 2)
+                print("[revv] mode -> %s (%.1fs)"
+                      % (backend.mode.upper(), obj["switch_seconds"]))
+                self._json(200, obj)
+            else:
+                self._json(404, {"error": "no such control endpoint"})
+            return True
+
+        def _status_obj(self) -> Dict[str, object]:
+            return {"mode": backend.mode,
+                    "mode_description": MODE_HELP[backend.mode],
+                    "model": os.path.basename(backend.model),
+                    "tier": backend.tier,
+                    "speculation": backend.use_spec and backend.mode == MODE_REVV,
+                    "backend_port": backend.port,
+                    # `revv down` uses this to reap an orphaned llama-server if
+                    # the supervisor died without cleaning up after itself.
+                    "backend_pid": (backend.proc.pid if backend.proc else 0),
+                    "supervisor_pid": os.getpid(),
+                    "requests": stats.n_requests,
+                    "last_decode_tps": round(stats.last_tps, 2)}
+
+        def _json(self, code: int, obj: Dict[str, object]) -> None:
+            payload = json.dumps(obj, indent=2).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _forward(self, method: str) -> None:
+            path = self.path
+            if self._control(path):
+                return
+            if not backend.alive():
+                self._json(503, {"error": "the llama-server backend is not "
+                                          "running; check the revv console"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else None
+
+            conn = http.client.HTTPConnection("127.0.0.1", backend.port,
+                                              timeout=3600)
+            headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in ("host", "connection",
+                                            "content-length")}
+            if body is not None:
+                headers["Content-Length"] = str(len(body))
+            t0 = time.time()
+            try:
+                conn.request(method, path, body=body, headers=headers)
+                resp = conn.getresponse()
+            except (OSError, http.client.HTTPException) as exc:
+                conn.close()
+                self._json(502, {"error": "backend request failed: %s" % exc})
+                return
+
+            self.send_response(resp.status)
+            for key, value in resp.getheaders():
+                # send_response() already emitted Server and Date; forwarding
+                # the backend's copies would duplicate both headers.
+                if key.lower() in ("connection", "transfer-encoding",
+                                   "content-length", "server", "date"):
+                    continue
+                self.send_header(key, value)
+            self.send_header("X-Revv-Mode", backend.mode)
+            # The rate of the PREVIOUS generation: headers must be written
+            # before the body, so this request's own rate does not exist yet.
+            self.send_header("X-Revv-Last-Decode-TPS", "%.2f" % stats.last_tps)
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            captured = bytearray()
+            t_first = None      # type: Optional[float]
+            # read1() hands back whatever has already arrived; plain read(n)
+            # blocks until it can fill n bytes, which stalls token streaming
+            # until 64 KB has piled up.
+            read_chunk = getattr(resp, "read1", None) or resp.read
+            try:
+                while True:
+                    chunk = read_chunk(65536)
+                    if not chunk:
+                        break
+                    if t_first is None:
+                        t_first = time.time()
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    if len(captured) < 4 * 1024 * 1024:
+                        captured += chunk
+            except (BrokenPipeError, ConnectionResetError):
+                return          # client hung up mid-stream; not our problem
+            finally:
+                conn.close()
+            self._record(method, path, bytes(captured), t0, t_first)
+
+        def _record(self, method: str, path: str, body: bytes,
+                    t0: float, t_first: Optional[float]) -> None:
+            if "/completion" not in path:
+                return
+            stats.n_requests += 1
+            now = time.time()
+            n_tok = None        # type: Optional[int]
+            tps = None          # type: Optional[float]
+            if body.startswith(b"data:") or b"\ndata: " in body[:4096]:
+                chunks, tps, n_tok = _sse_token_count(body)
+                if tps is None and t_first is not None and chunks > 1:
+                    tps = (chunks - 1) / max(now - t_first, 1e-6)
+                if n_tok is None:
+                    n_tok = chunks
+            else:
+                try:
+                    obj = json.loads(body.decode("utf-8", "replace"))
+                except ValueError:
+                    return
+                timings = obj.get("timings")
+                if isinstance(timings, dict):
+                    tps = timings.get("predicted_per_second")
+                    n_tok = timings.get("predicted_n")
+                usage = obj.get("usage") or {}
+                n_tok = n_tok or usage.get("completion_tokens")
+            if tps:
+                stats.last_tps = float(tps)
+            if quiet:
+                return
+            ttft = "-" if t_first is None else "%.2fs" % (t_first - t0)
+            print("[revv] %s %s  mode=%s  %s tok  %s  ttft %s  %.1fs"
+                  % (method, path, backend.mode.upper(),
+                     n_tok if n_tok else "?",
+                     "%.1f t/s" % tps if tps else "-",
+                     ttft, now - t0))
+            sys.stdout.flush()
+
+        def do_GET(self) -> None:
+            self._forward("GET")
+
+        def do_POST(self) -> None:
+            self._forward("POST")
+
+        def do_DELETE(self) -> None:
+            self._forward("DELETE")
+
+        def do_OPTIONS(self) -> None:
+            self._forward("OPTIONS")
+
+    return Handler
+
+
+def _pick_tier(explicit: Optional[str], quiet: bool = False) -> str:
+    if explicit is not None:
+        if explicit not in TIERS:
+            die("unknown tier: %s" % explicit,
+                "one of: %s" % ", ".join(sorted(TIERS)))
+        return explicit
+    gpus, err = detect_gpus()
+    if err is not None:
+        die("cannot detect a GPU: %s" % err,
+            "revv v1.0 is NVIDIA-only. If nvidia-smi works but revv cannot see\n"
+            "it, force a tier:  revv serve --tier 12gb")
+    best = max(gpus, key=lambda g: g.total_mib)
+    detected = tier_for(best.total_mib)
+    if detected is None:
+        die("%s has %s; the certified config peaks at %s"
+            % (best.name, mib(best.total_mib), mib(CERT_PEAK_MIB)),
+            "Trade capability for fit with a smaller context:\n"
+            "  revv serve --tier 12gb --ctx 8192")
+    if detected == "12gb" and best.used_mib > VRAM_IDLE_WARN_MIB and not quiet:
+        print("%s %s is already in use on a 12GB card, and the certified "
+              "config peaks at %s.\n         Run headless or add --ctx 8192 "
+              "if this OOMs."
+              % (yellow("warning:"), mib(best.used_mib), mib(CERT_PEAK_MIB)))
+    return str(detected)
+
+
+def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
+    exe = find_llama_server()
+    if exe is None:
+        die("llama-server not found",
+            "./install.sh   # builds it into %s" % BIN_DIR)
+        return 1
+    model = resolve_model(args.model)
+    tier = _pick_tier(args.tier)
+
+    # A model without the draft head cannot speculate, and passing the flags
+    # anyway makes llama-server fail to start with an opaque message.
+    try:
+        info = read_gguf(model)
+    except GGUFError as exc:
+        die("cannot read %s: %s" % (model, exc))
+        return 1
+    use_spec = info.has_mtp_head
+    mode = MODE_STOCK if args.stock else MODE_REVV
+
+    if args.print_command:
+        argv = build_server_argv(exe, model, tier, args.port, args.ctx, mode,
+                                 use_spec, passthrough)
+        print(" ".join(_shell_quote(a) for a in argv))
+        return 0
+
+    print(bold("revv %s  --  serve" % __version__))
+    print("  model    %s" % os.path.basename(model))
+    print("  tier     %s   ctx %s   KV %s"
+          % (tier.upper(), args.ctx if args.ctx else TIERS[tier]["ctx"],
+             TIERS[tier]["kv"]))
+    if not use_spec:
+        print("  %s no MTP draft head in this model, so speculation is off."
+              % yellow("note:"))
+        print("         Expect roughly %.0f t/s rather than %.0f."
+              % (CERT_TS_NOSPEC, CERT_TS))
+
+    backend = Backend(exe, model, tier, args.ctx, use_spec, passthrough,
+                      os.path.join(REVV_HOME, "logs", "llama-server.log"))
+    print("\n  starting llama-server (first load pages ~%s off disk)..."
+          % gib(info.file_size))
+    sys.stdout.flush()
+    try:
+        backend.start(mode)
+    except RuntimeError as exc:
+        die(str(exc),
+            "On a 12GB card the usual cause is VRAM: the certified config\n"
+            "peaks at %s of ~12,044 MiB. Close the desktop session, or:\n"
+            "  revv serve --ctx 8192" % mib(CERT_PEAK_MIB))
+        return 1
+
+    stats = _Stats()
+    handler = make_proxy_handler(backend, stats, args.quiet)
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), handler)
+    except OSError as exc:
+        backend.stop()
+        die("cannot bind %s:%d (%s)" % (args.host, args.port, exc),
+            "Something else is on that port. Pick another:\n"
+            "  revv serve --port 8081")
+        return 1
+    httpd.daemon_threads = True
+
+    print("\n  %s  http://%s:%d/v1" % (bold("api"), args.host, args.port))
+    print("  mode     %s -- %s" % (bold(backend.mode.upper()),
+                                   MODE_HELP[backend.mode]))
+    print("  backend  llama-server on 127.0.0.1:%d" % backend.port)
+    print("  log      %s" % backend.log_path)
+    print("\n  Point any OpenAI-compatible tool at the api url above; the port")
+    print("  stays put even when the backend restarts. Model name: %s"
+          % bold(MODEL_ALIAS))
+    print("    %s   switch between certified and stock" % bold("revv toggle"))
+    print("    %s  measure both, side by side" % bold("revv compare"))
+    print("    %s    the certified-protocol benchmark" % bold("revv bench"))
+    print("\n  Ctrl-C to stop.\n")
+    sys.stdout.flush()
+
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+
+    # `revv up` runs this very function detached, so serve is the only writer of
+    # the run file; up and status just read it.
+    started_at = time.time()
+
+    def _persist() -> None:
+        write_run_file(pid=os.getpid(), port=args.port, host=args.host,
+                       model=os.path.basename(model), tier=tier,
+                       backend_pid=(backend.proc.pid if backend.proc else 0),
+                       started_at=started_at,
+                       log=os.path.join(LOG_DIR, "revv.log"))
+
+    _persist()
+    backend.on_change = _persist
+
+    # SIGTERM is how `revv down` asks us to stop. Turning it into
+    # KeyboardInterrupt routes it through the same cleanup path as Ctrl-C --
+    # without this the default handler would kill us and orphan llama-server
+    # holding 11 GB of VRAM.
+    def _on_term(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _on_term)
+
+    try:
+        while True:
+            time.sleep(0.5)
+            if not backend.alive() and not backend.lock.locked():
+                print("\n%s the llama-server backend exited. Last log lines:\n%s"
+                      % (red("error:"), _tail(backend.log_path)),
+                      file=sys.stderr)
+                return 1
+    except KeyboardInterrupt:
+        print("\n  stopping...")
+    finally:
+        httpd.shutdown()
+        backend.stop()
+        clear_run_file()
+    print("  stopped.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# toggle
+# ---------------------------------------------------------------------------
+
+def _control(url: str, action: str, payload: Optional[Dict[str, object]] = None,
+             timeout: float = 900.0) -> Dict[str, object]:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else b""
+    req = urllib.request.Request(
+        url.rstrip("/") + "/_revv/" + action, data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "revv/1.0"},
+        method="POST" if payload is not None or action != "status" else "GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _no_server(url: str, exc: object) -> None:
+    die("no revv server at %s (%s)" % (url, exc),
+        "Start one in another terminal:\n  revv serve\n"
+        "This command talks to a running `revv serve`, not to llama-server.")
+
+
+def cmd_toggle(args: argparse.Namespace) -> int:
+    try:
+        before = _control(args.url, "status")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        _no_server(args.url, exc)
+        return 1
+    want = args.mode or (MODE_STOCK if before["mode"] == MODE_REVV else MODE_REVV)
+    if want == before["mode"]:
+        print("Already in %s mode." % str(want).upper())
+        return 0
+    print("Switching %s -> %s ..." % (str(before["mode"]).upper(),
+                                      str(want).upper()))
+    print("  the weights stay in the page cache, so this is usually 10-15 s.")
+    sys.stdout.flush()
+    try:
+        after = _control(args.url, "mode", {"mode": want})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die("the switch failed: %s" % exc,
+            "Check the `revv serve` console for the llama-server error.")
+        return 1
+    if after.get("error"):
+        die(str(after["error"]))
+    print("\n  mode  %s -- %s" % (bold(str(after["mode"]).upper()),
+                                  after["mode_description"]))
+    print("  took  %.1fs" % float(after.get("switch_seconds") or 0.0))
+    print("  the api url did not change; your client did not notice.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# compare
+#
+# The demo. Same prompt, same weights, same GPU, both modes, one table.
+# ---------------------------------------------------------------------------
+
+def _timed_generation(base: str, thinking_off: bool, max_tokens: int,
+                      timeout: float) -> Tuple[float, float, int, float]:
+    """Return (decode t/s, time to first token, completion tokens, wall s).
+
+    Streams, because time-to-first-token is half the point: it separates
+    prefill from decode without needing the server's own counters.
+    """
+    payload = {
+        "messages": [{"role": "user", "content": BENCH_PROMPT}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "top_k": 1,
+        "seed": 1234,
+        "stream": True,
+        "cache_prompt": False,
+    }
+    if thinking_off:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    req = urllib.request.Request(
+        base.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "revv/1.0"})
+    t0 = time.time()
+    t_first = None      # type: Optional[float]
+    body = bytearray()
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # Line-at-a-time: an SSE event ends at a newline, and read(n) would
+        # block until n bytes accumulated, destroying the time-to-first-token
+        # measurement this function exists to take.
+        for line in resp:
+            # Time to FIRST TOKEN, whichever channel it comes out of: with
+            # thinking on, the first thing the model emits is reasoning.
+            if t_first is None and line.startswith(b"data: ") and (
+                    b'"content":"' in line
+                    or b'"reasoning_content":"' in line):
+                t_first = time.time()
+            body += line
+    wall = time.time() - t0
+    chunks, tps, n_tok = _sse_token_count(bytes(body))
+    if t_first is None:
+        t_first = t0
+    if n_tok is None:
+        n_tok = chunks
+    if tps is None:
+        tps = (chunks - 1) / max(time.time() - t_first, 1e-6) if chunks > 1 \
+            else 0.0
+    return float(tps), t_first - t0, int(n_tok), wall
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    base = args.url.rstrip("/")
+    try:
+        start_status = _control(base, "status")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        _no_server(base, exc)
+        return 1
+    original = str(start_status["mode"])
+
+    print(bold("revv %s  --  compare" % __version__))
+    print("  model    %s" % start_status["model"])
+    print("  prompt   the certified bench prompt, greedy, one request per mode")
+    print("  budget   %d tokens max; each mode stops when it is done\n"
+          % args.max_tokens)
+
+    rows = []
+    try:
+        for mode in (MODE_STOCK, MODE_REVV):
+            print("  %-5s switching..." % mode.upper(), end="")
+            sys.stdout.flush()
+            _control(base, "mode", {"mode": mode})
+            print("\r  %-5s generating...     " % mode.upper(), end="")
+            sys.stdout.flush()
+            tps, ttft, n_tok, wall = _timed_generation(
+                base, thinking_off=(mode == MODE_REVV),
+                max_tokens=args.max_tokens, timeout=args.timeout)
+            rows.append((mode, tps, ttft, n_tok, wall))
+            print("\r  %-5s done.               " % mode.upper())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die("comparison failed: %s" % exc,
+            "Check the `revv serve` console for the llama-server error.")
+        return 1
+    finally:
+        try:
+            _control(base, "mode", {"mode": original})
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+
+    print("\n  %-7s %11s %8s %9s %9s" % ("mode", "decode t/s", "ttft",
+                                         "tokens", "wall"))
+    print("  " + "-" * 47)
+    for mode, tps, ttft, n_tok, wall in rows:
+        print("  %-7s %11.1f %7.2fs %9d %8.1fs"
+              % (mode.upper(), tps, ttft, n_tok, wall))
+
+    stock = rows[0]
+    revv = rows[1]
+    print()
+    if stock[1] > 0:
+        print("  decode rate   %.2fx faster" % (revv[1] / stock[1]))
+    if stock[4] > 0:
+        print("  time to done  %.2fx faster  (%.1fs -> %.1fs)"
+              % (stock[4] / revv[4], stock[4], revv[4]))
+    if revv[3] and stock[3] > revv[3]:
+        print("  tokens spent  %d -> %d  (STOCK thinks out loud; revv does not)"
+              % (stock[3], revv[3]))
+
+    print("\n  " + dim("STOCK = the same weights on the same GPU with"
+                       " llama.cpp's defaults for"))
+    print("  " + dim("speculation, KV precision and the thinking switch. It is"
+                     " a control for"))
+    print("  " + dim("revv's configuration, not a measurement of any other"
+                     " product."))
+    print("  " + dim("Restored to %s mode." % original.upper()))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Daemon lifecycle: up / down / status
+#
+# revv is meant to be plumbing you forget about. `revv up` detaches the same
+# stack `revv serve` runs in the foreground. No systemd or launchd units in
+# v1.0 -- setsid is enough, and autostart can come later.
+# ---------------------------------------------------------------------------
+
+RUN_DIR = os.path.join(REVV_HOME, "run")
+RUN_FILE = os.path.join(RUN_DIR, "revv.json")
+LOG_DIR = os.path.join(REVV_HOME, "logs")
+
+
+def write_run_file(**fields: object) -> None:
+    os.makedirs(RUN_DIR, exist_ok=True)
+    tmp = RUN_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(fields, fh, indent=2)
+    os.replace(tmp, RUN_FILE)
+
+
+def read_run_file() -> Optional[Dict[str, object]]:
+    try:
+        with open(RUN_FILE, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def clear_run_file() -> None:
+    try:
+        os.remove(RUN_FILE)
+    except OSError:
+        pass
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True     # exists, owned by someone else
+    return True
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    existing = read_run_file()
+    if existing and pid_alive(int(existing.get("pid") or 0)):
+        print("revv is already up (pid %s) on http://%s:%s/v1"
+              % (existing.get("pid"), existing.get("host"),
+                 existing.get("port")))
+        print("Use %s to inspect it, %s to stop it."
+              % (bold("revv status"), bold("revv down")))
+        return 0
+    clear_run_file()
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, "revv.log")
+    argv = [sys.executable, os.path.abspath(__file__), "serve", "--quiet"]
+    if args.model:
+        argv.append(args.model)
+    for flag, value in (("--port", args.port), ("--host", args.host),
+                        ("--ctx", args.ctx), ("--tier", args.tier)):
+        if value is not None:
+            argv += [flag, str(value)]
+    if args.stock:
+        argv.append("--stock")
+
+    print("Starting revv in the background...")
+    print("  log  %s" % log_path)
+    sys.stdout.flush()
+    log = open(log_path, "ab", 0)
+    log.write(b"\n=== revv up ===\n")
+    # start_new_session detaches from this terminal's process group, so the
+    # stack survives the terminal closing without needing nohup.
+    proc = subprocess.Popen(argv, stdout=log, stderr=log,
+                            stdin=subprocess.DEVNULL, start_new_session=True)
+
+    base = "http://%s:%d" % (args.host, args.port)
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            print("%s revv failed to start. Last log lines:\n%s"
+                  % (red("error:"), _tail(log_path, 20)), file=sys.stderr)
+            return 1
+        try:
+            st = _control(base, "status", timeout=3)
+        except (urllib.error.URLError, OSError, ValueError):
+            time.sleep(0.5)
+            continue
+        print("\n  %s   http://%s:%d/v1" % (bold("api"), args.host, args.port))
+        print("  mode  %s -- %s" % (bold(str(st["mode"]).upper()),
+                                    st["mode_description"]))
+        print("  model %s" % st["model"])
+        print("  pid   %d" % proc.pid)
+        print("\n  %s to see it, %s to stop it, %s for the demo."
+              % (bold("revv status"), bold("revv down"), bold("revv compare")))
+        return 0
+    proc.terminate()
+    print("%s revv did not come up within %ds. Last log lines:\n%s"
+          % (red("error:"), int(args.timeout), _tail(log_path, 20)),
+          file=sys.stderr)
+    return 1
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    run = read_run_file()
+    if not run:
+        print("revv is not running (no %s)." % RUN_FILE)
+        return 0
+    pid = int(run.get("pid") or 0)
+    base = "http://%s:%s" % (run.get("host"), run.get("port"))
+
+    # Ask the supervisor for the backend pid first: if the supervisor is
+    # already gone we still have to make sure no llama-server is orphaned.
+    backend_pid = 0
+    try:
+        st = _control(base, "status", timeout=3)
+        backend_pid = int(st.get("backend_pid") or 0)
+    except (urllib.error.URLError, OSError, ValueError):
+        # The supervisor is unreachable, which is exactly the case where an
+        # orphan is most likely. Fall back to the pid it wrote to disk.
+        backend_pid = int(run.get("backend_pid") or 0)
+
+    if not pid_alive(pid):
+        print("revv supervisor (pid %d) is already gone." % pid)
+    else:
+        print("Stopping revv (pid %d)..." % pid)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            die("could not signal pid %d: %s" % (pid, exc),
+                "Stop it by hand:  kill %d" % pid)
+        deadline = time.time() + 30.0
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.3)
+        if pid_alive(pid):
+            print("  it ignored SIGTERM; sending SIGKILL.")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            time.sleep(1.0)
+
+    # Never leave a llama-server holding 11 GB of VRAM.
+    if backend_pid and pid_alive(backend_pid):
+        print("  reaping orphaned llama-server (pid %d)..." % backend_pid)
+        try:
+            os.kill(backend_pid, signal.SIGTERM)
+            deadline = time.time() + 20.0
+            while time.time() < deadline and pid_alive(backend_pid):
+                time.sleep(0.3)
+            if pid_alive(backend_pid):
+                os.kill(backend_pid, signal.SIGKILL)
+        except OSError:
+            pass
+    clear_run_file()
+    print("Stopped.")
+    return 0
+
+
+def _uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm %ds" % (seconds // 60, seconds % 60)
+    return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    run = read_run_file()
+    base = args.url.rstrip("/") if args.url else (
+        "http://%s:%s" % (run.get("host"), run.get("port")) if run else None)
+    if base is None:
+        print("revv is not running.")
+        print("Start it with %s (background) or %s (foreground)."
+              % (bold("revv up"), bold("revv serve")))
+        return 1
+    try:
+        st = _control(base, "status", timeout=5)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print("%s no revv server at %s (%s)" % (red("down:"), base, exc))
+        if run:
+            print("  a stale %s says pid %s; clear it with %s"
+                  % (RUN_FILE, run.get("pid"), bold("revv down")))
+        return 1
+
+    print(bold("revv %s  --  status" % __version__))
+    print("  api      %s/v1" % base)
+    print("  mode     %s -- %s" % (bold(str(st["mode"]).upper()),
+                                   st["mode_description"]))
+    print("  model    %s   (send \"%s\" as the model name)"
+          % (st["model"], MODEL_ALIAS))
+    print("  tier     %s   speculation %s"
+          % (str(st["tier"]).upper(), "on" if st["speculation"] else "off"))
+    if run and run.get("started_at"):
+        print("  uptime   %s   pid %s"
+              % (_uptime(time.time() - float(run["started_at"])),
+                 run.get("pid")))
+    print("  requests %s" % st["requests"])
+    last = float(st.get("last_decode_tps") or 0.0)
+    print("  last     %s" % ("%.1f t/s on the most recent generation" % last
+                             if last else "no generations yet"))
+
+    gpus, err = detect_gpus()
+    if err is None and gpus:
+        g = max(gpus, key=lambda x: x.total_mib)
+        head = g.total_mib - g.used_mib
+        print("  vram     %s used of %s  (%s free)"
+              % (mib(g.used_mib), mib(g.total_mib), mib(head)))
+        if g.used_mib > CERT_PEAK_MIB and head < 200:
+            print("           %s that is close to the ceiling."
+                  % yellow("note:"))
+    return 0
+
+
+def _shell_quote(s: str) -> str:
+    return s if re.match(r"^[\w@%+=:,./-]+$", s) else "'" + s.replace(
+        "'", "'\"'\"'") + "'"
+
+
+# ---------------------------------------------------------------------------
+# bench
+#
+# The community-feedback instrument. Reproduces the re-certification protocol:
+# 4 sequential requests, a code prompt, 400 new tokens, greedy, thinking off.
+# ---------------------------------------------------------------------------
+
+BENCH_PROMPT = (
+    "Write a complete Python implementation of an LRU cache with a fixed "
+    "capacity. Use a dict plus a doubly linked list so that get and put are "
+    "both O(1). Include the node class, full link/unlink handling, and "
+    "docstrings. Do not use collections.OrderedDict or functools.lru_cache."
+)
+BENCH_N_PREDICT = 400
+BENCH_REQUESTS = 4
+
+
+def _post_json(url: str, payload: Dict[str, object],
+               timeout: float) -> Dict[str, object]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "revv/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+class BenchResult:
+    def __init__(self, ts: float, n_tok: int, wall: float, source: str,
+                 reasoning_chars: int) -> None:
+        self.ts = ts
+        self.n_tok = n_tok
+        self.wall = wall
+        self.source = source
+        self.reasoning_chars = reasoning_chars
+
+
+def _bench_once(base: str, timeout: float) -> BenchResult:
+    payload = {
+        "messages": [{"role": "user", "content": BENCH_PROMPT}],
+        "max_tokens": BENCH_N_PREDICT,
+        "temperature": 0.0,   # greedy, exactly as certified
+        "top_k": 1,
+        "seed": 1234,
+        "stream": False,
+        "cache_prompt": False,  # a warm prefix would replay the previous answer
+        # Belt and braces: serve already sets this server-side, but a leaked
+        # reasoning block is the one failure that silently invalidates a result.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    t0 = time.time()
+    body = _post_json(base + "/v1/chat/completions", payload, timeout)
+    wall = time.time() - t0
+
+    usage = body.get("usage") or {}
+    n_tok = int(usage.get("completion_tokens") or 0)
+    reasoning = ""
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if isinstance(msg, dict):
+            reasoning = msg.get("reasoning_content") or ""
+
+    timings = body.get("timings")
+    if isinstance(timings, dict) and timings.get("predicted_per_second"):
+        # llama-server's own decode rate: excludes prefill, and is the exact
+        # quantity the re-certification table reports.
+        return BenchResult(float(timings["predicted_per_second"]),
+                           int(timings.get("predicted_n") or n_tok), wall,
+                           "server", len(reasoning))
+    if n_tok:
+        return BenchResult(n_tok / wall, n_tok, wall, "wall-clock",
+                           len(reasoning))
+    raise RuntimeError("server returned no token counts")
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    base = args.url.rstrip("/")
+    print(bold("revv %s  --  bench" % __version__))
+    print("  target   %s" % base)
+    print("  protocol %d requests, %d new tokens, greedy, thinking off"
+          % (BENCH_REQUESTS, BENCH_N_PREDICT))
+
+    try:
+        with urllib.request.urlopen(base + "/health", timeout=10) as resp:
+            resp.read()
+    except (urllib.error.URLError, OSError) as exc:
+        die("no server at %s (%s)" % (base, exc),
+            "Start one in another terminal:\n  revv serve\n"
+            "Or point bench elsewhere:\n  revv bench --url http://host:8080")
+        return 1
+
+    print("\n  warmup...", end="")
+    sys.stdout.flush()
+    try:
+        _bench_once(base, args.timeout)
+    except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+        print()
+        die("the warmup request failed: %s" % exc,
+            "Check the llama-server log. A 12GB card OOMs here if a desktop\n"
+            "session is holding VRAM: peak during generation is %s."
+            % mib(CERT_PEAK_MIB))
+        return 1
+    print(" done (excluded from the result)\n")
+
+    runs: List[BenchResult] = []
+    for i in range(BENCH_REQUESTS):
+        try:
+            r = _bench_once(base, args.timeout)
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError) as exc:
+            die("request %d failed: %s" % (i + 1, exc))
+            return 1
+        runs.append(r)
+        print("  request %d   %6.2f t/s   %4d tokens   %5.2f s wall"
+              % (i + 1, r.ts, r.n_tok, r.wall))
+
+    rates = sorted(r.ts for r in runs)
+    mean = sum(rates) / len(rates)
+    median = rates[len(rates) // 2] if len(rates) % 2 else \
+        (rates[len(rates) // 2 - 1] + rates[len(rates) // 2]) / 2.0
+    spread = (rates[-1] - rates[0]) / mean * 100.0
+    leaked = any(r.reasoning_chars > 0 for r in runs)
+
+    print("\n  " + bold("result"))
+    print("    decode      %.2f t/s mean, %.2f median" % (mean, median))
+    print("    spread      %.1f%% across %d requests (noise floor is ~1%%)"
+          % (spread, len(rates)))
+    print("    measured by %s" % ("llama-server timings"
+                                  if runs[0].source == "server"
+                                  else "wall clock (server timings absent)"))
+
+    # The thinking canary. Every quality number this project published before
+    # 2026-09-02 was wrong because this check did not exist.
+    if leaked:
+        print("\n  " + red("thinking is LEAKING"))
+        print("    The server returned a reasoning block, so enable_thinking is")
+        print("    not taking effect. The model is burning its budget on")
+        print("    reasoning: ~2.8x slower per task, and the quality numbers in")
+        print("    BENCHMARKS.md do not apply. Check that --jinja is set and")
+        print("    that your GGUF's chat template honours enable_thinking.")
+
+    # Compare against the figure that matches the build actually installed,
+    # not the headline. Flagging a healthy stock build as "slow" would be noise.
+    manifest = read_build_manifest()
+    patched = bool(manifest and "mmvq_iquant_decode.patch"
+                   in (manifest.get("patches") or []))
+    target = CERT_TS_PATCHED if patched else CERT_TS_STOCK
+    target_label = ("kernel-patched build" if patched else
+                    "stock build" if manifest else
+                    "stock build (assumed: unknown provenance)")
+
+    print("\n  " + bold("certified reference (RTX 3060 12GB, sm_86, c=16384)"))
+    print("    %-44s %6.1f t/s" % ("MTP n=2, q8_0 KV, kernel-patched",
+                                   CERT_TS_PATCHED))
+    print("    %-44s %6.1f t/s" % ("MTP n=2, q8_0 KV, stock llama.cpp",
+                                   CERT_TS_STOCK))
+    print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
+                                   CERT_TS_NOSPEC))
+    print("    comparing against the %s" % target_label)
+
+    print("\n  " + bold("reading"))
+    ratio = mean / target
+    if ratio >= 0.95:
+        print("    %s within 5%% of the reference (%.1f t/s)."
+              % (green("on target:"), target))
+    elif mean < CERT_TS_NOSPEC * 1.15:
+        print("    %s %.1f t/s sits in the no-speculation regime."
+              % (red("speculation is not running:"), mean))
+        print("    Almost always a model without the MTP draft head. Check:")
+        print("      revv inspect <your.gguf>")
+    elif ratio >= 0.85:
+        print("    %s %.0f%% of reference. Usual causes: a hotter or"
+              % (yellow("slightly low:"), ratio * 100))
+        print("    power-limited card, a slower CPU on the host-side draft")
+        print("    path, or another process sharing the GPU.")
+    else:
+        print("    %s %.0f%% of reference. Check nvidia-smi for other"
+              % (red("well below:"), ratio * 100))
+        print("    processes, and confirm -ngl put every layer on the GPU.")
+    print("\n  Numbers off? That is the useful case -- open an issue with this")
+    print("  output, `revv doctor`, and your GPU model. BENCHMARKS.md documents")
+    print("  exactly how the reference figures were produced.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="revv",
+        description="revv, by Mericanii -- Qwen3.8-27B on consumer NVIDIA GPUs.",
+        epilog="Start with: revv doctor")
+    p.add_argument("--version", action="version",
+                   version="revv %s" % __version__)
+    sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("doctor", help="check this machine and report what is possible")
+
+    g = sub.add_parser("get", help="download the certified model")
+    g.add_argument("tier", nargs="?", help="12gb / 16gb / 24gb (default: detect)")
+    g.add_argument("--build", help="download a specific build: %s"
+                   % ", ".join(sorted(BUILDS)))
+    g.add_argument("--force", action="store_true",
+                   help="re-download even if the file is already present")
+
+    i = sub.add_parser("inspect", help="parse a GGUF and report its capabilities")
+    i.add_argument("file", help="path to a .gguf file")
+
+    a = sub.add_parser("adopt",
+                       help="find and register GGUFs already on this machine")
+    a.add_argument("--source", choices=["ollama", "lmstudio"],
+                   help="scan only one store (default: both)")
+    a.add_argument("--all", action="store_true",
+                   help="adopt non-Qwen models too; revv's numbers will not apply")
+    a.add_argument("--dry-run", action="store_true",
+                   help="show what would be adopted without writing the registry")
+
+    def add_serve_flags(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("model", nargs="?",
+                        help="path, filename, build name, or adopted name")
+        sp.add_argument("--port", type=int, default=8080,
+                        help="the stable port your tools point at (default 8080)")
+        sp.add_argument("--host", default="127.0.0.1")
+        sp.add_argument("--ctx", type=int, help="override the context size")
+        sp.add_argument("--tier", help="force a tier instead of detecting one")
+        sp.add_argument("--stock", action="store_true",
+                        help="start in STOCK mode (llama.cpp defaults)")
+
+    s = sub.add_parser(
+        "serve", help="run the stack in the foreground (verbose; for debugging)",
+        epilog="Unknown flags are passed through to llama-server unchanged.")
+    add_serve_flags(s)
+    s.add_argument("--quiet", action="store_true",
+                   help="suppress the per-request log line")
+    s.add_argument("--print-command", action="store_true",
+                   help="print the llama-server command and exit")
+
+    u = sub.add_parser("up", help="start the stack in the background")
+    add_serve_flags(u)
+    u.add_argument("--timeout", type=float, default=600.0,
+                   help="seconds to wait for the model to load")
+
+    sub.add_parser("down", help="stop the background stack and its llama-server")
+
+    st = sub.add_parser("status", help="show mode, model, port, uptime, VRAM")
+    st.add_argument("--url", help="query a specific instance")
+
+    t = sub.add_parser("toggle",
+                       help="switch between revv and STOCK without moving the port")
+    t.add_argument("mode", nargs="?", choices=[MODE_REVV, MODE_STOCK],
+                   help="switch to a specific mode (default: the other one)")
+    t.add_argument("--url", default="http://127.0.0.1:8080")
+
+    c = sub.add_parser("compare",
+                       help="run the same prompt through both modes, side by side")
+    c.add_argument("--url", default="http://127.0.0.1:8080")
+    c.add_argument("--max-tokens", type=int, default=1024)
+    c.add_argument("--timeout", type=float, default=900.0)
+
+    b = sub.add_parser("bench", help="time a running server against the reference")
+    b.add_argument("--url", default="http://127.0.0.1:8080")
+    b.add_argument("--timeout", type=float, default=300.0)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # serve forwards unrecognised flags to llama-server; every other command
+    # treats an unknown flag as a typo and should say so.
+    if raw and raw[0] == "serve":
+        args, passthrough = parser.parse_known_args(raw)
+    else:
+        args, passthrough = parser.parse_args(raw), []
+
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    handlers = {
+        "doctor": cmd_doctor, "get": cmd_get, "inspect": cmd_inspect,
+        "adopt": cmd_adopt, "up": cmd_up, "down": cmd_down,
+        "status": cmd_status, "toggle": cmd_toggle, "compare": cmd_compare,
+        "bench": cmd_bench,
+    }
+    if args.command == "serve":
+        return cmd_serve(args, passthrough)
+    handler = handlers.get(args.command)
+    if handler is None:
+        parser.print_help()
+        return 0
+    return handler(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+    except BrokenPipeError:
+        # e.g. `revv doctor | head`
+        os._exit(0)

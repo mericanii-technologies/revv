@@ -1,0 +1,394 @@
+# revv Benchmarks
+
+## 1. What this document is
+
+These are the measurements behind revv's claims — speed, quality, VRAM, and
+context — including the ones that went against us. Section 12 lists every
+number we published and then retracted, and why. If a figure isn't in this
+document, or isn't reproducible with the protocol described in Section 2,
+don't trust it.
+
+## 2. The rig and the protocol
+
+**Hardware and software.** RTX 3060 12GB (sm_86), driver 535.309.01, Ryzen 5
+3600, 47 GB DDR4, Ubuntu 24.04, headless. llama.cpp build 10718 /
+9efa1595e for the speed re-certification below; a cross-check binary, build
+169 / daef7b6, unpatched, was used to sanity-check results against an
+independent build.
+
+**Speed protocol** (the re-certification, 2026-09-02):
+
+- Server started with: `-ngl 99 -fa on -ctk <kv> -ctv <kv> -c <ctx> --parallel 1 --no-warmup`,
+  plus `--spec-type draft-mtp --spec-draft-n-max <n>` where speculation is in
+  play.
+- Client settings: `temperature=0, top_k=1, seed=1234, max_tokens=400,
+  cache_prompt=false, chat_template_kwargs={"enable_thinking": false}`.
+- Prompt: one fixed greedy code prompt (a persistent on-disk B-tree module),
+  99 tokens exactly (~110 tokens).
+- Each cell is 1 discarded warm-up request followed by 4 measured requests;
+  the reported number is the mean of those 4.
+- Decode t/s is read from llama-server's own timings
+  (`predicted_n / predicted_ms`), not from client-side wall-clock. This
+  matters — see Section 7 for a case where raw t/s and actual work speed
+  told opposite stories.
+- VRAM is the peak of a 1 Hz `nvidia-smi` sample taken across the duration of
+  the requests, not a single reading at load time. See Section 4 for why this
+  distinction changed our results.
+- Guard: the server refuses to start unless the card is already below 500 MiB
+  used, so every cell starts from a clean baseline.
+
+**Noise floor.** Within-cell spread is 0.1-0.8%. Drift over a 3-hour run is
+<=1.1%. We treat +/-1% as the measurement floor and don't call anything under
+roughly 2% a real difference. This is stated here, up front, so you can apply
+your own skepticism to any close numbers in the tables below rather than
+take our word for which differences matter.
+
+**Quality protocol.** Full HumanEval-164, greedy decoding, thinking off.
+
+## 3. Speed: the official table
+
+Decode t/s, 400-token code generation, shallow depth (empty/short context at
+start of generation):
+
+| # | config | decode t/s | vs no-spec | accept | mean len | VRAM peak MiB |
+|---|---|---|---|---|---|---|
+| 1 | IQ3_XXS + MTP n=2, q8_0 KV, c=16384 **[SHIPPING]** | 34.39 | 1.719x | 0.781 | 2.56 | 11958 |
+| 2 | IQ3_XXS + MTP n=2, f16 KV, c=16384 | OOM | — | — | — | 11960 (dies) |
+| 3a | IQ3_XXS + MTP n=3, q8_0 KV, c=16384 | 32.76 | 1.638x | 0.638 | 2.91 | 11984 |
+| 3b | IQ3_XXS + MTP n=4 / n=5, q8_0 KV, c=16384 | OOM | — | — | — | — |
+| 4a | Q2_K_XL + MTP n=2, f16 KV, c=16384 | 34.73 | 1.735x | 0.771 | 2.54 | 11156 |
+| 4b | Q2_K_XL + MTP n=2, q8_0 KV, c=16384 | 34.64 | 1.732x | 0.781 | 2.56 | 10704 |
+| 5 | IQ3_XXS no-spec, f16 KV, c=16384 | 20.15 | 1.007x | — | — | 11440 |
+| 5b | IQ3_XXS no-spec, q8_0 KV, c=16384 (RAW FLOOR) | 20.00 | 1.000x | — | — | 10986 |
+
+The OOM rows are in the table on purpose. IQ3_XXS with MTP n=2 and f16 KV
+dies during the run at c=16384; IQ3_XXS with MTP n=4 or n=5 (q8_0 KV,
+c=16384) dies the same way. On a 12GB card, both are real limits, not
+configs that just weren't tried — and both failed during the run, not at
+load. That's evidence about what the card can hold, not clutter to be
+trimmed.
+
+**Depth result.** At working depth — 13.5K tokens of filled context — the
+shipping config reaches 36.00 t/s, acceptance 0.981, 1.99x vs no-spec. Deep
+context is speculation's best regime under this protocol: the model gets
+more confident (higher acceptance) as context fills, not less.
+
+**MTP depth sweep** (at c=8192): n=2 gives 34.06 t/s, n=3 gives 32.57, n=4
+gives 31.61, n=5 gives 30.22. Optimal n is 2. n>=3 showed greedy
+non-reproducibility in a one-prompt observation, so losslessness of deep MTP
+is unverified, and n>2 does not ship on that basis.
+
+## 4. Why VRAM is certified during requests, not at load
+
+VRAM is measured as the peak of a 1 Hz sample taken across the full duration
+of the request cell — not a single reading right after the server reports
+"loaded." That distinction is not academic: three configs in our sweep
+passed a load-time VRAM check cleanly and then ran out of memory on the
+first actual request. A benchmark that samples VRAM only at load would have
+certified all three as safe. This is a methods point that most published
+local-LLM numbers get wrong, and it's the reason the protocol in Section 2
+samples continuously.
+
+## 5. The kernel patch A/B (patch #1, mmvq_iquant_decode.patch)
+
+Shipping config, MTP path, measured on the main decode loop:
+
+- stock 35.8 t/s -> patched 36.7 t/s (+2.5%)
+- acceptance identical at 0.8356 in both arms, which corroborates that the
+  patch changes speed, not output
+
+Raw decode, speculation off: 20.48 -> 22.54 t/s (+10.1%); +10.2% at depth.
+Prefill is untouched by the patch, which serves as a clean control (a patch
+that touches decode-only code shouldn't move a prefill-only number, and it
+doesn't).
+
+**Why the gain attenuates from +10.1% raw to +2.5% shipped.** Speculation
+amortizes the GEMV across a verification round, so a raw-decode kernel gain
+gets divided down by the round structure once speculation is turned on.
+T_round at n=2 is 74.45 ms; one verify forward is about 45-50 ms of that;
+the remaining ~24 ms/round of round overhead (draft forwards plus host
+graph/sync) doesn't benefit from the kernel patch at all, and is now
+co-dominant with the GEMV. A patch that speeds up one piece of a round by
+10% only speeds up the round overall by however large that piece's share is.
+
+**Root cause the patch addresses.** sm_75 and newer removed the
+SIMD-video instructions the original kernel relied on, so nvcc emulates each
+one in 4-5 instructions. In this model's i-quant format, the sign-recovery
+machinery accounted for 18 of every 20 instructions in the inner loop. The
+fix is a carry-free SWAR multiply to spread sign bits (valid because no
+i-quant codebook byte is zero) combined with 2-rows-per-block tiling. The two
+changes are superadditive: +4.2% and +2.7% alone, +10.1% together.
+
+**Correctness evidence.** A 133,392-case exhaustive proof, llama.cpp's own
+backend tests, three 200-token greedy transcripts byte-identical across all
+four builds tested, and SASS of untouched quant types confirmed byte-for-byte
+unchanged (i.e., the patch provably doesn't touch code paths it isn't
+supposed to).
+
+## 6. Quality: the ladder
+
+Protocol: full HumanEval-164, greedy, thinking off, on the 3060.
+
+| Build | Size on disk | HumanEval-164 |
+|---|---|---|
+| Q8_0 anchor (uncompressed reference) | 29,047,086,048 B | 93.3% |
+| UD-Q2_K_XL | 9,828,981,664 B | 93.3% |
+| UD-IQ3_XXS **[SHIPPING]** | 10,934,860,704 B | 92.7% |
+| UD-IQ2_XXS | 7,266,070,528 B | 78.0% |
+
+The finding that matters here: the shipping flagship (IQ3_XXS) is
+statistically indistinguishable from its own uncompressed Q8_0 anchor on
+this benchmark — about 99% retention. The old rule of thumb we used to quote,
+"~10 points of HumanEval per GiB," is retired. It turned out to be an
+artifact of the thinking bug described in Section 7, not a real property of
+quantization at this range.
+
+Above roughly 2.9 bits per weight, quantization damage on this model doesn't
+show up in pass/fail coding benchmarks like HumanEval at all — it shows up in
+format and instruction adherence. Edit-format compliance: Q2_K_XL 67.6% vs
+IQ3_XXS 94.1%, p=0.0117. IQ2_S emits unclosed code fences on 52% of tasks
+even when the code inside is correct. This is the actual reason IQ3_XXS ships
+instead of Q2_K_XL, despite both posting the same HumanEval score: the
+difference shows up in agent and edit loops, which is what people actually
+use this class of model for, and a lenient pass/fail benchmark can't see it.
+
+MTP speculation is quality-neutral: adjudicated no-spec scored 136/164
+(82.9%) vs spec 135/164 (82.3%). That comparison was measured under the
+legacy (thinking-on) protocol described in Section 7, but since both arms
+share the same protocol, the relative comparison remains internally valid.
+
+## 7. The thinking bug — the largest single correction in the program
+
+The legacy test harness never sent `enable_thinking=false`, and the model's
+served chat template defaults thinking ON. As a result, every historical
+quality number in this program up to the fix was measured with the model
+burning its 1024-token reasoning budget before answering. 26 of 29 legacy
+failures turned out to be truncations from running out of budget mid-thought,
+not wrong answers.
+
+- Reconstructing the legacy conditions reproduced the old 82.3% score
+  task-for-task: 164/164 match.
+- Flipping that single flag (thinking off) changed the outcome by +18 tasks,
+  p=0.00053.
+- Every other confound we suspected and tested, combined, was worth exactly
+  one task, p=1.0. The thinking flag was the whole story.
+- Wall-clock effect: 4.79 s vs 13.38 s per HumanEval task, and 158.8 vs 474
+  completion tokens per task — about 2.8x, roughly 4x larger than every other
+  configuration lever we tested, combined.
+
+The consequence, and the reason revv sets this flag server-side rather than
+leaving it to the client: raw t/s is not work speed. The legacy protocol
+posted a HIGHER raw decode rate while doing the job 2.8x slower in wall
+clock, because it was generating far more tokens (reasoning) per task before
+producing an answer.
+
+Standing canary against recurrence: if HumanEval mean completion tokens per
+task climbs back above 350, the thinking switch is not taking effect, and any
+quality run in that state should be discarded.
+
+## 8. A suspected GPU bug that wasn't
+
+A same-file quality gap was observed between the 3060 (sm_86) and an L40S
+(sm_89), and was initially suspected to be a kernel defect specific to
+sub-4-bit i-quants. A decisive cross-platform test was run to check this: Q8
+greedy generation on both cards, compared paired task-by-task. Result: 54/54
+paired tasks had identical completion-token counts, 0 discordant pairs. The
+GPU architecture is exonerated — the actual cause of the earlier gap was the
+same thinking-flag harness bug described in Section 7.
+
+One rule survived this investigation, though: sub-2-bit i-quants are NOT
+numerically reproducible across GPU architectures. IQ2_XXS showed only a 67%
+identical-token rate cross-platform (p=0.45, i.e. consistent with unbiased
+divergence, not a directional defect), against a 100% same-GPU control.
+Standing practice from this: never A/B two quants of this precision class on
+two different cards and expect the comparison to mean anything.
+
+## 9. Context and KV
+
+- With MTP at q8_0 KV on a 12GB card, the practical context ceiling is
+  24-32K (the config OOMs at 32768). An earlier "-c 40960" figure floating
+  around was measured without MTP, at q4_0 KV, with smaller buffers — it is
+  not the same config and is not comparable. Any context claim needs the full
+  config stated alongside it.
+- No decode cliff was observed with growing context: flat ~21 t/s from 8K to
+  98K, measured on Q2_K_XL with q4_0 KV. The cliff reported in upstream
+  llama.cpp issue #27623 does not reproduce on this rig.
+- KV precision at depth (llama-bench tg64, IQ3_XXS, `-fa 1`), decode t/s:
+
+  | KV type | d0 | 8K | 16K | 24K | 32K |
+  |---|---|---|---|---|---|
+  | f16 | 20.36 | 19.81 | 19.26 | OOM | OOM |
+  | q8_0 | 20.53 | 19.22 | 18.12 | 17.14 | 16.27 |
+  | q4_0 | 20.26 | 18.92 | 17.75 | 16.69 | 15.72 |
+
+  Quantized KV is slower, not faster, at every depth measured — q4_0 reads
+  half the bytes of q8_0 per KV entry but posts a lower t/s at every single
+  depth. The slowdown is dequantization compute, not bandwidth. This inverts
+  the usual folklore: KV quantization here is purely a capacity trade
+  (fitting more context in the same VRAM), bought at a real speed cost, not a
+  speed win.
+- KV precision quality: q4 vs q8 comparison gave p=0.375 — no measurable
+  quality difference between the two KV tiers.
+- Long-context quality: needle-in-a-haystack scored 15/15 at all depths
+  tested up to 48K, on both KV tiers. Multi-hop reasoning scored 100% at 8K,
+  falling to 65-75% at 32-48K.
+- f16 KV at c=16384 with MTP is not a real config on this card: it passes
+  the load-time check and then OOMs on the first request. The actual f16
+  ceiling with MTP is c=12288. This is the concrete case referenced in
+  Section 4 for why VRAM must be certified from a peak sampled during
+  requests rather than at load — this config, among others in the sweep,
+  passed a load-time check and then died.
+
+**Prefill:** approximately 500 t/s, and essentially linear with context
+length on this hardware. Two earlier prefill figures we published — 225 t/s
+and 25.63 t/s — were both wrong and are superseded by this number.
+
+## 10. Session restore (patch #2, pr26004-rebased-daef7b687.patch)
+
+Median of 3 runs, fresh server per row, 8K-token prompt:
+
+| condition | cache_n | prompt_n | prompt_ms | wall |
+|---|---|---|---|---|
+| patched, cold prefill 8K | 0 | 8023 | 15784.4 | 16.564 s |
+| patched, action=save | — | — | — | 1.13 s, 997,687,036 B on disk |
+| patched, action=restore | — | — | — | 0.277 s |
+| patched, first request after restore | 8019 | 4 | 156.0 | 0.925 s |
+| unpatched, first request after restore | 0 | 8023 | 15881.9 | 16.669 s |
+| RAM-cache control (`--cache-ram 8192`, no save/restore) | 0 | 8023 | — | 16.691 s |
+
+**Headline: 18.02x** on first-request-after-restore (0.925 s vs 16.7 s). We
+quote 18x specifically, and deliberately do not quote larger numbers that
+appear elsewhere in the underlying data (up to roughly 40-50x, and never the
+101x figure) — 18x is the comparison against the realistic unpatched
+baseline in the same table, and it's the one we stand behind.
+
+The key inversion in this data: the RAM prompt cache control
+(`--cache-ram 8192`, no save/restore) delivered zero reuse on this hybrid
+architecture — its cache_n is 0 and its wall-clock is indistinguishable from
+plain cold prefill. That's why the save/restore patch is not described as an
+"optimization" — it is the only mechanism in this stack that produces any
+reuse at all on this architecture.
+
+Byte-correctness: the restored run's output diverges from the reference
+generation at token 76, while a batch-split noise-floor control (using no
+restore at all, just different batching) diverges at token 75 — i.e., the
+restore's divergence sits at or below the noise floor already present from
+batching effects. 6 of 6 semantic ground-truth probes matched exactly. On the
+MTP arm: prompt_n dropped from 3519 to 24, wall from 9.075 s to 2.321 s,
+decode rate 31.48 to 31.15 t/s, and completion token ids were identical over
+64 greedy tokens.
+
+Cost: approximately 125 MB of disk per 1K tokens of saved context, or
+roughly 1 GB for an 8K save.
+
+**This is not wired into the revv CLI in v1.0.** The patch lives in revv's
+`patches/` directory; session save and restore are available to people who
+build llama-server with the patch applied and drive its slot save/restore
+endpoints directly. There is no `revv` command for this in the current
+release.
+
+## 11. Baselines: what revv is actually faster than
+
+Two separate comparisons, shown as two rows, because conflating them
+overstates the result:
+
+| baseline | decode t/s | source |
+|---|---|---|
+| Naive out-of-the-box offload, general range | 2-4.5 t/s | our measurement |
+| Naive out-of-the-box offload, our specific measured point (UD-Q4_K_S, CPU offload) | 2.12 t/s (live server logged ~3.96 t/s during that eval) | our measurement |
+| Tuned community recipe (Q4_K_S + hand-picked FFN offload + MTP at 96K context), as reported | ~9.7 t/s | third-party claim, NOT measured by us |
+| Same tuned community recipe, independently replicated | 6.6-8.5 t/s | third-party replication, NOT measured by us |
+
+The project's own standing honesty note: the honest comparison against a
+tuned baseline is about 2.2x, not 10x. The 10x-style figure describes the
+naive out-of-the-box experience specifically, and must be labelled as such
+wherever it's quoted. There is no single "default llama.cpp on this card does
+~6 t/s" figure in this document, because no such measurement exists — the
+naive baseline spans 2-4.5 t/s depending on config, and the tuned baseline is
+a third-party claim we have not independently measured ourselves (only
+replicated within a wide band).
+
+## 12. Retractions and things we got wrong
+
+A benchmarks document that only contains wins is an advertisement. Here is
+everything in this program that was published and then withdrawn or
+corrected:
+
+- **ngram speculation's "86-148 t/s"**: retracted. It was a benchmark
+  artifact from re-firing the same prompt against a warm server, which let
+  ngram speculation replay its own previous answer verbatim. On 5 distinct
+  prompts it issued zero drafts — 1.00x, no gain at all.
+- **"+42% from removing state-management overhead"**: retracted, flawed
+  control. The realistic gain from that direction is +3-7%.
+- **The ASCII vocab-prune "-4.9 HumanEval points" result**: both arms of
+  that comparison were measured under the legacy thinking-on protocol (see
+  Section 7). Do not quote this number until it is re-run under the
+  corrected protocol.
+- **MTP n>=3 is not shipped**: greedy non-reproducibility was observed in a
+  one-prompt observation, and losslessness of deep MTP has not been
+  verified. n=2 ships; n>=3 does not.
+- **`--spec-type draft-mtp-adaptive`** (merged upstream) is unusable on a
+  12GB card: it creates a second full context against the target model and
+  OOMs even at c=8192. Plain `draft-mtp` shares the main context and is
+  unaffected by this problem.
+- **DFlash2 drafting** segfaults in graph compute on this llama.cpp build.
+  This is treated as an upstream instability, not an artifact introduced by
+  revv.
+- **Speculation speedup is content-dependent**, not a fixed multiplier:
+  +129% on structured output, +110% on code, -2% to -4% on prose. The
+  certified figures in this document are a code workload; do not extrapolate
+  them to prose.
+- **Multi-GPU splitting is untested.** AMD, Apple Silicon, and CPU-only are
+  not supported at all in v1.0.
+- The 12GB tier has approximately 86 MiB of headroom (11,958 MiB peak
+  observed against roughly 12,044 MiB usable). A desktop session running on
+  the same card is enough to turn that headroom into a CUDA OOM.
+
+## 13. Limits of these numbers
+
+Everything above was measured on one GPU (RTX 3060 12GB, sm_86), one model
+family (Qwen3.8-27B, unsloth Dynamic GGUF quants), and one workload type
+(code generation, via HumanEval-164 and a fixed B-tree code prompt). As
+Section 12 notes, speculation speedup is a property of the content: +129% on
+structured output and +110% on code, but -2% to -4% on prose — so a prose
+workload will not see anything close to the headline numbers in Section 3.
+Multi-GPU splitting is untested. There is no AMD, Apple Silicon, or CPU-only
+support, and consequently no numbers for any of those paths.
+
+## 14. Reproducing it yourself
+
+`revv bench` runs the same protocol described in Section 2 — 4 measured
+requests plus a discarded warm-up, 400 tokens, greedy, thinking off,
+server-reported decode rate rather than client wall-clock — against your own
+running server, and prints your number next to the reference figure from
+this document. `revv compare` runs the same prompt through both revv and
+STOCK mode side by side so you can see the difference directly.
+
+Note that `revv bench` measures decode speed only. It does not measure
+quality — the quality numbers in Section 6 come from full HumanEval-164 runs,
+not from anything `revv bench` or `revv compare` produces.
+
+If your numbers disagree with this document, that's useful information —
+post them. The protocol above is written so it can be attacked; if it's
+underspecified somewhere, that's a bug in this document.
+
+## Appendix: exact artifacts
+
+For anyone trying to reproduce byte-identical inputs:
+
+- Repository: `unsloth/Qwen3.8-27B-GGUF`
+- Certified file: `Qwen3.8-27B-UD-IQ3_XXS.gguf`, exact size 10,934,860,704
+  bytes (10.18 GiB), sha256 `c0b7c3038681ed2e3040456c1dd45f9858b6c2290bed172c70388a94874f3eee`
+- Other files from the same repo referenced in this document:
+  `Qwen3.8-27B-UD-Q2_K_XL.gguf` (9,828,981,664 B),
+  `Qwen3.8-27B-UD-IQ2_XXS.gguf` (7,266,070,528 B),
+  `Qwen3.8-27B-Q8_0.gguf` (29,047,086,048 B — note this file has no "UD-"
+  prefix).
+- The MTP draft head lives in the GGUF as tensors named `blk.64.nextn.*`.
+  Builds below roughly 8.4 GiB have it stripped, which is why going smaller
+  than IQ3_XXS is a double penalty: lower quality and no speculation.
+- llama.cpp base commit both patches in `patches/` apply to:
+  `daef7b6874397a5a7c3d7e38b55e2ee0adf7da38` (build b10712), "vulkan: top_k
+  radix select for k >= 1024 for Qwen 3.8 Flash Next (#28032)". Both patches
+  were verified to apply cleanly to a pristine checkout of that commit.
+</content>

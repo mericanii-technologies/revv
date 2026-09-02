@@ -1,0 +1,162 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 79f7a3f..de4fc9c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -525,7 +525,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+-                return small_k ? nwarps : 1;
++                // EXPERIMENT C: 2 rows per block at ncols_dst == 1. At the K values a
++                // 5120-wide model uses, the K loop only runs 1-2 trips, so the per-block
++                // prologue/epilogue is roughly half of the whole kernel; two rows per
++                // block halves that per output row and reuses the q8_1 activation loads.
++                return small_k ? nwarps : 2;
+             case 2:
+             case 3:
+             case 4:
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index ec117c5..20dcf61 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -103,6 +103,46 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
+     return s * 0x01010101;
+ }
+ 
++// Same as unpack_ksigns but without the byte broadcast: the 8 sign bits stay packed
++// in the low byte, which is what signs_ones_4 wants.
++static __device__ __forceinline__ uint32_t ksigns8(const uint8_t v) {
++    const uint32_t p = __popc(v) & 1;
++    return v ^ p << 7;
++}
++
++// Spread the low 4 bits of `bits` one per byte: byte k of the result is 0x01 if bit k
++// of `bits` is set and 0x00 otherwise.
++//
++// 0x00204081 == 2^21 + 2^14 + 2^7 + 1, so bit j of the input appears at bit j + 7k for
++// k = 0..3, i.e. in the disjoint ranges 0..3, 7..10, 14..17 and 21..24. Nothing overlaps,
++// so the multiply cannot carry, and masking with 0x01010101 keeps exactly bit k of the
++// input at bit 8k. Three instructions: LOP3 + IMAD + LOP3.
++//
++// This replaces "unpack_ksigns() & selector" followed by __vcmpne4, which costs six,
++// because sm_75 and later have no SIMD video instructions and nvcc emulates __vcmpne4
++// as LOP3 + IADD3 + LOP3 + PRMT.
++//
++// Note: __byte_perm() cannot be used to build the 0xff mask directly. Its selector
++// nibbles are masked to 3 bits, so the prmt sign-replicate mode (nibble msb set) is not
++// reachable through the intrinsic -- nvcc silently folds 0xba98 to the identity 0x3210.
++static __device__ __forceinline__ uint32_t signs_ones_4(const uint32_t bits) {
++    return ((bits & 0x0f) * 0x00204081) & 0x01010101;
++}
++
++// Negate byte k of v where byte k of `ones` is 0x01, leave it alone where it is 0x00.
++//
++// ones * 0xff turns each selected byte into 0xff and cannot carry because every byte of
++// `ones` is 0 or 1. Then -x == (x ^ 0xff) + 1 per byte; the +1 is only added where the
++// byte is selected, and it can only carry out of its byte if (v ^ 0xff) == 0xff there,
++// i.e. if that byte of v is zero. No byte of any i-quant codebook is ever zero
++// (iq2*_grid bytes come from {8,25,43}, iq3xxs_grid from {4,12,...,62}, iq3s_grid from
++// {1,3,...,15}), so the add is carry-free and this is bit-for-bit identical to
++// __vsub4(v ^ mask, mask) -- at three instructions instead of six, __vsub4 being
++// emulated as four LOP3 plus an IMAD.
++static __device__ __forceinline__ int apply_signs_nz(const uint32_t v, const uint32_t ones) {
++    return static_cast<int>((v ^ (ones * 0xff)) + ones);
++}
++
+ // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
+ // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
+ 
+@@ -1049,15 +1089,15 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
+ #pragma unroll
+     for (int k0 = 0; k0 < 8; k0 += 2) {
+         const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
+-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
++        const uint32_t signs = ksigns8(aux32 >> (7 * k0 / 2));
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
++        const uint32_t signs0 = signs_ones_4(signs);
++        const int grid0 = apply_signs_nz(grid_pos.x, signs0);
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
+         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
++        const uint32_t signs1 = signs_ones_4(signs >> 4);
++        const int grid1 = apply_signs_nz(grid_pos.y, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
+         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+     }
+@@ -1086,14 +1126,14 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
+-        const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
++        const uint32_t signs = ksigns8(q2[l0/2] >> 9);
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        const uint32_t signs0 = signs_ones_4(signs);
++        const int grid_l = apply_signs_nz(grid_pos.x, signs0);
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        const uint32_t signs1 = signs_ones_4(signs >> 4);
++        const int grid_h = apply_signs_nz(grid_pos.y, signs1);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+ 
+         if (l0 < 4) {
+@@ -1134,11 +1174,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+ 
+-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
++        const uint32_t signs0 = signs_ones_4(signs_packed_8[l0/2]);
++        const uint32_t signs1 = signs_ones_4(signs_packed_8[l0/2] >> 4);
+ 
+-        const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+-        const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
++        const int grid_l = apply_signs_nz(grid_pos[0], signs0);
++        const int grid_h = apply_signs_nz(grid_pos[1], signs1);
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+@@ -1173,15 +1213,15 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+ #pragma unroll
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+-        const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
++        const uint32_t signs = ksigns8(aux32 >> (7*l0/2));
+ 
+-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
++        const uint32_t signs0 = signs_ones_4(signs);
++        const int grid_l = apply_signs_nz(grid_pos.x, signs0);
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+ 
+-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        const uint32_t signs1 = signs_ones_4(signs >> 4);
++        const int grid_h = apply_signs_nz(grid_pos.y, signs1);
+ 
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+ 
+@@ -1219,11 +1259,11 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+ 
+-        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+-        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
++        const uint32_t signs0 = signs_ones_4(signs_packed_8[l0/2]);
++        const uint32_t signs1 = signs_ones_4(signs_packed_8[l0/2] >> 4);
+ 
+-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++        const int grid_l = apply_signs_nz(grid_pos.x, signs0);
++        const int grid_h = apply_signs_nz(grid_pos.y, signs1);
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
