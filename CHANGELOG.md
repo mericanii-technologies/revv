@@ -42,6 +42,23 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **revv now picks its flags per model instead of applying the Qwen-certified
+  set to everything.** A field report measured a Gemma-4-12B running 2.5%
+  *slower* in revv mode than stock: no draft head so no speculation, no thinking
+  switch to disable, and quantized KV, which the kernel profile shows is a
+  compute tax that only pays when VRAM is tight. `serve`/`up` now decide each
+  lever from what `inspect` reads — speculation only when a draft head exists,
+  the thinking flag only when the chat template implements one, and KV precision
+  by need (f16 when it fits at the chosen context, quantized only to buy
+  capacity) — and print the choice with its reason. When no lever applies revv
+  says "this model gains nothing from revv's tuned mode -- serving with the
+  best-known stock config", and `toggle`/`compare` report that state instead of
+  staging an A/B whose two arms are the same configuration. The certified Qwen
+  config is provably unchanged by this: on a clean 12 GB card it still resolves
+  to ctx 16,384, q8_0 KV and speculation on.
+
+
+
 - **`revv compare` and `revv bench` now measure the same quantity.** A field
   report showed them disagreeing by 14% on one machine (compare 29.7 t/s vs
   bench 34.31). compare now requests `timings_per_token`, so llama-server's own

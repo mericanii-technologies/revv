@@ -125,6 +125,17 @@ your decode speed against our reference numbers. `./revv.py down` stops everythi
 - NVIDIA GPUs, 12GB+ VRAM, Turing or newer, Linux
 - Community finetunes of the same architecture (works; our quality numbers don't transfer)
 
+**Other models will run, but may gain nothing.** revv's speed comes from
+levers that are properties of the model, not of the server: speculative
+decoding needs an MTP draft head in the file, and the thinking-off win needs a
+chat template that has a thinking mode to turn off. A model with neither —
+most GGUFs — gets no benefit, and a measured field case ran 2.5% *slower* in
+revv mode than stock before revv learned to check. **Models without a draft
+head may see little or no gain — `revv inspect` will tell you before you
+serve.** revv now picks its flags per model, says which levers apply, and when
+none do it says so plainly and serves the best-known stock config instead of
+staging a meaningless A/B.
+
 ## Roadmap
 
 **1. A prebuilt Linux CUDA binary, hosted on Releases.** This is the top

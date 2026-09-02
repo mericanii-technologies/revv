@@ -164,6 +164,42 @@ def plan_context(free_mib: int, kv: str, preferred_ctx: int
     return None
 
 
+# Bytes per KV element by cache precision. q8_0 is 34 bytes per 32 elements,
+# q4_0 is 18 per 32.
+KV_BYTES_PER_ELEM = {"f16": 2.0, "q8_0": 34.0 / 32.0, "q4_0": 18.0 / 32.0}
+
+# Weights aside, a loaded server costs this much in compute buffers and
+# scratch. Back-solved from the certified model: 11,094 base - 10,428 of
+# weights. Roughly constant across models of this class.
+COMPUTE_OVERHEAD_MIB = 666
+
+
+def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
+    """KV cache cost per token, or None if the header does not say enough.
+
+    The certified model gets its MEASURED rate. Everything else is estimated
+    from attention geometry, which is exact for dense models and conservative
+    (an over-estimate) for hybrids like the certified one, where most layers
+    carry no KV at all. Over-estimating is the safe direction: it makes revv
+    reach for a smaller context rather than OOM.
+    """
+    if os.path.basename(info.path) == str(BUILDS[DEFAULT_BUILD]["file"]):
+        return KV_MIB_PER_TOKEN.get(kv)
+    if not (info.n_layer and info.n_embd and info.n_head and info.n_head_kv):
+        return None
+    n_embd_kv = float(info.n_embd) * info.n_head_kv / info.n_head
+    per_token_bytes = 2.0 * info.n_layer * n_embd_kv * KV_BYTES_PER_ELEM[kv]
+    return per_token_bytes / (1024.0 * 1024.0)
+
+
+def model_peak_mib(info: "GGUFInfo", ctx: int, kv: str) -> Optional[int]:
+    rate = kv_mib_per_token(info, kv)
+    if rate is None:
+        return None
+    weights = info.file_size / (1024.0 * 1024.0)
+    return int(round(weights + COMPUTE_OVERHEAD_MIB + ctx * rate))
+
+
 # The least free VRAM that can run anything at all: the smallest ladder rung.
 VRAM_MIN_FREE_MIB = (estimated_peak_mib(CONTEXT_LADDER[-1], "q8_0")
                      + VRAM_MARGIN_MIB)
@@ -458,6 +494,9 @@ class GGUFInfo:
     n_layer: Optional[int]
     n_ctx_train: Optional[int]
     n_embd: Optional[int]
+    n_head: Optional[int]
+    n_head_kv: Optional[int]
+    supports_thinking: bool
     file_type: Optional[int]
     dominant_quant: str
     type_counts: Dict[str, int]
@@ -695,6 +734,21 @@ def read_gguf(path: str) -> GGUFInfo:
         n_embd = kv.get("{}.embedding_length".format(arch)) if arch else None
         n_embd = n_embd if isinstance(n_embd, int) else None
 
+        n_head = kv.get("{}.attention.head_count".format(arch)) if arch else None
+        n_head = n_head if isinstance(n_head, int) else None
+
+        # GQA: KV cache is sized by the KV head count, not the query heads.
+        n_head_kv = (kv.get("{}.attention.head_count_kv".format(arch))
+                     if arch else None)
+        n_head_kv = n_head_kv if isinstance(n_head_kv, int) else n_head
+
+        # Whether the packaged chat template implements a thinking switch at
+        # all. If it does not, revv's --reasoning off is a no-op on this model
+        # and claiming it as a lever would be dishonest.
+        template = kv.get("tokenizer.chat_template")
+        supports_thinking = (isinstance(template, str)
+                             and "enable_thinking" in template)
+
         # --- n_vocab: tokens array count, then {arch}.vocab_size, then token_embd dims[1]
         n_vocab: Optional[int] = None
         tokens_meta = kv.get("tokenizer.ggml.tokens")
@@ -732,6 +786,9 @@ def read_gguf(path: str) -> GGUFInfo:
             n_layer=n_layer,
             n_ctx_train=n_ctx_train,
             n_embd=n_embd,
+            n_head=n_head,
+            n_head_kv=n_head_kv,
+            supports_thinking=supports_thinking,
             file_type=file_type,
             dominant_quant=dominant_quant,
             type_counts=type_counts,
@@ -1384,6 +1441,25 @@ def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
                 "This is the exact file the published numbers were measured on:\n"
                 "%.1f t/s, %.1f%% HumanEval-164, %s peak."
                 % (CERT_TS, CERT_HUMANEVAL, mib(CERT_PEAK_MIB)))
+    # Quoting the certified Qwen figures at a Gemma or Llama file would be
+    # meaningless: those numbers are properties of one model on one card.
+    same_family = bool(info.arch and info.arch.lower().startswith("qwen"))
+    if not same_family:
+        if info.has_mtp_head:
+            return ("COMPATIBLE (has a draft head -- speculation will run, "
+                    "no numbers for this model)",
+                    "This is not the model revv was certified on (arch: %s),\n"
+                    "so none of the published speed or quality figures apply.\n"
+                    "It has a draft head, so speculative decoding will work.\n"
+                    "Measure it yourself with revv bench."
+                    % (info.arch or "unknown"))
+        return ("COMPATIBLE (no draft head -- revv's levers may not apply)",
+                "This is not the model revv was certified on (arch: %s), and\n"
+                "it has no MTP draft head, so speculative decoding cannot run.\n"
+                "If its chat template also has no thinking mode, revv has no\n"
+                "lever left and will serve it with the best-known stock config\n"
+                "rather than pretend to tune it. revv serve will tell you which\n"
+                "case you are in." % (info.arch or "unknown"))
     if info.has_mtp_head:
         return ("COMPATIBLE (has draft head -- full speed expected, "
                 "numbers not certified)",
@@ -1904,18 +1980,137 @@ MODEL_ALIAS = "revv"
 # same context. It is a control for revv's configuration, NOT a measurement of
 # ollama or of anyone else's product.
 MODE_HELP = {
-    MODE_REVV: "certified: MTP speculation, quantized KV, thinking off",
+    MODE_REVV: "tuned for this model",
     MODE_STOCK: "llama.cpp defaults: no speculation, f16 KV, thinking on",
 }
 
 
-def build_server_argv(exe: str, model: str, tier: str, port: int,
-                      ctx: Optional[int], mode: str, use_spec: bool,
-                      passthrough: Sequence[str]) -> List[str]:
-    """Every flag in the revv arm is load-bearing; BENCHMARKS.md says why."""
+def mode_description(mode: str, plan: Optional["LaunchPlan"]) -> str:
+    """Describe the mode in terms of what it does to THIS model.
+
+    A fixed string here would claim speculation and a thinking switch on models
+    that have neither, which is how revv came to run a Gemma file 2.5% slower
+    than stock while reporting it as the tuned configuration.
+    """
+    if mode != MODE_REVV or plan is None:
+        return MODE_HELP[mode]
+    if plan.is_noop:
+        return "no lever applies to this model; best-known stock config"
+    return "tuned: " + ", ".join(plan.levers)
+
+
+class LaunchPlan:
+    """What revv will actually do to this model, and why.
+
+    revv's flag set was certified on one model. Applied blindly to a different
+    one it can be a net LOSS: a field report measured a Gemma-4-12B running
+    2.5% SLOWER in revv mode than stock, because none of the levers applied --
+    no draft head so no speculation, no thinking switch to disable, and
+    quantized KV, which is a compute tax that only pays for itself when VRAM is
+    tight. A 7 GB model on a 12 GB card is not tight. So each lever is decided
+    per model rather than assumed.
+    """
+
+    def __init__(self, ctx: int, kv: str, use_spec: bool, thinking_off: bool,
+                 notes: List[str], estimated_peak: Optional[int]) -> None:
+        self.ctx = ctx
+        self.kv = kv
+        self.use_spec = use_spec
+        self.thinking_off = thinking_off
+        self.notes = notes
+        self.estimated_peak = estimated_peak
+
+    @property
+    def levers(self) -> List[str]:
+        active = []
+        if self.use_spec:
+            active.append("speculation (MTP n=%d)" % SPEC_N_MAX)
+        if self.thinking_off:
+            active.append("thinking off")
+        if self.kv != "f16":
+            active.append("%s KV (for capacity)" % self.kv)
+        return active
+
+    @property
+    def is_noop(self) -> bool:
+        """True when revv mode is materially the same as stock.
+
+        No draft head, no thinking switch, and f16 KV already optimal means
+        there is nothing left for revv to change. Pretending otherwise would
+        make `revv compare` a fake A/B.
+        """
+        return not self.use_spec and not self.thinking_off and self.kv == "f16"
+
+
+def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
+                free_mib: Optional[int]) -> LaunchPlan:
     t = TIERS[tier]
-    n_ctx = str(ctx if ctx is not None else t["ctx"])
-    argv = [exe, "-m", model, "-ngl", "99", "-c", n_ctx,
+    preferred = explicit_ctx if explicit_ctx is not None else int(t["ctx"])
+    notes = []      # type: List[str]
+
+    use_spec = info.has_mtp_head
+    if not use_spec:
+        notes.append("no MTP draft head in this file, so speculative decoding "
+                     "is off (that is where most of revv's speed comes from)")
+    thinking_off = info.supports_thinking
+    if not thinking_off:
+        notes.append("this model's chat template has no thinking switch, so "
+                     "there is nothing to disable")
+
+    # Context: the largest rung that fits, measured at q8_0 so the choice is
+    # about capacity rather than precision.
+    ctx = preferred
+    if free_mib is not None:
+        chosen = None
+        for cand in CONTEXT_LADDER:
+            if cand > preferred:
+                continue
+            peak = model_peak_mib(info, cand, "q8_0")
+            if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
+                chosen = cand
+                break
+        if chosen is None:
+            chosen = CONTEXT_LADDER[-1]
+        if chosen != preferred:
+            notes.append("context reduced %s -> %s to fit %s free"
+                         % ("{:,}".format(preferred), "{:,}".format(chosen),
+                            mib(free_mib)))
+        ctx = chosen
+
+    # KV precision by need, not by habit. f16 is the faster kernel; quantizing
+    # is a compute tax paid only to buy capacity we would not otherwise have.
+    kv = str(t["kv"])
+    if free_mib is None:
+        pass                            # tier was forced; keep its setting
+    else:
+        f16_peak = model_peak_mib(info, ctx, "f16")
+        if f16_peak is not None and f16_peak + VRAM_MARGIN_MIB <= free_mib:
+            if kv != "f16":
+                notes.append("f16 KV fits (~%s of %s free) and is the faster "
+                             "kernel, so revv is not quantizing the cache"
+                             % (mib(f16_peak), mib(free_mib)))
+            kv = "f16"
+        else:
+            for cand in ("q8_0", "q4_0"):
+                peak = model_peak_mib(info, ctx, cand)
+                if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
+                    kv = cand
+                    break
+            else:
+                kv = "q4_0"
+            if f16_peak is not None:
+                notes.append("f16 KV would need ~%s, over the %s free, so the "
+                             "cache is %s to fit"
+                             % (mib(f16_peak), mib(free_mib), kv))
+
+    return LaunchPlan(ctx, kv, use_spec, thinking_off, notes,
+                      model_peak_mib(info, ctx, kv))
+
+
+def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
+                      mode: str, passthrough: Sequence[str]) -> List[str]:
+    """Apply the plan. Which levers are in the revv arm is decided per model."""
+    argv = [exe, "-m", model, "-ngl", "99", "-c", str(plan.ctx),
             # Certified at one slot. Concurrency splits the context and was
             # never measured, and the 12GB tier has 86 MiB of headroom.
             "--parallel", "1",
@@ -1927,7 +2122,7 @@ def build_server_argv(exe: str, model: str, tier: str, port: int,
     if mode == MODE_REVV:
         argv += [
             "-fa", "on",
-            "-ctk", str(t["kv"]), "-ctv", str(t["kv"]),
+            "-ctk", plan.kv, "-ctv", plan.kv,
             # The RAM prompt cache delivers ZERO reuse on this hybrid
             # architecture (measured against a control) while costing ~1 GB
             # per 8K tokens. It is off on both counts.
@@ -1937,8 +2132,14 @@ def build_server_argv(exe: str, model: str, tier: str, port: int,
             # be set and must come first. Disabling thinking is the largest
             # single effect in the stack: ~2.8x wall-clock per task.
             "--jinja",
-        ] + thinking_off_flags(exe)
-        if use_spec:
+        ]
+        # Only claim the levers this model can actually use. Passing
+        # --spec-type to a file with no draft head makes llama-server fail to
+        # start with an opaque message; disabling a thinking mode the template
+        # does not implement is simply a lie in the log.
+        if plan.thinking_off:
+            argv += thinking_off_flags(exe)
+        if plan.use_spec:
             argv += ["--spec-type", SPEC_TYPE,
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
     argv += list(passthrough)
@@ -1994,14 +2195,12 @@ def _free_port() -> int:
 class Backend:
     """Owns the llama-server child process and can restart it in a new mode."""
 
-    def __init__(self, exe: str, model: str, tier: str, ctx: Optional[int],
-                 use_spec: bool, passthrough: Sequence[str],
-                 log_path: str) -> None:
+    def __init__(self, exe: str, model: str, tier: str, plan: LaunchPlan,
+                 passthrough: Sequence[str], log_path: str) -> None:
         self.exe = exe
         self.model = model
         self.tier = tier
-        self.ctx = ctx
-        self.use_spec = use_spec
+        self.plan = plan
         self.passthrough = list(passthrough)
         self.log_path = log_path
         self.proc = None            # type: Optional[subprocess.Popen]
@@ -2014,8 +2213,7 @@ class Backend:
         self.on_change = None       # type: Optional[Callable[[], None]]
 
     def argv(self, mode: str, port: int) -> List[str]:
-        return build_server_argv(self.exe, self.model, self.tier, port,
-                                 self.ctx, mode, self.use_spec,
+        return build_server_argv(self.exe, self.model, self.plan, port, mode,
                                  self.passthrough)
 
     def start(self, mode: str, wait_s: float = 600.0) -> None:
@@ -2183,11 +2381,18 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
             return True
 
         def _status_obj(self) -> Dict[str, object]:
+            plan = backend.plan
             return {"mode": backend.mode,
-                    "mode_description": MODE_HELP[backend.mode],
+                    "mode_description": mode_description(backend.mode, plan),
                     "model": os.path.basename(backend.model),
                     "tier": backend.tier,
-                    "speculation": backend.use_spec and backend.mode == MODE_REVV,
+                    "context": plan.ctx,
+                    "kv": plan.kv,
+                    # Which levers this model can actually use, so toggle and
+                    # compare can refuse to stage a meaningless A/B.
+                    "levers": plan.levers,
+                    "tuning_is_noop": plan.is_noop,
+                    "speculation": plan.use_spec and backend.mode == MODE_REVV,
                     "backend_port": backend.port,
                     # `revv down` uses this to reap an orphaned llama-server if
                     # the supervisor died without cleaning up after itself.
@@ -2350,44 +2555,31 @@ def _pick_tier(explicit: Optional[str], quiet: bool = False
     return str(detected), best.free_mib
 
 
-def resolve_context(tier: str, explicit: Optional[int],
-                    free_mib: Optional[int], quiet: bool = False) -> int:
-    """Pick the context size, sizing to free VRAM unless told otherwise."""
-    t = TIERS[tier]
-    preferred = int(t["ctx"])
-    kv = str(t["kv"])
-    if explicit is not None:
-        # An explicit --ctx is obeyed, but the user still gets told when the
-        # arithmetic says it will not fit.
-        if free_mib is not None:
-            peak = estimated_peak_mib(explicit, kv)
-            if peak + VRAM_MARGIN_MIB > free_mib and not quiet:
-                print("%s --ctx %d needs ~%s but only %s is free. Expect a "
-                      "CUDA OOM."
-                      % (yellow("warning:"), explicit, mib(peak),
-                         mib(free_mib)))
-        return explicit
-    if free_mib is None:
-        return preferred
-    plan = plan_context(free_mib, kv, preferred)
-    if plan is None:
-        die("no context size fits in %s of free VRAM" % mib(free_mib),
-            "revv needs at least %s free." % mib(VRAM_MIN_FREE_MIB))
-        return preferred
-    ctx, peak = plan
-    if not quiet:
-        if ctx == preferred:
-            print("  context  %s (full size for this tier, ~%s peak of %s free)"
-                  % ("{:,}".format(ctx), mib(peak), mib(free_mib)))
+def print_plan(plan: LaunchPlan) -> None:
+    """Say which levers apply to THIS model, and which do not and why."""
+    if plan.is_noop:
+        print("  %s this model gains nothing from revv's tuned mode --"
+              % yellow("note:"))
+        print("         serving with the best-known stock config.")
+    else:
+        print("  levers   %s" % ", ".join(plan.levers))
+    for note in plan.notes:
+        for i, line in enumerate(_wrap(note, 66)):
+            print("           %s%s" % ("" if i else "- ", line)
+                  if i == 0 else "             %s" % line)
+
+
+def _wrap(text: str, width: int) -> List[str]:
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > width:
+            lines.append(cur)
+            cur = w
         else:
-            print("  context  %s %s"
-                  % ("{:,}".format(ctx),
-                     yellow("(reduced from %s: it needs ~%s, only %s free)"
-                            % ("{:,}".format(preferred),
-                               mib(estimated_peak_mib(preferred, kv)),
-                               mib(free_mib)))))
-            print("           override with --ctx if you know better")
-    return ctx
+            cur = (cur + " " + w) if cur else w
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
@@ -2406,27 +2598,26 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     except GGUFError as exc:
         die("cannot read %s: %s" % (model, exc))
         return 1
-    use_spec = info.has_mtp_head
     mode = MODE_STOCK if args.stock else MODE_REVV
+    plan = plan_launch(info, tier, args.ctx, free_mib)
 
     if args.print_command:
-        ctx = resolve_context(tier, args.ctx, free_mib, quiet=True)
-        argv = build_server_argv(exe, model, tier, args.port, ctx, mode,
-                                 use_spec, passthrough)
+        argv = build_server_argv(exe, model, plan, args.port, mode,
+                                 passthrough)
         print(" ".join(_shell_quote(a) for a in argv))
         return 0
 
     print(bold("revv %s  --  serve" % __version__))
     print("  model    %s" % os.path.basename(model))
-    print("  tier     %s   KV %s" % (tier.upper(), TIERS[tier]["kv"]))
-    ctx = resolve_context(tier, args.ctx, free_mib)
-    if not use_spec:
-        print("  %s no MTP draft head in this model, so speculation is off."
-              % yellow("note:"))
-        print("         Expect roughly %.0f t/s rather than %.0f."
-              % (CERT_TS_NOSPEC, CERT_TS))
+    print("  tier     %s   context %s   KV %s"
+          % (tier.upper(), "{:,}".format(plan.ctx), plan.kv))
+    if plan.estimated_peak:
+        print("  vram     ~%s estimated peak%s"
+              % (mib(plan.estimated_peak),
+                 " of %s free" % mib(free_mib) if free_mib else ""))
+    print_plan(plan)
 
-    backend = Backend(exe, model, tier, ctx, use_spec, passthrough,
+    backend = Backend(exe, model, tier, plan, passthrough,
                       os.path.join(REVV_HOME, "logs", "llama-server.log"))
     print("\n  starting llama-server (first load pages ~%s off disk)..."
           % gib(info.file_size))
@@ -2454,7 +2645,7 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
 
     print("\n  %s  http://%s:%d/v1" % (bold("api"), args.host, args.port))
     print("  mode     %s -- %s" % (bold(backend.mode.upper()),
-                                   MODE_HELP[backend.mode]))
+                                   mode_description(backend.mode, plan)))
     print("  backend  llama-server on 127.0.0.1:%d" % backend.port)
     print("  log      %s" % backend.log_path)
     print("\n  Point any OpenAI-compatible tool at the api url above; the port")
@@ -2537,6 +2728,13 @@ def cmd_toggle(args: argparse.Namespace) -> int:
     except (urllib.error.URLError, OSError, ValueError) as exc:
         _no_server(args.url, exc)
         return 1
+    if before.get("tuning_is_noop") and not args.mode:
+        print("%s revv mode and stock are the same configuration for this "
+              "model." % yellow("note:"))
+        print("      No draft head, no thinking switch, and f16 KV is already")
+        print("      optimal, so there is nothing for the toggle to change.")
+        print("      Pass an explicit mode if you want to switch anyway.")
+        return 0
     want = args.mode or (MODE_STOCK if before["mode"] == MODE_REVV else MODE_REVV)
     if want == before["mode"]:
         print("Already in %s mode." % str(want).upper())
@@ -2664,6 +2862,23 @@ def cmd_compare(args: argparse.Namespace) -> int:
         _no_server(base, exc)
         return 1
     original = str(start_status["mode"])
+
+    if start_status.get("tuning_is_noop"):
+        print(bold("revv %s  --  compare" % __version__))
+        print("  model    %s" % start_status["model"])
+        print("\n  %s there is nothing to compare for this model."
+              % yellow("note:"))
+        print("  It has no MTP draft head, its chat template has no thinking")
+        print("  switch, and f16 KV already fits -- so revv mode and stock are")
+        print("  the same configuration. Running the A/B anyway would produce")
+        print("  two numbers that differ only by noise and imply a speedup")
+        print("  that is not there.")
+        print("\n  revv is still serving this model with the best-known stock")
+        print("  config. Use %s to measure it." % bold("revv bench"))
+        print("  %s tells you before you serve whether a file has the"
+              % bold("revv inspect"))
+        print("  draft head that revv's speed actually depends on.")
+        return 0
 
     print(bold("revv %s  --  compare" % __version__))
     print("  model    %s" % start_status["model"])
@@ -2960,8 +3175,14 @@ def cmd_status(args: argparse.Namespace) -> int:
                                    st["mode_description"]))
     print("  model    %s   (send \"%s\" as the model name)"
           % (st["model"], MODEL_ALIAS))
-    print("  tier     %s   speculation %s"
-          % (str(st["tier"]).upper(), "on" if st["speculation"] else "off"))
+    print("  tier     %s   context %s   KV %s"
+          % (str(st["tier"]).upper(),
+             "{:,}".format(int(st.get("context") or 0)), st.get("kv", "?")))
+    if st.get("tuning_is_noop"):
+        print("  tuning   %s"
+              % yellow("no lever applies to this model; serving stock config"))
+    else:
+        print("  levers   %s" % ", ".join(st.get("levers") or ["none"]))
     if run and run.get("started_at"):
         print("  uptime   %s   pid %s"
               % (_uptime(time.time() - float(run["started_at"])),

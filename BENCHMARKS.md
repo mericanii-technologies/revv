@@ -458,6 +458,50 @@ that only ever gets tested on the author's box is worth very little.
 Those are raw figures from that user's box, quoted as reported. We have not
 set an "expected band" for WSL2 — one machine is not a band.
 
+### A negative result: revv mode made a Gemma model slower
+
+On the same box, a Gemma-4-12B GGUF measured over 3 trials:
+
+| mode | decode t/s |
+|---|---|
+| stock | 35.49 |
+| revv | **34.63** (2.5% *slower*) |
+
+This is real, it is expected once you look at it, and it was our bug. revv was
+applying a flag set certified on Qwen3.8-27B to a model that could not use any
+of it:
+
+- **No MTP draft head** in the file, so no speculative decoding — which is
+  where most of revv's speed comes from.
+- **No thinking mode** in its chat template, so nothing to disable — and the
+  thinking-off win is the largest single lever in Section 7.
+- The only flag still doing anything was **quantized KV**, and per the kernel
+  profile in Section 9 that is a *compute tax*: q8_0 switches attention to a
+  compute-bound kernel and is slower than f16. It pays for itself only when it
+  buys capacity you would otherwise not have. A 7 GB model on a 12 GB card is
+  not short of capacity, so the tax was pure loss.
+
+2.5% is close to this box's noise floor, so the magnitude is not the point. The
+direction is. A tool that claims to speed models up should not be able to slow
+one down silently.
+
+**What changed.** revv now derives its flags per model from the facts `inspect`
+already reads: draft head present or not, thinking switch present or not, and
+whether f16 KV fits in free VRAM at the chosen context. On this Gemma file that
+yields no speculation flags, no thinking flag, and f16 KV — i.e. the best-known
+stock configuration — and revv says so:
+
+    note: this model gains nothing from revv's tuned mode --
+          serving with the best-known stock config.
+
+`toggle` and `compare` now refuse to stage the A/B in that state rather than
+printing two numbers that differ only by noise. Verified: the certified Qwen
+config is unchanged by this logic (ctx 16,384, q8_0 KV, speculation on, 11,830
+MiB estimated peak on a clean 12 GB card), because on that model f16 KV genuinely
+does not fit — the rule reproduces the certification rather than overriding it.
+On a 24 GB card the same model now correctly gets f16 KV, which Section 9 says
+is the faster kernel.
+
 What that run taught us, both of which are now fixed in the tool:
 
 1. **Total VRAM is not available VRAM.** Windows reserves roughly 1-1.5 GB of
