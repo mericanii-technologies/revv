@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 /models/
 *.gguf
+
+# staged release artifacts (large binaries, never committed)
+*.tar.gz
+*.tar.gz.sha256

@@ -1380,7 +1380,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if exe is None:
         status(FAIL, "llama-server not found",
                "Looked in %s and on PATH." % BIN_DIR)
-        print("         Run ./install.sh to build it.")
+        print("         Run ./install.sh -- it downloads a prebuilt binary;\n"
+              "         no compiler needed. See README for the three install\n"
+              "         paths and what each one asks you to trust.")
         problems += 1
     else:
         status(OK, exe, llama_server_version(exe) or "version unknown")
@@ -1394,12 +1396,38 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             patches = manifest.get("patches") or []
             base = manifest.get("base_commit", "unknown")
-            if "mmvq_iquant_decode.patch" in patches:
+            # Which rung of the install ladder produced this binary. It decides
+            # what performance to expect and how much to trust it, so it is
+            # worth stating rather than inferring from the patch list alone.
+            method = str(manifest.get("install_method") or "source")
+            backend = str(manifest.get("backend") or "cuda")
+            origin = str(manifest.get("source") or "")
+            rung = {
+                "prebuilt": ("revv prebuilt binary (patched, CUDA)",
+                             "Downloaded, not built here. A Mericanii fork\n"
+                             "build of upstream at %s." % base),
+                "upstream": ("official llama.cpp prebuilt (%s)" % backend,
+                             "Official upstream binary, so the most trusted\n"
+                             "rung -- but upstream ships no CUDA build for\n"
+                             "Linux, so this is the %s backend. revv's\n"
+                             "published numbers are CUDA and do NOT apply."
+                             % backend),
+                "source": ("built from source", "base commit %s" % base),
+            }.get(method, ("unknown install method: %s" % method, ""))
+            detail = rung[1] + (("\n" + origin) if origin else "")
+            status(OK if method != "upstream" else WARN,
+                   "install: %s" % rung[0], detail)
+
+            if backend != "cuda":
+                status(WARN, "not a CUDA build",
+                       "Speculation and the kernel patch are CUDA-specific.\n"
+                       "For the certified configuration: ./install.sh --prebuilt")
+            elif "mmvq_iquant_decode.patch" in patches:
                 status(OK, "kernel patch applied", "base commit %s" % base)
             else:
                 status(WARN, "kernel patch NOT applied",
                        "base commit %s\nExpect ~%.1f t/s instead of %.1f (-2.5%%).\n"
-                       "Rebuild with: ./install.sh --patched"
+                       "Get the patched build with: ./install.sh --prebuilt"
                        % (base, CERT_TS_STOCK, CERT_TS))
 
     print("\n" + bold("Models"))
@@ -2707,7 +2735,7 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     exe = find_llama_server()
     if exe is None:
         die("llama-server not found",
-            "./install.sh   # builds it into %s" % BIN_DIR)
+            "./install.sh   # downloads a prebuilt binary into %s" % BIN_DIR)
         return 1
     model = resolve_model(args.model)
     tier, free_mib = _pick_tier(args.tier, quiet=args.print_command)

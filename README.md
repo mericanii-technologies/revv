@@ -56,6 +56,10 @@ ollama pull qwen3.8:27b        # note: this pulls a 4-bit file that won't fit 12
 ./revv.py adopt                # revv finds it, warns about the fit, offers the right file
 ```
 
+`./install.sh` no longer compiles anything by default — it downloads a prebuilt
+binary. See [Install paths](#install-paths-and-what-you-are-trusting) if you
+would rather not run a third-party build.
+
 **Windows:** use WSL2 (revv needs Linux + the NVIDIA driver's WSL CUDA support):
 ```
 wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
@@ -101,7 +105,7 @@ already have.
 
 ```
 git clone https://github.com/mericanii-technologies/revv && cd revv
-./install.sh          # checks python3 + llama.cpp, offers a patched build
+./install.sh          # downloads a prebuilt llama-server. No compiler needed.
 ./revv.py adopt       # finds Qwen3.8 models you already downloaded via ollama
                       # (or: ./revv.py get   to download the certified file)
 ./revv.py up          # starts in the background on localhost:8080
@@ -117,6 +121,49 @@ export OPENAI_API_KEY=revv
 To see the difference on your own card: `./revv.py compare` runs the same
 prompt in stock mode and revv mode, back to back. `./revv.py bench` measures
 your decode speed against our reference numbers. `./revv.py down` stops everything.
+
+## Install paths, and what you are trusting
+
+`install.sh` has three rungs. The default downloads a binary, because the CUDA
+build chain — cmake, then the toolkit, then a host compiler `nvcc` accepts,
+then a glibc that toolkit accepts — is the single biggest obstacle to a first
+working install. One reported setup lost about half an hour to it.
+
+| | command | what you get | what you trust |
+|---|---|---|---|
+| **1. default** | `./install.sh` | our patched llama-server, CUDA, the certified config | a **third-party fork build** signed off by Mericanii |
+| **2. upstream** | `./install.sh --upstream` | the official llama.cpp prebuilt | **official upstream binaries**, nothing of ours |
+| **3. source** | `./install.sh --source` | you compile it, patched or `--stock` | **your own machine** — you can read every patch first |
+
+**The awkward fact about rung 2.** Upstream llama.cpp publishes prebuilt CUDA
+binaries **for Windows only**. For Linux it ships CPU, Vulkan, ROCm and SYCL —
+no CUDA. So "official prebuilt" on a Linux NVIDIA box means the *Vulkan* build:
+it will run, but it is a different backend, the CUDA kernel patch does not
+apply to it, and **none of the numbers in this README were measured on it**.
+That is why rung 2 is a deliberate choice and revv will never fall back to it
+silently. Verified against the GitHub API on 2026-09-03 for builds b10712,
+b10770 and b10776.
+
+**Rung 2 is also the older-distro option.** The upstream Vulkan build needs only
+glibc 2.34, so it runs on Ubuntu 22.04, where our CUDA prebuilt (glibc 2.38)
+does not. If you are on an older distro and do not want to compile, that is the
+path — at the cost of the Vulkan backend's unmeasured performance.
+
+Rung 1 requirements, checked before it will install: Linux x86_64, **glibc 2.38
+or newer** (Ubuntu 24.04+; 22.04 will not work), and the CUDA *runtime*
+libraries — `libcudart`, `libcublas`, `libcublasLt`, which are far smaller than
+the full toolkit and need no compiler. The binary is built for **sm_86**
+(Ampere, 30-series); other cards rely on driver JIT and `--source` is the
+reliable path there. If any precondition fails, `install.sh` says which one and
+falls back to rung 3 automatically.
+
+Every download is pinned to a tested release tag, never "latest", and verified
+by sha256. `revv doctor` reports which rung produced the binary you are running.
+
+**This path is new.** The prebuilt has been packaged and its provenance
+verified, but it has not yet been installed from scratch on a machine other
+than the one that built it. If it fails on yours, that report is genuinely
+useful — open an issue with `revv doctor` output.
 
 ## Supported
 
@@ -142,8 +189,12 @@ the acceptance rate so you can judge whether that pair is worth it).
 
 ## Roadmap
 
-**1. A prebuilt Linux CUDA binary, hosted on Releases.** This is the top
-priority and it is a commitment, not an aspiration. Right now the single
+**1. A prebuilt Linux CUDA binary, hosted on Releases. — SHIPPING.**
+`./install.sh` now downloads instead of compiling. The remaining work is
+breadth: the binary is built for sm_86 only, so a multi-architecture build is
+needed before it covers most cards, and it has not yet been installed from
+scratch on a machine other than the one that built it. The original note is
+kept below because it is still why this mattered. Right now the single
 biggest thing standing between a new user and a working setup is not revv and
 not the model — it is the CUDA build gauntlet: cmake, then the CUDA toolkit,
 then a host-compiler version nvcc accepts, then a glibc that toolkit accepts.

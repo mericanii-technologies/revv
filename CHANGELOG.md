@@ -7,6 +7,24 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.0.0] - 2026-09-02
 
 ### Added
+
+- **Zero-compile install.** `./install.sh` now downloads a prebuilt
+  `llama-server` instead of building one. Three rungs: our patched CUDA
+  prebuilt (default), the official upstream prebuilt (`--upstream`), or a
+  source build (`--source`, the old path with all its preflights; `--patched`
+  and `--stock` still work as aliases). Downloads are pinned to a tested
+  release tag, never "latest", and sha256-verified. If Linux/x86_64/glibc-2.38
+  preconditions fail, or the download does, it says which one and falls back to
+  the source build — but it never falls back to `--upstream` silently, because
+  that is a different backend. `revv doctor` reports which rung produced the
+  binary in use.
+- Documented the trust tradeoff in the README, including the awkward fact that
+  upstream llama.cpp ships **no Linux CUDA prebuilt** (Windows only; verified
+  against the GitHub API across builds b10712/b10770/b10776), so "official
+  prebuilt" on a Linux NVIDIA box means the Vulkan backend, which none of our
+  numbers were measured on.
+
+
 - First public release.
 - `revv doctor`: detects GPU, VRAM, driver and compute capability, locates llama-server, reports the tier and whether the certified configuration fits.
 - `revv get`: resumable HTTPS download of the certified GGUF from HuggingFace, verified against an exact expected byte size.
