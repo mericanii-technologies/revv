@@ -15,8 +15,12 @@ protocols are in [BENCHMARKS.md](BENCHMARKS.md).
   (15.4GB) spills off a 12GB card and runs at ~5 tok/s. The 3-bit file (10.9GB)
   fits, runs 4× faster, and scores the same on HumanEval within noise
   (92.7% vs 94.5%, n=164, statistically indistinguishable).
-- **Turns on the model's built-in speculative decoding** (MTP head). Lossless —
-  output is byte-identical — and ~1.7× faster. Off in every default setup we checked.
+- **Turns on the model's built-in speculative decoding** (MTP head), ~1.7×
+  faster. Quality-neutral by measurement (identical pass/fail on all 164
+  HumanEval tasks, McNemar p=1.0); not bit-identical — occasional single-token
+  differences from floating-point batch-order effects, the same class of
+  nondeterminism llama.cpp has across batch sizes. Off in every default setup
+  we checked.
 - **Disables thinking mode by default.** This model ships with reasoning on,
   which triples tokens per answer. With it off: same pass rate, ~2.8× faster
   per task.
