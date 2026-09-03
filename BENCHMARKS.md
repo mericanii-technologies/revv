@@ -571,6 +571,43 @@ simply agree, the fix landed. Either outcome is informative and we will record i
 If you run revv on hardware not listed above, `revv bench` output plus
 `revv doctor` is exactly the contribution that makes this table worth having.
 
+## 17. Two things that do not work, measured (2026-09-04)
+
+**Context checkpoints must be off near the VRAM ceiling.** llama.cpp keeps 32
+context checkpoints per slot by default (upstream PR #15293) at roughly 150 MiB
+each on this model. They are allocated lazily, so on a config close to the
+ceiling the server loads, passes its health check, serves one request, and then
+dies on the second with a `cudaGraphInstantiate` error that names neither
+memory nor checkpoints. Configs near the ceiling required `-ctxcp 0` to survive
+at all. This is the same class of trap as certifying VRAM at load time instead
+of during requests (Section 4): the failure hides behind a successful startup.
+revv's planner now sets `-ctxcp 0` whenever the estimated peak leaves under
+500 MiB free — which includes the certified config on a clean 12 GB card, where
+the margin is 457 MiB.
+
+**GPU overclocking is not a lever on this card.** Measured on the RTX 3060,
+driver 535.309.01, headless:
+
+| arm | tg64 d=13000 | server t/s | sm / power at depth |
+|---|---|---|---|
+| A stock (170 W) | 20.390 | 35.103 | 1865 MHz / 161.5 W |
+| C 190 W + lgc 2145 | 20.581 (+0.94%) | **35.586 (+1.38%)** | 1882 MHz / 179.8 W |
+| E lgc 2400 + lmc 8000 (above spec) | 20.582 | — | 1876 MHz / 180.2 W |
+
+Clock *offsets* are impossible headless on this driver — they require
+`nvidia-settings`, which requires X, and NVML exposes no offset API. The power
+limit is the only real lever and it buys **+1.4% for +11.8% power and +7 °C**,
+because the card sits against `SW_POWER_CAP` at 1880 MHz of a 2145 MHz maximum
+even after the raise: the workload is power-limited, not clock-limited.
+
+The trap worth publishing: **`nvidia-smi` accepts above-spec clock requests,
+reports success, and silently clamps.** Arm E asked for 2400/8000 MHz, printed
+`"All done."`, and delivered clocks identical to the in-spec arm C, matching
+throughput to four decimal places. Anything automating this must verify with
+`--query-gpu=clocks.sm,clocks.mem` under load and never trust the exit status.
+Acceptance was bit-identical at 0.7756 across every arm, so the locked clocks
+were not a stability risk either — they simply were not an overclock.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce quality-neutral (per-task identical pass/fail; not bit-identical — see MTP losslessness note) inputs:

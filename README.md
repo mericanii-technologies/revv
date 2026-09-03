@@ -191,6 +191,26 @@ small-model.gguf` (experimental, uncertified; community MTP drafts exist for
 some families, revv will not download one for you, and `revv bench` reports
 the acceptance rate so you can judge whether that pair is worth it).
 
+## Troubleshooting
+
+**Server starts fine, then dies on the second request.** Almost always
+llama.cpp's context checkpoints: 32 per slot by default at ~150 MiB each,
+allocated lazily, so the first one lands *after* the health check has passed.
+The error names `cudaGraphInstantiate` and mentions neither memory nor
+checkpoints. revv sets `-ctxcp 0` automatically when the planned peak leaves
+under 500 MiB free, and says so in the plan it prints. If you overrode `--ctx`,
+you may have re-created the condition.
+
+**Don't expect anything from GPU overclocking.** On 30-series with driver 535
+headless, clock *offsets* are impossible — they need `nvidia-settings`, which
+needs X, and NVML exposes no offset API. The one real lever is the power limit,
+and raising it 170 W → 190 W measured **+1.4%** on the shipping config for
+**+12% power** and +7 °C; the workload is power-capped, not clock-capped.
+Worse, `nvidia-smi -lgc 2400` and `-lmc 8000` print "All done." and silently
+clamp to stock — measured clocks under load were identical to the in-spec arm.
+**Never trust the exit status; verify with `--query-gpu=clocks.sm,clocks.mem`
+under load.**
+
 ## Roadmap
 
 **1. A prebuilt Linux CUDA binary, hosted on Releases. — SHIPPING.**

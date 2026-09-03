@@ -3,6 +3,9 @@ __pycache__/
 .DS_Store
 /models/
 *.gguf
+# ...except the synthetic test fixtures: a few KB each, no weights,
+# and the planner suite is useless without them.
+!tests/fixtures/*.gguf
 
 # staged release artifacts (large binaries, never committed)
 *.tar.gz

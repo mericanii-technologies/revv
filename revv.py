@@ -141,6 +141,23 @@ CONTEXT_LADDER = [65536, 49152, 32768, 24576, 16384, 12288, 8192, 6144, 4096]
 # historically sat 86 MiB from the ceiling.
 VRAM_MARGIN_MIB = 250
 
+# llama-server keeps up to 32 context checkpoints PER SLOT by default
+# (upstream PR #15293), and on this model each one is ~150 MiB. They are
+# allocated lazily, so the first one lands during the SECOND request -- after
+# the health check has already passed. The server therefore starts fine, serves
+# one request, and dies on the next with a cudaGraphInstantiate error that
+# names neither memory nor checkpoints. Any config running close to the ceiling
+# must turn them off. Measured: configs near the ceiling "required -ctxcp 0 to
+# survive at all".
+#
+# INTERACTION, for whoever wires up session save/restore later: the restore
+# patch depends on these checkpoints (its measured run used -ctxcp 8), so a
+# config that disables them cannot also offer restore. No conflict today
+# because revv v1.0 does not expose save/restore, but the two features are
+# mutually exclusive at the VRAM ceiling and something has to give.
+CHECKPOINT_MIB_EACH = 150
+CHECKPOINT_HEADROOM_MIB = 500
+
 
 def estimated_peak_mib(ctx: int, kv: str) -> int:
     return int(round(FOOTPRINT_BASE_MIB
@@ -2071,7 +2088,8 @@ class LaunchPlan:
     def __init__(self, ctx: int, kv: str, use_spec: bool, thinking_off: bool,
                  notes: List[str], estimated_peak: Optional[int],
                  draft_path: Optional[str] = None,
-                 draft_spec_type: Optional[str] = None) -> None:
+                 draft_spec_type: Optional[str] = None,
+                 ctx_checkpoints: Optional[int] = None) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2084,6 +2102,9 @@ class LaunchPlan:
         # can be worthless for a finetune of it.
         self.draft_path = draft_path
         self.draft_spec_type = draft_spec_type
+        # None = leave llama-server's default. 0 = disable, because the
+        # checkpoint allocation would not fit and would kill request two.
+        self.ctx_checkpoints = ctx_checkpoints
 
     @property
     def levers(self) -> List[str]:
@@ -2097,6 +2118,8 @@ class LaunchPlan:
             active.append("thinking off")
         if self.kv != "f16":
             active.append("%s KV (for capacity)" % self.kv)
+        if self.ctx_checkpoints == 0:
+            active.append("context checkpoints off (VRAM)")
         return active
 
     @property
@@ -2237,8 +2260,24 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             notes.append("WARNING estimated peak ~%s exceeds %s free once the "
                          "drafter is counted; reduce --ctx if this OOMs"
                          % (mib(peak), mib(free_mib)))
+
+    # Context checkpoints are allocated lazily, so leaving them on near the
+    # ceiling produces a server that passes its health check and then dies on
+    # the second request. Turn them off before that can happen.
+    ctx_checkpoints = None      # type: Optional[int]
+    if peak is not None and free_mib is not None:
+        headroom = free_mib - peak
+        if headroom < CHECKPOINT_HEADROOM_MIB:
+            ctx_checkpoints = 0
+            notes.append("context checkpoints disabled (-ctxcp 0): only ~%s "
+                         "would be left after load, and the first checkpoint "
+                         "alone wants ~%s. Left on, this config passes its "
+                         "health check and then dies on the second request"
+                         % (mib(max(0, headroom)), mib(CHECKPOINT_MIB_EACH)))
+
     return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
-                      draft.path if draft else None, draft_spec_type)
+                      draft.path if draft else None, draft_spec_type,
+                      ctx_checkpoints)
 
 
 def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
@@ -2262,6 +2301,10 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
             # per 8K tokens. It is off on both counts.
             "--cache-ram", "0",
             "--no-cache-idle-slots",
+        ]
+        if plan.ctx_checkpoints is not None:
+            argv += ["-ctxcp", str(plan.ctx_checkpoints)]
+        argv += [
             # The thinking switch is read by the jinja engine, so --jinja must
             # be set and must come first. Disabling thinking is the largest
             # single effect in the stack: ~2.8x wall-clock per task.

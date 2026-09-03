@@ -6,7 +6,28 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.0.0] - 2026-09-02
 
+### Fixed
+
+- **Configs near the VRAM ceiling passed their health check and then died on
+  the second request.** llama.cpp keeps 32 context checkpoints per slot by
+  default (upstream PR #15293) at ~150 MiB each on this model, allocated
+  lazily — so the first one lands after startup has already succeeded, and the
+  failure surfaces as a `cudaGraphInstantiate` error naming neither memory nor
+  checkpoints. The planner now emits `-ctxcp 0` whenever the estimated peak
+  leaves under 500 MiB free, and prints why. That includes the certified config
+  on a clean 12 GB card, where the margin is 457 MiB. Note for later: the
+  session-restore patch depends on these checkpoints, so the two are mutually
+  exclusive at the ceiling.
+- Added `tests/test_planner.py` and `tests/make_fixtures.py` — a dependency-free
+  regression suite over the planner's arithmetic, with a case for every bug
+  that shipped or was caught in review: checkpoint thresholds and boundaries,
+  KV-by-need, explicit-`--ctx` exactness, context monotonicity, per-model
+  levers, certified-model identity under an adopted filename, and drafter VRAM
+  accounting.
+
 ### Added
+
+
 
 - **Zero-compile install.** `./install.sh` now downloads a prebuilt
   `llama-server` instead of building one. Three rungs: our patched CUDA
