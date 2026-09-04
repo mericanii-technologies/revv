@@ -12,6 +12,7 @@ if tests/fixtures/ is missing.
 """
 
 import os
+import socket
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -178,6 +179,89 @@ def test_drafter():
     check("MTP-head drafter selects draft-mtp", p.draft_spec_type, "draft-mtp")
 
 
+def speed_like():
+    """The 35B MoE speed line, identified by its exact size."""
+    info = revv.read_gguf(os.path.join(FIXTURES, "qwen_like.gguf"))
+    info.file_size = int(revv.BUILDS["Q3_K_XL_35B"]["size"])
+    info.path = "/models/" + str(revv.BUILDS["Q3_K_XL_35B"]["file"])
+    return info
+
+
+def test_speed_tier():
+    """The MoE line keeps most of its weights in HOST RAM, so estimating its
+    VRAM from file size over-counts by gigabytes and collapses the context."""
+    section("speed tier (35B MoE)")
+    info = speed_like()
+    check("identified by size", revv.identify_build(info), "Q3_K_XL_35B")
+    check("peak anchored on the measurement, not the file size",
+          revv.model_peak_mib(info, 16384, "q8_0"), 11832)
+
+    p = revv.plan_launch(info, "12gb", None, 12287)
+    check("certified context survives planning", p.ctx, 16384)
+    check("certified KV survives planning", p.kv, "q8_0")
+    check("expert offload is applied", p.n_cpu_moe, 16)
+    argv = revv.build_server_argv("/x/llama-server", info.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("argv carries --n-cpu-moe 16",
+          "--n-cpu-moe" in argv and argv[argv.index("--n-cpu-moe") + 1] == "16",
+          True)
+    check("STOCK mode does not offload experts",
+          "--n-cpu-moe" in revv.build_server_argv(
+              "/x/llama-server", info.path, p, 8080, revv.MODE_STOCK, []),
+          False)
+    check("host-RAM requirement is mentioned",
+          any("host RAM" in n or "host RAM" in n.lower() for n in p.notes), True)
+
+    verdict, _ = revv.classify(info, info.path)
+    check("labelled as the speed line", verdict, "CERTIFIED (speed line)")
+
+    # The flagship must be untouched by any of this.
+    f = certified_like()
+    pf = revv.plan_launch(f, "12gb", None, 12287)
+    check("flagship still plans ctx 16384 / q8_0 / 11830 peak",
+          (pf.ctx, pf.kv, pf.estimated_peak, pf.n_cpu_moe),
+          (16384, "q8_0", 11830, None))
+
+
+def test_speed_tier_is_the_mtp_build():
+    """Two HuggingFace repos publish a file with this exact name. The plain
+    -GGUF one has NO draft head (16,845,511,648 bytes, 733 tensors, 40 layers);
+    without it speculation silently does not run and 48.5 t/s is unreachable.
+    Guard the size and the repo so nobody 'simplifies' this back."""
+    section("speed tier points at the MTP build")
+    spec = revv.BUILDS["Q3_K_XL_35B"]
+    check("repo is the MTP one", spec["repo"],
+          "unsloth/Qwen3.6-35B-A3B-MTP-GGUF")
+    check("size is the MTP build's", spec["size"], 17227569440)
+    check("NOT the headless build's size", spec["size"] == 16845511648, False)
+
+
+def test_port_fallback():
+    """A real WSL2 box had an unrelated service squatting 8080."""
+    section("port selection")
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    busy = sock.getsockname()[1]
+    sock.listen(1)
+    try:
+        check("a busy port reads as busy",
+              revv.port_is_free("127.0.0.1", busy), False)
+        # Explicit port is exact-or-fail: it must NOT silently move.
+        try:
+            revv.resolve_port("127.0.0.1", busy)
+            moved = True
+        except SystemExit:
+            moved = False
+        check("explicit --port on a busy port fails rather than moving",
+              moved, False)
+        free = revv.resolve_port("127.0.0.1", None)
+        check("auto selection returns a bindable port",
+              revv.port_is_free("127.0.0.1", free), True)
+    finally:
+        sock.close()
+
+
 def main():
     if not os.path.isdir(FIXTURES):
         print("fixtures missing: run python3 tests/make_fixtures.py first")
@@ -187,6 +271,9 @@ def main():
     test_levers()
     test_certified_identity()
     test_drafter()
+    test_speed_tier()
+    test_speed_tier_is_the_mtp_build()
+    test_port_fallback()
     print("\n%s" % ("ALL PASSED" if not _failures
                     else "%d FAILED: %s" % (len(_failures), ", ".join(_failures))))
     return 1 if _failures else 0

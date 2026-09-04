@@ -120,7 +120,7 @@ i-quant codebook byte is zero) combined with 2-rows-per-block tiling. The two
 changes are superadditive: +4.2% and +2.7% alone, +10.1% together.
 
 **Correctness evidence.** A 133,392-case exhaustive proof, llama.cpp's own
-backend tests, three 200-token greedy transcripts quality-neutral (per-task identical pass/fail; not bit-identical — see MTP losslessness note) across all
+backend tests, three 200-token greedy transcripts byte-identical across all
 four builds tested, and SASS of untouched quant types confirmed byte-for-byte
 unchanged (i.e., the patch provably doesn't touch code paths it isn't
 supposed to).
@@ -424,13 +424,13 @@ template and a per-request kwarg. Both differences were tested:
 | C — positive control | `enable_thinking:true` | **803 chars** |
 
 Arm C is what makes arm A meaningful. And a 25-task HumanEval run under revv's
-embedded template produced **quality-neutral (per-task identical pass/fail; not bit-identical — see MTP losslessness note) completions on 25/25 tasks** versus
+embedded template produced **byte-identical completions on 25/25 tasks** versus
 the certified run under the external template, so revv does not ship a template
 file and does not need to.
 
 **What the v1.1 candidate is, and is not.** It is the ASCII-vocab-pruned
 flagship (vocab 127,947) on the merged build: faster, and roomier at 542 MiB
-free versus 214 MiB. Its 25-task spot-check was quality-neutral (per-task identical pass/fail; not bit-identical — see MTP losslessness note) to the certified
+free versus 214 MiB. Its 25-task spot-check was byte-identical to the certified
 baseline, which is strong evidence of output-neutrality on that workload but is
 **not** a certification — 25 tasks bounds pass@1 only to roughly [86.7%, 100%].
 The full 164-task run has not been done. v1.1 therefore ships no headline
@@ -610,7 +610,7 @@ were not a stability risk either — they simply were not an overclock.
 
 ## Appendix: exact artifacts
 
-For anyone trying to reproduce quality-neutral (per-task identical pass/fail; not bit-identical — see MTP losslessness note) inputs:
+For anyone trying to reproduce these results from byte-identical inputs:
 
 - Repository: `unsloth/Qwen3.8-27B-GGUF`
 - Certified file: `Qwen3.8-27B-UD-IQ3_XXS.gguf`, exact size 10,934,860,704

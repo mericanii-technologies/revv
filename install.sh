@@ -17,6 +17,10 @@ LLAMA_REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 # time this script was written -- the 404 case below is expected, not a bug.
 PREBUILT_URL="https://github.com/mericanii-technologies/revv/releases/download/v1.1.0-binaries/revv-llama-server-1.1.0-linux-x86_64-cuda12.tar.gz"
 PREBUILT_SHA256="3522ef73cb9a93b865e0cfe26c6ccb0f7021e3415fc011e844537bf948bc4423"
+# The prebuilt binary is compiled for this compute capability only (Ampere /
+# 30-series). Other cards rely on driver JIT from PTX, which may simply not
+# work -- see check_prebuilt_arch below.
+PREBUILT_CUDA_ARCH="8.6"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,6 +88,15 @@ Environment:
                   Set to any non-empty value to install a downloaded binary
                   even when no sha256 tool is available to verify it. Off by
                   default: an unverifiable download is refused, not accepted.
+  REVV_ALLOW_ARCH_MISMATCH
+                  (--prebuilt only) The revv prebuilt is compiled for sm_86
+                  (compute capability 8.6) only. Set to any non-empty value
+                  to install it on a different card anyway -- it may fail to
+                  load, or fall back to slow driver JIT. Off by default: an
+                  explicit --prebuilt on a mismatched card fails with an
+                  explanation instead of silently installing a binary that
+                  may not run; the automatic (no-flag) path just falls back
+                  to --source without needing this.
   REVV_SKIP_TOOLCHAIN_CHECK
                   (--source only) Set to any non-empty value to skip
                   the CUDA/host-compiler preflight check and proceed
@@ -756,6 +769,58 @@ download_with_progress() {
     fi
 }
 
+# Like download_with_progress, but for the prebuilt rung specifically:
+# classifies *why* a failed download failed, so the caller can tell "the
+# release isn't published yet" (benign, expected right now) apart from "this
+# machine can't reach GitHub" (the user's network). Sets DOWNLOAD_HTTP_CODE
+# to the HTTP status if one was obtained (e.g. "404"), or "000" if the
+# request never got far enough to get one at all (DNS/route/TLS/timeout).
+# Returns 0 on a clean 200, 1 otherwise -- never calls fail() itself, this
+# rung already has its own soft-fail/auto-fallback convention.
+download_prebuilt() {
+    url="$1"
+    dest="$2"
+    DOWNLOAD_HTTP_CODE="000"
+
+    if command -v curl >/dev/null 2>&1; then
+        # No -f: with -f, curl discards the response and we lose the status
+        # code on a 404 along with it. Plain -sS -w gets us the code either
+        # way, and a 404's response body is a tiny HTML page we're about to
+        # rm -f regardless.
+        code=$(curl -sS -L -o "$dest" -w '%{http_code}' "$url" 2>/dev/null)
+        curl_status=$?
+        is_int "$code" && DOWNLOAD_HTTP_CODE="$code"
+        [ "$curl_status" -eq 0 ] && [ "$DOWNLOAD_HTTP_CODE" = "200" ] && return 0
+        return 1
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        wget_log="$dest.wgetlog.$$"
+        if wget -o "$wget_log" -O "$dest" "$url"; then
+            rm -f "$wget_log"
+            DOWNLOAD_HTTP_CODE="200"
+            return 0
+        fi
+        wget_status=$?
+        # wget exposes no numeric status the way curl's -w does; exit 8
+        # ("server issued an error response") is the closest signal that we
+        # got a real HTTP response and it was bad, rather than never
+        # reaching the server at all. Grep its log for the specific case we
+        # care about distinguishing; anything else stays "unknown" and gets
+        # the generic message.
+        if [ "$wget_status" -eq 8 ] && grep -q '404' "$wget_log" 2>/dev/null; then
+            DOWNLOAD_HTTP_CODE="404"
+        fi
+        rm -f "$wget_log"
+        return 1
+    fi
+
+    fail "neither curl nor wget found on PATH" \
+"revv needs curl or wget to download prebuilt binaries. Install one (e.g.
+'brew install curl' on macOS, 'apt install curl' on Debian/Ubuntu), or use
+--source to build llama.cpp from source instead."
+}
+
 # Verifies $1 against expected sha256 $2. If neither sha256sum nor shasum
 # is installed, warns loudly and proceeds only if the shell is
 # non-interactive or the user explicitly confirms -- never silently.
@@ -798,30 +863,83 @@ verify_sha256_or_confirm() {
     return 1
 }
 
-# Non-fatal: revv's prebuilt targets sm_86 only. A mismatched card can
-# still work (driver JIT) or can fail outright -- either way it's the
-# user's call, not this script's, so this only warns.
-warn_sm86_mismatch() {
-    command -v nvidia-smi >/dev/null 2>&1 || return 0
-    caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || caps=""
-    [ -n "$caps" ] || return 0
-    printf '%s\n' "$caps" | tr -d ' \r' | while IFS= read -r cc; do
-        [ -n "$cc" ] || continue
-        if [ "$cc" != "8.6" ]; then
-            echo ""
-            echo "warning: detected GPU compute capability $cc -- the revv prebuilt is"
-            echo "         built for sm_86 only. It may fall back to slow driver JIT, or"
-            echo "         fail to run, on this card. --source is the reliable path here."
-        fi
-    done || true
-    return 0
+# Checked before downloading anything (no point spending 78 MB finding this
+# out afterward). Returns 0 to proceed -- either it matches, or the check
+# itself couldn't be done and we don't block on a missing check. Returns 1
+# with PREBUILT_FAIL_REASON set on a genuine mismatch, so the existing
+# auto-fallback machinery in try_prebuilt()/main drops to --source; an
+# explicit --prebuilt then surfaces that reason as a hard failure the same
+# way a 404 or a bad sha256 would, unless REVV_ALLOW_ARCH_MISMATCH is set.
+check_prebuilt_arch() {
+    sm_target=$(printf '%s' "$PREBUILT_CUDA_ARCH" | tr -d '.')
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "  warning: 'nvidia-smi' not found -- could not verify GPU architecture" >&2
+        echo "           against the prebuilt's sm_$sm_target target. Proceeding anyway." >&2
+        return 0
+    fi
+
+    raw=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
+
+    # One compute-capability value per line, deduped. Same "bail to BAD on
+    # anything that doesn't look like a compute capability" approach as
+    # detect_cuda_archs -- a partial/garbage nvidia-smi output should
+    # degrade to "could not verify", not to a false mismatch report.
+    caps=$(printf '%s\n' "$raw" | tr -d ' \r' | awk '
+        NF == 0 { next }
+        !/^[0-9]+\.[0-9]+$/ { bad = 1; exit }
+        {
+            if (!($0 in seen)) {
+                seen[$0] = 1
+                out = out (out == "" ? "" : "\n") $0
+            }
+        }
+        END {
+            if (bad) { print "BAD"; exit }
+            if (out != "") print out
+        }
+    ')
+
+    if [ -z "$caps" ] || [ "$caps" = "BAD" ]; then
+        echo "  warning: could not parse a GPU compute capability from nvidia-smi --" >&2
+        echo "           could not verify it against the prebuilt's sm_$sm_target target." >&2
+        echo "           Proceeding anyway." >&2
+        return 0
+    fi
+
+    mismatch=0
+    for cc in $caps; do
+        [ "$cc" = "$PREBUILT_CUDA_ARCH" ] || mismatch=1
+    done
+    [ "$mismatch" -eq 0 ] && return 0
+
+    detected=$(printf '%s\n' "$caps" | tr '\n' ',' | sed 's/,$//')
+    echo ""
+    echo "warning: GPU architecture mismatch."
+    echo "         The revv prebuilt is compiled for sm_$sm_target (compute capability"
+    echo "         $PREBUILT_CUDA_ARCH) only. This machine reports: $detected."
+    echo "         The binary may fail to load, or fall back to slow driver JIT"
+    echo "         compilation from PTX, on this card."
+    echo "         The reliable path here is --source: it auto-detects and compiles"
+    echo "         for the local architecture."
+
+    if [ -n "$REVV_ALLOW_ARCH_MISMATCH" ]; then
+        echo "         REVV_ALLOW_ARCH_MISMATCH is set: proceeding with the sm_$sm_target"
+        echo "         prebuilt anyway."
+        return 0
+    fi
+
+    PREBUILT_FAIL_REASON="GPU compute capability $detected does not match the prebuilt's sm_$sm_target target (override with REVV_ALLOW_ARCH_MISMATCH=1)"
+    return 1
 }
 
 # Downloads the revv prebuilt into $REVV_HOME/cache/, reusing it if
 # already present and sha256-verified (idempotent: re-running does not
 # re-fetch ~78 MB). Sets PREBUILT_CACHE_FILE on success; sets
-# PREBUILT_FAIL_REASON and returns 1 on failure (404, network error, or a
-# sha256 mismatch) without printing -- the caller reports it.
+# PREBUILT_FAIL_REASON (one line) and returns 1 on failure -- 404, network
+# error, or a sha256 mismatch -- without printing; the caller reports it.
+# On a 404 or network error, also sets PREBUILT_FAIL_DETAIL to a longer,
+# case-specific explanation for main's explicit-rung fail() path.
 ensure_prebuilt_downloaded() {
     cache_dir="$REVV_HOME/cache"
     mkdir -p "$cache_dir"
@@ -841,9 +959,26 @@ ensure_prebuilt_downloaded() {
 
     tmp="$dest.tmp.$$"
     echo "  downloading $PREBUILT_URL ..."
-    if ! download_with_progress "$PREBUILT_URL" "$tmp"; then
+    if ! download_prebuilt "$PREBUILT_URL" "$tmp"; then
         rm -f "$tmp"
-        PREBUILT_FAIL_REASON="download failed for $PREBUILT_URL (likely a 404 -- this release may not be published yet)"
+        case "$DOWNLOAD_HTTP_CODE" in
+            404)
+                PREBUILT_FAIL_REASON="the prebuilt release is not published yet (HTTP 404) -- this is expected until the first binary release is published"
+                PREBUILT_FAIL_DETAIL="This is expected right now: the revv prebuilt release hasn't been
+published yet. Use --source to build llama.cpp from source in the
+meantime, or --upstream for the official (Vulkan) prebuilt."
+                ;;
+            000)
+                PREBUILT_FAIL_REASON="could not reach $PREBUILT_URL (network error -- check connectivity, DNS, or a proxy)"
+                PREBUILT_FAIL_DETAIL="This looks like a local network problem (no route, DNS failure, TLS
+error, or timeout) rather than the release itself. Check connectivity
+(and any proxy settings), then re-run; or use --source to build
+llama.cpp from source instead."
+                ;;
+            *)
+                PREBUILT_FAIL_REASON="download failed for $PREBUILT_URL (HTTP $DOWNLOAD_HTTP_CODE)"
+                ;;
+        esac
         return 1
     fi
 
@@ -891,6 +1026,7 @@ check_cuda_runtime_libs() {
 # through to --source cleanly.
 try_prebuilt() {
     PREBUILT_FAIL_REASON=""
+    PREBUILT_FAIL_DETAIL=""
 
     uname_s=$(uname -s)
     if [ "$uname_s" != "Linux" ]; then
@@ -924,7 +1060,10 @@ try_prebuilt() {
     fi
     echo "  platform OK for the revv prebuilt: Linux x86_64, glibc $GLIBC_VER"
 
-    warn_sm86_mismatch
+    if ! check_prebuilt_arch; then
+        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        return 1
+    fi
 
     if ! ensure_prebuilt_downloaded; then
         echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
@@ -1115,7 +1254,7 @@ else
                 echo "installing llama-server (--prebuilt)..."
                 if ! try_prebuilt; then
                     fail "prebuilt install failed: $PREBUILT_FAIL_REASON" \
-"Use --source to build llama.cpp from source on this machine instead."
+"${PREBUILT_FAIL_DETAIL:-Use --source to build llama.cpp from source on this machine instead.}"
                 fi
                 ;;
             upstream)

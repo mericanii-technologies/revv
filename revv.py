@@ -159,6 +159,37 @@ CHECKPOINT_MIB_EACH = 150
 CHECKPOINT_HEADROOM_MIB = 500
 
 
+def host_ram_mib() -> Tuple[Optional[int], Optional[int]]:
+    """(total, available) host RAM in MiB, or (None, None) if unknown.
+
+    A new dimension for MoE tiers: --n-cpu-moe streams expert weights from host
+    RAM, so a config can fit VRAM perfectly and still thrash or get OOM-killed
+    on a machine with too little RAM. MemAvailable is the right field -- it
+    accounts for reclaimable page cache, which MemFree does not.
+    """
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            fields = {}
+            for line in fh:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    fields[parts[0]] = parts[1].strip().split()[0]
+        total = int(fields["MemTotal"]) // 1024
+        avail = int(fields.get("MemAvailable", fields["MemFree"])) // 1024
+        return total, avail
+    except (OSError, KeyError, ValueError, IndexError):
+        pass
+    # macOS fallback: total only, so revv can still say something on a dev box.
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip()) // (1024 * 1024), None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None, None
+
+
 def estimated_peak_mib(ctx: int, kv: str) -> int:
     return int(round(FOOTPRINT_BASE_MIB
                      + ctx * KV_MIB_PER_TOKEN.get(kv, KV_MIB_PER_TOKEN["q8_0"])))
@@ -191,6 +222,22 @@ KV_BYTES_PER_ELEM = {"f16": 2.0, "q8_0": 34.0 / 32.0, "q4_0": 18.0 / 32.0}
 COMPUTE_OVERHEAD_MIB = 666
 
 
+def identify_build(info: "GGUFInfo") -> Optional[str]:
+    """Which registry build is this file, by exact size then by name.
+
+    Size first because `revv adopt` registers ollama blobs whose filename is a
+    content hash; matching on name alone silently demotes a certified file.
+    """
+    for name, spec in BUILDS.items():
+        if info.file_size == spec["size"]:
+            return name
+    base = os.path.basename(info.path)
+    for name, spec in BUILDS.items():
+        if base == spec["file"]:
+            return name
+    return None
+
+
 def is_certified_file(info: "GGUFInfo") -> bool:
     """Is this the exact file the measured numbers came from?
 
@@ -214,7 +261,7 @@ def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
     carry no KV at all. Over-estimating is the safe direction: it makes revv
     reach for a smaller context rather than OOM.
     """
-    if is_certified_file(info):
+    if identify_build(info) == DEFAULT_BUILD:
         return KV_MIB_PER_TOKEN.get(kv)
     if not (info.n_layer and info.n_embd and info.n_head and info.n_head_kv):
         return None
@@ -224,9 +271,29 @@ def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
 
 
 def model_peak_mib(info: "GGUFInfo", ctx: int, kv: str) -> Optional[int]:
+    """Estimated peak VRAM, anchored on a measurement when we have one.
+
+    The file-size term is only valid when the whole model is resident. A
+    mixture-of-experts build launched with --n-cpu-moe keeps most of its
+    weights in HOST RAM, so counting the file size as VRAM over-estimates it by
+    gigabytes -- enough to collapse the context to a quarter of the certified
+    value. For any build we have actually measured, anchor on that number and
+    move only the KV term, which is the part that genuinely scales with
+    context.
+    """
     rate = kv_mib_per_token(info, kv)
     if rate is None:
         return None
+
+    build_name = identify_build(info)
+    spec = BUILDS.get(build_name) if build_name else None
+    if spec is not None and spec.get("peak_mib"):
+        anchor_tier = TIERS["12gb"]
+        anchor_ctx = int(anchor_tier["ctx"])
+        anchor_rate = kv_mib_per_token(info, str(anchor_tier["kv"])) or rate
+        base = float(spec["peak_mib"]) - anchor_ctx * anchor_rate
+        return int(round(base + ctx * rate))
+
     weights = info.file_size / (1024.0 * 1024.0)
     return int(round(weights + COMPUTE_OVERHEAD_MIB + ctx * rate))
 
@@ -250,21 +317,57 @@ MIN_COMPUTE_CAPABILITY = (7, 5)
 # ---------------------------------------------------------------------------
 
 HF_REPO = "unsloth/Qwen3.8-27B-GGUF"
+HF_REPO_35B = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 
-# Sizes are exact bytes from the HuggingFace blob API, cross-checked against
-# the rendered file tree. They are the download's integrity check: a truncated
-# or CDN-mangled file is caught before it ever reaches llama-server.
+# Two certified lines. FLAGSHIP is the 27B dense model; SPEED is a 35B
+# mixture-of-experts model whose experts stream from host RAM, which is why it
+# is faster despite being a bigger file: only ~3B parameters are active per
+# token. They tie on our instruments; see README for where they differ.
+#
+# Sizes are exact bytes from the HuggingFace API. They are the download's
+# integrity check: a truncated or CDN-mangled file is caught before it ever
+# reaches llama-server.
 BUILDS: Dict[str, Dict[str, object]] = {
     "IQ3_XXS": {
         "file": "Qwen3.8-27B-UD-IQ3_XXS.gguf",
+        "repo": HF_REPO,
         "size": 10934860704,
+        "line": "flagship",
         "certified": True,
         "humaneval": 92.7,
-        "note": "the shipping build",
+        "decode_ts": 37.9,
+        "peak_mib": 11830,
+        "note": "the flagship: 27B dense, the build every published number "
+                "was measured on",
+    },
+    "Q3_K_XL_35B": {
+        "file": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+        "repo": HF_REPO_35B,
+        # The MTP repo, NOT the plain one. Both publish a file with this exact
+        # name; the plain repo's build (16,845,511,648 bytes, 733 tensors, 40
+        # layers) has NO draft head, so speculation silently would not run and
+        # the 48.5 t/s figure would not be reachable. Verified by parsing both
+        # headers over a ranged HTTP fetch: this one has 41 layers, 753
+        # tensors, and blk.40.nextn.*.
+        "size": 17227569440,
+        "line": "speed",
+        "certified": True,
+        "humaneval": 92.68,
+        "decode_ts": 48.54,
+        "peak_mib": 11832,
+        # MoE: experts live in host RAM and stream in, so this line has a
+        # second requirement the flagship does not have.
+        "n_cpu_moe": 16,
+        "host_ram_mib": 8192,
+        "note": "the speed tier: 35B mixture-of-experts, 48.5 t/s, ties the "
+                "flagship on our instruments. Needs ~8 GiB of free host RAM "
+                "on top of the VRAM, because the experts stream from it.",
     },
     "Q2_K_XL": {
         "file": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
+        "repo": HF_REPO,
         "size": 9828981664,
+        "line": "flagship",
         "certified": False,
         "humaneval": 93.3,
         "note": "1.03 GiB smaller and the same HumanEval, but edit-format "
@@ -273,7 +376,9 @@ BUILDS: Dict[str, Dict[str, object]] = {
     },
     "IQ2_XXS": {
         "file": "Qwen3.8-27B-UD-IQ2_XXS.gguf",
+        "repo": HF_REPO,
         "size": 7266070528,
+        "line": "flagship",
         "certified": False,
         "humaneval": 78.0,
         "note": "no MTP draft head (stripped below ~8.4 GiB): no speculation, "
@@ -281,6 +386,9 @@ BUILDS: Dict[str, Dict[str, object]] = {
                 "Small is doubly penalised. Not recommended.",
     },
 }
+
+# The two lines a user can ask for by name.
+MODEL_LINES = {"flagship": "IQ3_XXS", "speed": "Q3_K_XL_35B"}
 
 DEFAULT_BUILD = "IQ3_XXS"
 
@@ -1492,14 +1600,18 @@ def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
     it there is no speculative decoding, which is the difference between
     ~37 t/s and ~20 t/s. Nothing else about a GGUF changes speed that much.
     """
-    certified_name = str(BUILDS[DEFAULT_BUILD]["file"])
-    is_ours = (os.path.basename(filename) == certified_name
-               and info.dominant_quant == "IQ3_XXS")
-    if is_ours:
-        return ("CERTIFIED",
-                "This is the exact file the published numbers were measured on:\n"
-                "%.1f t/s, %.1f%% HumanEval-164, %s peak."
-                % (CERT_TS, CERT_HUMANEVAL, mib(CERT_PEAK_MIB)))
+    build_name = identify_build(info)
+    spec = BUILDS.get(build_name) if build_name else None
+    if spec is not None and spec.get("certified"):
+        detail = ("This is the exact file the published numbers were measured "
+                  "on.\n%.1f t/s decode, %.1f%% HumanEval-164, %s peak VRAM."
+                  % (float(spec["decode_ts"]), float(spec["humaneval"]),
+                     mib(int(spec["peak_mib"]))))
+        if spec.get("host_ram_mib"):
+            detail += ("\nMixture-of-experts: also needs ~%s of free host RAM, "
+                       "because\nthe expert layers stream from it."
+                       % mib(int(spec["host_ram_mib"])))
+        return ("CERTIFIED (%s line)" % spec.get("line", "?"), detail)
     # Quoting the certified Qwen figures at a Gemma or Llama file would be
     # meaningless: those numbers are properties of one model on one card.
     same_family = bool(info.arch and info.arch.lower().startswith("qwen"))
@@ -1947,19 +2059,23 @@ def cmd_adopt(args: argparse.Namespace) -> int:
 # get
 # ---------------------------------------------------------------------------
 
-def hf_url(filename: str) -> str:
+def hf_url(filename: str, repo: Optional[str] = None) -> str:
     return "https://huggingface.co/%s/resolve/main/%s?download=true" % (
-        HF_REPO, filename)
+        repo or HF_REPO, filename)
 
 
 def cmd_get(args: argparse.Namespace) -> int:
     build = args.build
     if build is None:
-        if args.tier:
+        if args.tier and args.tier.lower() in MODEL_LINES:
+            build = MODEL_LINES[args.tier.lower()]
+        elif args.tier:
             tier = args.tier.lower()
             if tier not in TIERS:
-                die("unknown tier: %s" % args.tier,
-                    "one of: %s" % ", ".join(sorted(TIERS)))
+                die("unknown target: %s" % args.tier,
+                    "a model line:  %s\n"
+                    "or a VRAM tier: %s"
+                    % (", ".join(sorted(MODEL_LINES)), ", ".join(sorted(TIERS))))
         else:
             gpus, err = detect_gpus()
             if err is not None:
@@ -1994,8 +2110,15 @@ def cmd_get(args: argparse.Namespace) -> int:
         print("%s %s is not the certified build." % (yellow("note:"), build))
         print("       %s" % spec["note"])
 
-    url = hf_url(filename)
-    print("Downloading %s" % build)
+    url = hf_url(filename, str(spec.get("repo") or HF_REPO))
+    line = str(spec.get("line") or "")
+    print("Downloading %s%s" % (build, " (%s line)" % line if line else ""))
+    if spec.get("decode_ts"):
+        print("  measured %.1f t/s, %.1f%% HumanEval-164 on an RTX 3060"
+              % (float(spec["decode_ts"]), float(spec["humaneval"])))
+    if spec.get("host_ram_mib"):
+        print("  needs ~%s of free host RAM as well as the VRAM"
+              % mib(int(spec["host_ram_mib"])))
     print("  from  %s" % url.split("?")[0])
     print("  to    %s" % dest)
     size = head_size(url)
@@ -2089,7 +2212,9 @@ class LaunchPlan:
                  notes: List[str], estimated_peak: Optional[int],
                  draft_path: Optional[str] = None,
                  draft_spec_type: Optional[str] = None,
-                 ctx_checkpoints: Optional[int] = None) -> None:
+                 ctx_checkpoints: Optional[int] = None,
+                 n_cpu_moe: Optional[int] = None,
+                 build_name: Optional[str] = None) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2105,6 +2230,10 @@ class LaunchPlan:
         # None = leave llama-server's default. 0 = disable, because the
         # checkpoint allocation would not fit and would kill request two.
         self.ctx_checkpoints = ctx_checkpoints
+        # MoE lines stream expert weights from host RAM; this is how many
+        # expert layers stay on the CPU. Certified per build, not guessed.
+        self.n_cpu_moe = n_cpu_moe
+        self.build_name = build_name
 
     @property
     def levers(self) -> List[str]:
@@ -2120,6 +2249,8 @@ class LaunchPlan:
             active.append("%s KV (for capacity)" % self.kv)
         if self.ctx_checkpoints == 0:
             active.append("context checkpoints off (VRAM)")
+        if self.n_cpu_moe is not None:
+            active.append("%d expert layers on CPU" % self.n_cpu_moe)
         return active
 
     @property
@@ -2150,6 +2281,33 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     t = TIERS[tier]
     preferred = explicit_ctx if explicit_ctx is not None else int(t["ctx"])
     notes = []      # type: List[str]
+
+    # A recognised build brings its own certified settings. These are measured
+    # for that specific file, so they beat anything the generic estimator
+    # would derive.
+    build_name = identify_build(info)
+    spec = BUILDS.get(build_name) if build_name else None
+    n_cpu_moe = None    # type: Optional[int]
+    if spec is not None and spec.get("n_cpu_moe") is not None:
+        n_cpu_moe = int(spec["n_cpu_moe"])
+        need_ram = int(spec.get("host_ram_mib") or 0)
+        total_ram, avail_ram = host_ram_mib()
+        notes.append("mixture-of-experts build: %d expert layers stay on the "
+                     "CPU and stream from host RAM, which is where the speed "
+                     "comes from" % n_cpu_moe)
+        if avail_ram is not None and need_ram and avail_ram < need_ram:
+            notes.append("WARNING only %s of host RAM is available and this "
+                         "build wants ~%s. It will thrash or be OOM-killed; "
+                         "close something, or use the flagship line instead"
+                         % (mib(avail_ram), mib(need_ram)))
+        elif total_ram is not None and need_ram and total_ram < need_ram + 4096:
+            notes.append("WARNING this machine has %s of RAM total and the "
+                         "build wants ~%s free. That is tight once the OS and "
+                         "your editor are counted" % (mib(total_ram),
+                                                      mib(need_ram)))
+        elif avail_ram is not None:
+            notes.append("host RAM ok: %s available, ~%s needed"
+                         % (mib(avail_ram), mib(need_ram)))
 
     # An external drafter takes precedence: the user asked for it explicitly,
     # and it is the only way to speculate on a file with no built-in head.
@@ -2277,7 +2435,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
 
     return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
                       draft.path if draft else None, draft_spec_type,
-                      ctx_checkpoints)
+                      ctx_checkpoints, n_cpu_moe, build_name)
 
 
 def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
@@ -2304,6 +2462,8 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
         ]
         if plan.ctx_checkpoints is not None:
             argv += ["-ctxcp", str(plan.ctx_checkpoints)]
+        if plan.n_cpu_moe is not None:
+            argv += ["--n-cpu-moe", str(plan.n_cpu_moe)]
         argv += [
             # The thinking switch is read by the jinja engine, so --jinja must
             # be set and must come first. Disabling thinking is the largest
@@ -2366,6 +2526,48 @@ def thinking_off_flags(exe: str) -> List[str]:
     if server_supports(exe, "--reasoning"):
         return ["--reasoning", "off"]
     return ["--chat-template-kwargs", '{"enable_thinking":false}']
+
+
+DEFAULT_PORT = 8080
+PORT_FALLBACK_TRIES = 8
+
+
+def port_is_free(host: str, port: int) -> bool:
+    sock = socket.socket()
+    try:
+        # SO_REUSEADDR matches what ThreadingHTTPServer will do, so this probe
+        # answers the same question the real bind will ask a moment later.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def resolve_port(host: str, explicit: Optional[int]) -> int:
+    """An explicit --port is exact-or-fail; the default walks forward.
+
+    Ports get taken by things that have nothing to do with revv -- the WSL2
+    field box had an unrelated python service on 8080 -- and failing to start
+    over that is a worse default than moving one port along and saying so.
+    """
+    if explicit is not None:
+        if not port_is_free(host, explicit):
+            die("port %d on %s is already in use" % (explicit, host),
+                "Something else is listening there. Free it, or pick another:\n"
+                "  revv up --port %d\n"
+                "Leaving --port off lets revv find a free port itself."
+                % (explicit + 1))
+        return explicit
+    for candidate in range(DEFAULT_PORT, DEFAULT_PORT + PORT_FALLBACK_TRIES):
+        if port_is_free(host, candidate):
+            return candidate
+    die("ports %d-%d on %s are all in use"
+        % (DEFAULT_PORT, DEFAULT_PORT + PORT_FALLBACK_TRIES - 1, host),
+        "Pick one explicitly:  revv up --port 9000")
+    return DEFAULT_PORT      # unreachable
 
 
 def _free_port() -> int:
@@ -2580,6 +2782,8 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
                     "tier": backend.tier,
                     "context": plan.ctx,
                     "kv": plan.kv,
+                    "line": (BUILDS[plan.build_name].get("line")
+                             if plan.build_name in BUILDS else None),
                     # Which levers this model can actually use, so toggle and
                     # compare can refuse to stage a meaningless A/B.
                     "levers": plan.levers,
@@ -2806,14 +3010,20 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
             return 1
     plan = plan_launch(info, tier, args.ctx, free_mib, draft_info)
 
+    # Resolved before anything binds or prints, so --print-command shows the
+    # port the server would actually use.
+    port = resolve_port(args.host, args.port)
+
     if args.print_command:
-        argv = build_server_argv(exe, model, plan, args.port, mode,
-                                 passthrough)
+        argv = build_server_argv(exe, model, plan, port, mode, passthrough)
         print(" ".join(_shell_quote(a) for a in argv))
         return 0
 
     print(bold("revv %s  --  serve" % __version__))
     print("  model    %s" % os.path.basename(model))
+    if args.port is None and port != DEFAULT_PORT:
+        print("  %s port %d was busy, using %d instead"
+              % (yellow("note:"), DEFAULT_PORT, port))
     print("  tier     %s   context %s   KV %s"
           % (tier.upper(), "{:,}".format(plan.ctx), plan.kv))
     if plan.estimated_peak:
@@ -2839,16 +3049,16 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     stats = _Stats()
     handler = make_proxy_handler(backend, stats, args.quiet)
     try:
-        httpd = ThreadingHTTPServer((args.host, args.port), handler)
+        httpd = ThreadingHTTPServer((args.host, port), handler)
     except OSError as exc:
         backend.stop()
-        die("cannot bind %s:%d (%s)" % (args.host, args.port, exc),
+        die("cannot bind %s:%d (%s)" % (args.host, port, exc),
             "Something else is on that port. Pick another:\n"
             "  revv serve --port 8081")
         return 1
     httpd.daemon_threads = True
 
-    print("\n  %s  http://%s:%d/v1" % (bold("api"), args.host, args.port))
+    print("\n  %s  http://%s:%d/v1" % (bold("api"), args.host, port))
     print("  mode     %s -- %s" % (bold(backend.mode.upper()),
                                    mode_description(backend.mode, plan)))
     print("  backend  llama-server on 127.0.0.1:%d" % backend.port)
@@ -2870,7 +3080,7 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     started_at = time.time()
 
     def _persist() -> None:
-        write_run_file(pid=os.getpid(), port=args.port, host=args.host,
+        write_run_file(pid=os.getpid(), port=port, host=args.host,
                        model=os.path.basename(model), tier=tier,
                        backend_pid=(backend.proc.pid if backend.proc else 0),
                        started_at=started_at,
@@ -2921,6 +3131,18 @@ def _control(url: str, action: str, payload: Optional[Dict[str, object]] = None,
         return json.loads(resp.read().decode("utf-8"))
 
 
+def default_url() -> str:
+    """Where a client command should look, absent an explicit --url.
+
+    Reads the run file, so `revv bench` still finds the server after the port
+    fallback moved it off 8080.
+    """
+    run = read_run_file()
+    if run and run.get("port"):
+        return "http://%s:%s" % (run.get("host") or "127.0.0.1", run["port"])
+    return "http://127.0.0.1:%d" % DEFAULT_PORT
+
+
 def _no_server(url: str, exc: object) -> None:
     die("no revv server at %s (%s)" % (url, exc),
         "Start one in another terminal:\n  revv serve\n"
@@ -2928,6 +3150,7 @@ def _no_server(url: str, exc: object) -> None:
 
 
 def cmd_toggle(args: argparse.Namespace) -> int:
+    args.url = args.url or default_url()
     try:
         before = _control(args.url, "status")
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -3069,7 +3292,7 @@ def _timed_generation(base: str, max_tokens: int,
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
-    base = args.url.rstrip("/")
+    base = (args.url or default_url()).rstrip("/")
     try:
         start_status = _control(base, "status")
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -3251,7 +3474,14 @@ def cmd_up(args: argparse.Namespace) -> int:
     argv = [sys.executable, os.path.abspath(__file__), "serve", "--quiet"]
     if args.model:
         argv.append(args.model)
-    for flag, value in (("--port", args.port), ("--host", args.host),
+    # up resolves the port itself and hands the child an EXPLICIT one, so it
+    # knows where to poll for readiness. The child then binds exact-or-fail,
+    # which is what we want: we already checked it was free.
+    port = resolve_port(args.host, args.port)
+    if args.port is None and port != DEFAULT_PORT:
+        print("  %s port %d was busy, using %d instead"
+              % (yellow("note:"), DEFAULT_PORT, port))
+    for flag, value in (("--port", port), ("--host", args.host),
                         ("--ctx", args.ctx), ("--tier", args.tier),
                         ("--draft", args.draft)):
         if value is not None:
@@ -3269,7 +3499,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     proc = subprocess.Popen(argv, stdout=log, stderr=log,
                             stdin=subprocess.DEVNULL, start_new_session=True)
 
-    base = "http://%s:%d" % (args.host, args.port)
+    base = "http://%s:%d" % (args.host, port)
     deadline = time.time() + args.timeout
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -3281,7 +3511,7 @@ def cmd_up(args: argparse.Namespace) -> int:
         except (urllib.error.URLError, OSError, ValueError):
             time.sleep(0.5)
             continue
-        print("\n  %s   http://%s:%d/v1" % (bold("api"), args.host, args.port))
+        print("\n  %s   http://%s:%d/v1" % (bold("api"), args.host, port))
         print("  mode  %s -- %s" % (bold(str(st["mode"]).upper()),
                                     st["mode_description"]))
         print("  model %s" % st["model"])
@@ -3395,6 +3625,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                                    st["mode_description"]))
     print("  model    %s   (send \"%s\" as the model name)"
           % (st["model"], MODEL_ALIAS))
+    if st.get("line"):
+        print("  line     %s" % str(st["line"]).upper())
     print("  tier     %s   context %s   KV %s"
           % (str(st["tier"]).upper(),
              "{:,}".format(int(st.get("context") or 0)), st.get("kv", "?")))
@@ -3601,7 +3833,7 @@ def thinking_check(base: str, timeout: float) -> Tuple[bool, str]:
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
-    base = args.url.rstrip("/")
+    base = (args.url or default_url()).rstrip("/")
     print(bold("revv %s  --  bench" % __version__))
     print("  target   %s" % base)
     print("  protocol %d requests, %d new tokens, greedy, thinking off"
@@ -3728,6 +3960,298 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Self-update / uninstall
+# ---------------------------------------------------------------------------
+
+def _run_git(git_args: List[str], cwd: str) -> "subprocess.CompletedProcess":
+    return subprocess.run(["git"] + git_args, cwd=cwd, capture_output=True,
+                          text=True)
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isdir(os.path.join(here, ".git")):
+        die("revv was not installed from git (%s has no .git), so there is "
+            "nothing to pull" % here,
+            "Install from git instead:\n"
+            "  git clone https://github.com/mericanii-technologies/revv")
+        return 1
+
+    if args.check:
+        fetch = _run_git(["fetch"], here)
+        if fetch.returncode != 0:
+            die("git fetch failed:\n%s"
+                % (fetch.stderr.strip() or fetch.stdout.strip()),
+                "Check your network connection and try again.")
+            return 1
+        behind = _run_git(["rev-list", "--count", "HEAD..@{u}"], here)
+        if behind.returncode != 0:
+            die("could not compare against the upstream branch:\n%s"
+                % (behind.stderr.strip() or behind.stdout.strip()),
+                "This checkout may not be tracking a remote branch. Set one "
+                "with:\n  git -C %s branch --set-upstream-to=origin/<branch>"
+                % here)
+            return 1
+        count = int(behind.stdout.strip() or "0")
+        sha = _git_sha() or "unknown SHA"
+        if count == 0:
+            print("already up to date (%s)." % sha)
+        else:
+            print("%d commit%s behind (%s). Run `revv update` to pull."
+                  % (count, "" if count == 1 else "s", sha))
+        return 0
+
+    # Refuse to pull over local modifications -- never discard anyone's work.
+    dirty = _run_git(["status", "--porcelain"], here)
+    if dirty.returncode != 0:
+        die("git status failed:\n%s"
+            % (dirty.stderr.strip() or dirty.stdout.strip()))
+        return 1
+    if dirty.stdout.strip():
+        die("local changes in %s would be overwritten by an update:\n%s"
+            % (here, dirty.stdout.rstrip()),
+            "Commit or stash your changes first:\n  git -C %s stash" % here)
+        return 1
+
+    old_sha = _git_sha()
+
+    # --ff-only is deliberate: never create a merge commit in someone's
+    # checkout on their behalf.
+    pull = _run_git(["pull", "--ff-only"], here)
+    if pull.returncode != 0:
+        die("git pull --ff-only failed:\n%s"
+            % (pull.stderr.strip() or pull.stdout.strip()),
+            "This usually means the checkout has diverged from upstream or "
+            "there is no network. Inspect it with:\n"
+            "  git -C %s log --oneline --left-right --graph HEAD...@{u}"
+            % here)
+        return 1
+
+    new_sha = _git_sha()
+    if new_sha == old_sha:
+        print("already up to date (%s)." % (new_sha or "unknown SHA"))
+        return 0
+
+    count_out = _run_git(["rev-list", "--count", "%s..%s" % (old_sha, new_sha)],
+                         here)
+    count = count_out.stdout.strip() if count_out.returncode == 0 else "?"
+    print("updated %s -> %s (%s commit%s)"
+          % (old_sha or "unknown", new_sha or "unknown", count,
+             "" if count == "1" else "s"))
+
+    print("\n" + bold("what changed"))
+    changelog_path = os.path.join(here, "CHANGELOG.md")
+    try:
+        with open(changelog_path, "r") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        lines = None
+    if lines is None:
+        print("  (no CHANGELOG.md found)")
+    else:
+        start = next((i for i, l in enumerate(lines) if l.startswith("## [")),
+                     None)
+        if start is None:
+            print("  (CHANGELOG.md has no ## [version] heading)")
+        else:
+            end = next((i for i in range(start + 1, len(lines))
+                        if lines[i].startswith("## [")), len(lines))
+            section = lines[start:end]
+            while section and not section[-1].strip():
+                section.pop()
+            for line in section[:40]:
+                print("  %s" % line)
+            if len(section) > 40:
+                print("  ...")
+
+    print("\n" + bold("after this update"))
+    manifest = read_build_manifest()
+    if manifest is not None:
+        method = str(manifest.get("install_method") or "source")
+        base = manifest.get("base_commit", "unknown")
+        print("  llama-server install: %s (base %s)" % (method, base))
+        if method in ("prebuilt", "upstream"):
+            print("  `git pull` does not update the installed llama-server "
+                  "binary -- if the pinned build changed, re-run: "
+                  "./install.sh")
+    print("  %s" % version_string())
+    return 0
+
+
+def _dir_size(path: str) -> Tuple[int, int]:
+    """Total bytes and file count under path."""
+    total = 0
+    count = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            count += 1
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total, count
+
+
+def _human_size(n: int) -> str:
+    for unit, factor in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2),
+                         ("KiB", 1024)):
+        if n >= factor:
+            return "%.2f %s" % (n / factor, unit)
+    return "%d B" % n
+
+
+def _confirm(prompt: str) -> bool:
+    try:
+        answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    # Refuse anywhere dangerous before touching a single file. REVV_HOME is
+    # env-controlled, so a bad value here must never turn into rm -rf /.
+    home = os.path.realpath(REVV_HOME)
+    dangerous = {"/", os.path.realpath(os.path.expanduser("~")), ""}
+    if not REVV_HOME.strip() or home in dangerous:
+        die("REVV_HOME resolves to %r, which looks like your home directory "
+            "or filesystem root, not revv's state directory" % home,
+            "Point REVV_HOME at revv's actual state dir (default ~/.revv) "
+            "before running uninstall.")
+        return 1
+
+    # Stop anything running first -- never leave a llama-server holding VRAM
+    # for a stack whose state is about to disappear.
+    run = read_run_file()
+    if run and pid_alive(int(run.get("pid") or 0)):
+        print("Stopping the running revv stack first...")
+        cmd_down(argparse.Namespace(url=None))
+        print()
+
+    if not os.path.isdir(REVV_HOME):
+        print("Nothing to remove: %s does not exist." % REVV_HOME)
+        return 0
+
+    models_dir = os.path.realpath(MODELS_DIR)
+    models_inside_home = os.path.isdir(MODELS_DIR) and (
+        models_dir == home or models_dir.startswith(home + os.sep))
+
+    # Models are a separate decision, so they are never in state_entries even
+    # when (as is normal) they live inside REVV_HOME.
+    state_entries = []
+    for name in sorted(os.listdir(REVV_HOME)):
+        full = os.path.join(REVV_HOME, name)
+        if models_inside_home and os.path.realpath(full) == models_dir:
+            continue
+        state_entries.append(full)
+
+    state_size = 0
+    for entry in state_entries:
+        if os.path.isdir(entry):
+            s, _n = _dir_size(entry)
+            state_size += s
+        elif os.path.isfile(entry):
+            state_size += os.path.getsize(entry)
+
+    models_size = 0
+    models_count = 0
+    if os.path.isdir(MODELS_DIR):
+        models_size, models_count = _dir_size(MODELS_DIR)
+
+    print(bold("this will remove"))
+    if state_entries:
+        print("  %s  (%s)" % (REVV_HOME, _human_size(state_size)))
+        for entry in state_entries:
+            print("    %s" % os.path.relpath(entry, REVV_HOME))
+    else:
+        print("  %s has nothing to remove aside from models." % REVV_HOME)
+    if os.path.isdir(MODELS_DIR):
+        print("\n" + bold("separately, downloaded models"))
+        print("  %s  (%s, %d file%s)"
+              % (MODELS_DIR, _human_size(models_size), models_count,
+                 "" if models_count == 1 else "s"))
+    print()
+
+    is_tty = sys.stdin.isatty()
+
+    if args.yes:
+        remove_state = True
+    elif is_tty:
+        remove_state = _confirm(
+            "Remove revv state at %s (%s)? [y/N] "
+            % (REVV_HOME, _human_size(state_size)))
+    else:
+        die("uninstall needs confirmation and stdin is not a terminal",
+            "Re-run non-interactively with the flags that answer for you:\n"
+            "  revv uninstall --yes             # remove state, keep models\n"
+            "  revv uninstall --yes --models    # remove state and models")
+        return 1
+
+    if not os.path.isdir(MODELS_DIR) or args.keep_models:
+        remove_models = False
+        if args.keep_models and os.path.isdir(MODELS_DIR):
+            print("Keeping models at %s (--keep-models)." % MODELS_DIR)
+    elif args.yes and args.models:
+        remove_models = True
+    elif args.yes:
+        remove_models = False
+        print("Keeping models (pass --models with --yes to remove them too).")
+    elif is_tty:
+        remove_models = _confirm(
+            "Also remove downloaded models at %s (%s, %d file%s)? [y/N] "
+            % (MODELS_DIR, _human_size(models_size), models_count,
+               "" if models_count == 1 else "s"))
+    else:
+        remove_models = False   # unreachable: the state branch above already
+                                 # died when stdin is not a tty and not --yes
+
+    if not remove_state and not remove_models:
+        print("Nothing removed.")
+        return 0
+
+    errors = []
+
+    if remove_state:
+        for entry in state_entries:
+            try:
+                if os.path.isdir(entry) and not os.path.islink(entry):
+                    shutil.rmtree(entry, ignore_errors=False)
+                else:
+                    os.remove(entry)
+            except OSError as exc:
+                errors.append("%s: %s" % (entry, exc))
+        if errors:
+            status(FAIL, "some revv state could not be removed",
+                   "\n".join(errors))
+        else:
+            status(OK, "removed revv state", REVV_HOME)
+
+    if remove_models:
+        try:
+            shutil.rmtree(MODELS_DIR, ignore_errors=False)
+            status(OK, "removed downloaded models", MODELS_DIR)
+        except OSError as exc:
+            errors.append("%s: %s" % (MODELS_DIR, exc))
+            status(FAIL, "models could not be fully removed", str(exc))
+    elif os.path.isdir(MODELS_DIR):
+        status(OK, "kept downloaded models", MODELS_DIR)
+
+    print()
+    remaining = sorted(os.listdir(REVV_HOME)) if os.path.isdir(REVV_HOME) \
+        else []
+    if remaining:
+        print("Remaining in %s:" % REVV_HOME)
+        for name in remaining:
+            print("  %s" % name)
+    else:
+        print("%s is now empty." % REVV_HOME)
+    print("The git checkout itself is untouched -- removing that is your "
+          "call:\n  rm -rf %s" % os.path.dirname(os.path.abspath(__file__)))
+
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -3764,8 +4288,9 @@ def build_parser() -> argparse.ArgumentParser:
     def add_serve_flags(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("model", nargs="?",
                         help="path, filename, build name, or adopted name")
-        sp.add_argument("--port", type=int, default=8080,
-                        help="the stable port your tools point at (default 8080)")
+        sp.add_argument("--port", type=int, default=None,
+                        help="exact port, or omit to use %d and walk forward "
+                             "if it is busy" % DEFAULT_PORT)
         sp.add_argument("--host", default="127.0.0.1")
         sp.add_argument("--ctx", type=int, help="override the context size")
         sp.add_argument("--tier", help="force a tier instead of detecting one")
@@ -3802,19 +4327,37 @@ def build_parser() -> argparse.ArgumentParser:
                        help="switch between revv and STOCK without moving the port")
     t.add_argument("mode", nargs="?", choices=[MODE_REVV, MODE_STOCK],
                    help="switch to a specific mode (default: the other one)")
-    t.add_argument("--url", default="http://127.0.0.1:8080")
+    t.add_argument("--url", default=None, help="default: the running instance, else port %d" % DEFAULT_PORT)
 
     c = sub.add_parser("compare",
                        help="run the same prompt through both modes, side by side")
-    c.add_argument("--url", default="http://127.0.0.1:8080")
+    c.add_argument("--url", default=None, help="default: the running instance, else port %d" % DEFAULT_PORT)
     # STOCK thinks out loud and needs room to actually finish; capping it
     # turns the headline ratio into a lower bound instead of a measurement.
     c.add_argument("--max-tokens", type=int, default=2048)
     c.add_argument("--timeout", type=float, default=900.0)
 
     b = sub.add_parser("bench", help="time a running server against the reference")
-    b.add_argument("--url", default="http://127.0.0.1:8080")
+    b.add_argument("--url", default=None, help="default: the running instance, else port %d" % DEFAULT_PORT)
     b.add_argument("--timeout", type=float, default=300.0)
+
+    up_ = sub.add_parser(
+        "update", help="pull the latest revv from git and report what changed")
+    up_.add_argument("--check", action="store_true",
+                     help="only report whether an update is available; "
+                          "do not pull")
+
+    un = sub.add_parser(
+        "uninstall",
+        help="remove revv's own state (binaries, cache, logs); models are "
+             "a separate decision")
+    un.add_argument("--yes", action="store_true",
+                    help="skip the confirmation prompt for state removal")
+    un.add_argument("--models", action="store_true",
+                    help="also remove downloaded models (still prompted "
+                         "unless --yes)")
+    un.add_argument("--keep-models", action="store_true",
+                    help="never remove or prompt about downloaded models")
     return p
 
 
@@ -3838,6 +4381,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "adopt": cmd_adopt, "up": cmd_up, "down": cmd_down,
         "status": cmd_status, "toggle": cmd_toggle, "compare": cmd_compare,
         "bench": cmd_bench,
+        "update": cmd_update, "uninstall": cmd_uninstall,
     }
     if args.command == "serve":
         return cmd_serve(args, passthrough)

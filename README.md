@@ -46,6 +46,41 @@ model (93.3%) under the same protocol.
 Verified output samples — physics sim, SVG drawing, threaded code, CUDA —
 with how each was checked: [examples/](examples/)
 
+## Two model lines
+
+`revv get flagship` (default) or `revv get speed`. Both are certified, both run
+on the same 12GB card, and on every instrument we have they tie.
+
+| | flagship | speed |
+|---|---|---|
+| model | Qwen3.8-27B, dense | Qwen3.6-35B-A3B, mixture-of-experts |
+| download | 10.2 GiB | 16.0 GiB |
+| decode | 37.9 tok/s | **48.5 tok/s** |
+| prefill | 277 tok/s | 205 tok/s |
+| HumanEval-164 | 92.7% | 92.7% (93.9% without speculation) |
+| peak VRAM | 11,830 MiB | 11,832 MiB |
+| host RAM | not a factor | **~8 GiB free, on top of the VRAM** |
+
+**Why the bigger file is faster:** only ~3B of the 35B parameters are active per
+token, and 16 expert layers stream from host RAM. That is also the catch — it
+needs RAM headroom the flagship does not, so `revv doctor` checks host RAM
+before recommending it.
+
+**Pick the flagship if you are unsure.** Three honest reasons:
+
+- Its **prefill is 35% faster** (277 vs 205 tok/s). Long prompts and tool loops
+  are prefill-heavy, so the decode win may not survive contact with an agent
+  workload. The A/B that would settle this **has not been run** — we are not
+  going to guess at it.
+- Every other number in this README was measured on the flagship. Edit-format
+  compliance, the adherence instrument that actually separates builds, is
+  **measured on the flagship and still pending on this speed build**.
+- It is a generation newer (Qwen3.8 vs 3.6). That is a reason for caution on
+  hard reasoning work, not a measured deficit.
+
+**Pick speed if** you are decode-bound — long generations, short prompts — and
+have the RAM. It is 28% faster at the same measured quality.
+
 ## Starting from zero (no model downloaded yet)
 
 **Linux:**

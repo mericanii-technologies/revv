@@ -27,6 +27,32 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A second certified model line.** `revv get speed` installs
+  Qwen3.6-35B-A3B-UD-Q3_K_XL — a mixture-of-experts build measured at
+  **48.5 t/s** (vs the flagship's 37.9) at the same 92.7% HumanEval-164 and
+  essentially the same peak VRAM, because only ~3B of its 35B parameters are
+  active per token and 16 expert layers stream from host RAM. `revv get
+  flagship` remains the default. The registry now carries a per-build repo,
+  certified peak VRAM, and MoE settings; `inspect` and `status` label which
+  line a file belongs to.
+- **Host RAM is now a planning dimension.** The speed line needs ~8 GiB of free
+  host RAM on top of the VRAM, so a config can fit the GPU perfectly and still
+  thrash. `doctor` and the planner read `/proc/meminfo` MemAvailable and warn
+  before you find out the hard way.
+- **Port fallback.** `revv up` / `revv serve` walk 8080 → 8081 → … when the
+  port is busy and print which they took; `--port` stays exact-or-fail. The
+  client commands read the run file, so `revv bench` still finds the server
+  after it moved. A real WSL2 box had an unrelated service on 8080.
+- `revv update` (ff-only pull, refuses over local changes, prints the new
+  CHANGELOG section) and `revv uninstall` (stops the stack first, then prompts
+  separately for state and for models, with guards against deleting `$HOME`).
+- `install.sh` checks the prebuilt's GPU architecture before downloading it and
+  falls back to a source build on a mismatch (`REVV_ALLOW_ARCH_MISMATCH` to
+  override), and distinguishes an unpublished release (404, benign, expected
+  right now) from a network failure.
+
+
+
 
 
 - **Zero-compile install.** `./install.sh` now downloads a prebuilt
