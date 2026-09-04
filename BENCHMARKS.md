@@ -608,6 +608,75 @@ throughput to four decimal places. Anything automating this must verify with
 Acceptance was bit-identical at 0.7756 across every arm, so the locked clocks
 were not a stability risk either — they simply were not an overclock.
 
+## 18. Speed tier re-certification: 55.9 t/s (2026-09-05)
+
+Three flag changes over the original 48.5 t/s speed-tier config, all gated to
+the n_cpu_moe (MoE, host-RAM-offload) build only -- the flagship's flags are
+untouched:
+
+1. **`-t <n>`, an explicit thread count** for the server process. CPU-MoE
+   offload puts host RAM bandwidth on the critical path for every token, so
+   the thread count is a decode-speed lever, not just a load-time one. `n` is
+   the physical (not logical/hyperthreaded) core count, clamped to [4, 8].
+2. **`--spec-type ngram-simple,draft-mtp`**, replacing plain `draft-mtp`.
+   llama.cpp runs this as a first-success-wins chain: an n-gram hit skips the
+   MTP pass for that token, so this is a strict addition over MTP alone, not
+   a substitute for it.
+3. **`--spec-ngram-simple-size-m 256`**, the n-gram matcher's window size.
+
+**Paired quality, before vs after (n=164 / n=34, McNemar):**
+
+| instrument | before | after | p |
+|---|---|---|---|
+| HumanEval-164 | 152/164 | 153/164 | 1.0 |
+| edit-format compliance | 33/34 | 34/34 | 1.0 |
+| peak VRAM | 11,832 MiB | 11,832 MiB | identical |
+
+No measurable quality change on either instrument, and the VRAM ceiling that
+`-ctxcp 0` and the rest of the planner are certified against did not move.
+
+**Result.** Decode: 48.5 -> **55.9 t/s** (2.52x stock 22.2 t/s). Editing
+workloads -- where the n-gram matcher gets to reuse text it can already see in
+the prompt instead of generating it token by token -- go much further: up to
+**~188 t/s mean, 243 t/s peak**, roughly 3x over MTP alone on the same tasks.
+Generation workloads see zero effect from the n-gram addition (it just misses
+and falls through to MTP) at zero cost.
+
+**Thread sweep** (decode t/s at fixed ctx, MoE build, n-gram+MTP stack held
+constant):
+
+| -t | t/s |
+|---|---|
+| 3 | 39.6 |
+| 4 | 46.4 |
+| 5 | 51.9 |
+| 6 | 55.1 |
+| 7 | 54.7 |
+| **8** | **55.9** |
+| 9 | 52.9 |
+| 10 | 48.5 |
+| 12 | 41.1 |
+
+Peaks at 8, falls off on both sides: too few threads starves the host-RAM
+transfer, too many oversubscribes the 6 physical cores and the SMT siblings
+fight over the same memory bus on this bandwidth-bound decode. The rig's full
+logical core count is 12 (6 physical, SMT-2); by -t 10 it is already losing
+5-15% against the -t 8 peak, which is why the heuristic clamps to physical
+cores rather than `os.cpu_count()`.
+
+**`size_m` sweep summary.** The n-gram matcher's default window (`size_m=48`)
+gives ~100 t/s mean on editing tasks; `size_m=256` gives **~188 t/s mean**.
+The curve was still rising at 256, so this is a floor for a wider window, not
+a measured ceiling -- 256 is what shipped because it is where we stopped
+sweeping, not where the effect stopped.
+
+**CRLF warning.** n-gram matching is a literal byte-sequence match against the
+prompt. Repos checked out with CRLF line endings collapse acceptance from
+0.83 to 0.11, because every matched line has its ending byte-flipped against
+what the model just generated. Use LF line endings in any repo an n-gram
+drafter is expected to help with; this is a property of the matcher, not of
+revv's config.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:

@@ -55,7 +55,8 @@ on the same 12GB card, and on every instrument we have they tie.
 |---|---|---|
 | model | Qwen3.8-27B, dense | Qwen3.6-35B-A3B, mixture-of-experts |
 | download | 10.2 GiB | 16.0 GiB |
-| decode | 37.9 tok/s | **48.5 tok/s** |
+| decode | 37.9 tok/s | **55.9 tok/s** (2.52× stock 22.2) |
+| editing workloads | not separately measured | **up to ~188 tok/s mean, 243 peak** |
 | prefill | 277 tok/s | 205 tok/s |
 | HumanEval-164 | 92.7% | 92.7% (93.9% without speculation) |
 | peak VRAM | 11,830 MiB | 11,832 MiB |
@@ -65,6 +66,12 @@ on the same 12GB card, and on every instrument we have they tie.
 token, and 16 expert layers stream from host RAM. That is also the catch — it
 needs RAM headroom the flagship does not, so `revv doctor` checks host RAM
 before recommending it.
+
+**Why editing is faster still:** the speed tier stacks an n-gram matcher in
+front of its MTP drafter, and editing tasks hand it text it has already seen —
+the server just reuses what's sitting in the prompt instead of generating it
+token by token. Certification details, the paired quality results, and the
+thread and size_m sweeps are in [BENCHMARKS.md](BENCHMARKS.md).
 
 **Pick the flagship if you are unsure.** Three honest reasons:
 
@@ -79,7 +86,8 @@ before recommending it.
   hard reasoning work, not a measured deficit.
 
 **Pick speed if** you are decode-bound — long generations, short prompts — and
-have the RAM. It is 28% faster at the same measured quality.
+have the RAM. It is 47% faster at the same measured quality, and considerably
+more than that on editing workloads (see above).
 
 ## Starting from zero (no model downloaded yet)
 

@@ -223,10 +223,84 @@ def test_speed_tier():
           (16384, "q8_0", 11830, None))
 
 
+def test_thread_heuristic():
+    """-t is a CPU-MoE-only lever: measured on a 3060+Ryzen 3600, -t 8 is
+    +14.4% over the server default and the full logical core count LOSES
+    5-15% to oversubscription on this bandwidth-bound decode. It must never
+    appear on a build whose experts stay on the GPU."""
+    section("thread heuristic (-t)")
+    check("physical_core_count is clamped to [4, 8]",
+          4 <= revv.physical_core_count() <= 8, True)
+
+    speed = speed_like()
+    p = revv.plan_launch(speed, "12gb", None, 12287)
+    check("n_cpu_moe > 0 -> n_threads is set", p.n_threads is not None, True)
+    check("n_threads is clamped to [4, 8]", 4 <= p.n_threads <= 8, True)
+    argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("argv carries -t <n_threads>",
+          "-t" in argv and argv[argv.index("-t") + 1] == str(p.n_threads),
+          True)
+    check("STOCK mode does not set -t",
+          "-t" in revv.build_server_argv(
+              "/x/llama-server", speed.path, p, 8080, revv.MODE_STOCK, []),
+          False)
+
+    # No CPU-MoE offload -> no thread flag, on either certified line.
+    flagship = certified_like()
+    pf = revv.plan_launch(flagship, "12gb", None, 12287)
+    check("flagship (no n_cpu_moe) -> n_threads is None", pf.n_threads, None)
+    argv_f = revv.build_server_argv("/x/llama-server", flagship.path, pf, 8080,
+                                    revv.MODE_REVV, [])
+    check("flagship argv never carries -t", "-t" in argv_f, False)
+
+
+def test_speed_tier_drafter_stack():
+    """The n-gram+MTP drafter stack is a strict addition over MTP alone
+    (first-success-wins chain), certified ONLY for the n_cpu_moe speed tier
+    -- it must not leak onto the flagship, which keeps its plain draft-mtp."""
+    section("speed tier drafter stack (n-gram + MTP)")
+    speed = speed_like()
+    p = revv.plan_launch(speed, "12gb", None, 12287)
+    argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("argv carries the n-gram+MTP chain",
+          "--spec-type" in argv and
+          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE_MOE, True)
+    check("argv carries --spec-ngram-simple-size-m 256",
+          "--spec-ngram-simple-size-m" in argv and
+          argv[argv.index("--spec-ngram-simple-size-m") + 1] == "256", True)
+    check("the speed tier no longer ships plain draft-mtp alone",
+          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE, False)
+
+    # The flagship is untouched: still plain draft-mtp, no n-gram flag.
+    flagship = certified_like()
+    pf = revv.plan_launch(flagship, "12gb", None, 12287)
+    argv_f = revv.build_server_argv("/x/llama-server", flagship.path, pf, 8080,
+                                    revv.MODE_REVV, [])
+    check("flagship argv carries plain draft-mtp",
+          "--spec-type" in argv_f and
+          argv_f[argv_f.index("--spec-type") + 1] == revv.SPEC_TYPE, True)
+    check("flagship argv never gets --spec-ngram-simple-size-m",
+          "--spec-ngram-simple-size-m" in argv_f, False)
+
+    # An external drafter still takes precedence over both built-in stacks,
+    # on either line.
+    drafter = revv.read_gguf(os.path.join(FIXTURES, "gemma_like.gguf"))
+    drafter.file_size = 3_000_000_000
+    pd = revv.plan_launch(speed, "12gb", 8192, 24476, drafter)
+    argv_d = revv.build_server_argv("/x/llama-server", speed.path, pd, 8080,
+                                    revv.MODE_REVV, [])
+    check("external drafter overrides the n-gram+MTP stack",
+          "--spec-ngram-simple-size-m" in argv_d, False)
+    check("external drafter argv carries --spec-draft-model",
+          "--spec-draft-model" in argv_d, True)
+
+
 def test_speed_tier_is_the_mtp_build():
     """Two HuggingFace repos publish a file with this exact name. The plain
     -GGUF one has NO draft head (16,845,511,648 bytes, 733 tensors, 40 layers);
-    without it speculation silently does not run and 48.5 t/s is unreachable.
+    without it speculation silently does not run and 55.9 t/s is unreachable.
     Guard the size and the repo so nobody 'simplifies' this back."""
     section("speed tier points at the MTP build")
     spec = revv.BUILDS["Q3_K_XL_35B"]
@@ -273,6 +347,8 @@ def main():
     test_drafter()
     test_speed_tier()
     test_speed_tier_is_the_mtp_build()
+    test_thread_heuristic()
+    test_speed_tier_drafter_stack()
     test_port_fallback()
     print("\n%s" % ("ALL PASSED" if not _failures
                     else "%d FAILED: %s" % (len(_failures), ", ".join(_failures))))

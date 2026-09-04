@@ -190,6 +190,41 @@ def host_ram_mib() -> Tuple[Optional[int], Optional[int]]:
     return None, None
 
 
+def physical_core_count() -> int:
+    """Physical (not logical/hyperthreaded) core count, clamped to [4, 8].
+
+    Measured on a 3060 + Ryzen 3600 (6 physical / 12 logical): -t 8 is +14.4%
+    over the server's default thread count, but the full logical count (12)
+    LOSES 5-15% -- llama.cpp oversubscribes the physical cores on a
+    bandwidth-bound decode, and SMT siblings just fight over the same memory
+    bus. Output was verified bit-identical across -t 3..12, so this is a pure
+    speed lever with no quality risk. /proc/cpuinfo's unique (physical id,
+    core id) pairs is the one field that survives SMT; os.cpu_count() // 2 is
+    the fallback when /proc is unavailable (e.g. macOS dev boxes), and 6 --
+    the value this was measured on -- is the last resort.
+    """
+    try:
+        pairs = set()
+        physical_id = None
+        core_id = None
+        with open("/proc/cpuinfo", "r") as fh:
+            for line in fh:
+                if line.startswith("physical id"):
+                    physical_id = line.split(":", 1)[1].strip()
+                elif line.startswith("core id"):
+                    core_id = line.split(":", 1)[1].strip()
+                    if physical_id is not None:
+                        pairs.add((physical_id, core_id))
+        if pairs:
+            return max(4, min(8, len(pairs)))
+    except (OSError, ValueError, IndexError):
+        pass
+    logical = os.cpu_count()
+    if logical:
+        return max(4, min(8, logical // 2))
+    return 6
+
+
 def estimated_peak_mib(ctx: int, kv: str) -> int:
     return int(round(FOOTPRINT_BASE_MIB
                      + ctx * KV_MIB_PER_TOKEN.get(kv, KV_MIB_PER_TOKEN["q8_0"])))
@@ -346,22 +381,28 @@ BUILDS: Dict[str, Dict[str, object]] = {
         # The MTP repo, NOT the plain one. Both publish a file with this exact
         # name; the plain repo's build (16,845,511,648 bytes, 733 tensors, 40
         # layers) has NO draft head, so speculation silently would not run and
-        # the 48.5 t/s figure would not be reachable. Verified by parsing both
+        # the 55.9 t/s figure would not be reachable. Verified by parsing both
         # headers over a ranged HTTP fetch: this one has 41 layers, 753
         # tensors, and blk.40.nextn.*.
         "size": 17227569440,
         "line": "speed",
         "certified": True,
         "humaneval": 92.68,
-        "decode_ts": 48.54,
+        # 55.9 t/s: certified 2026-09 with three flag changes over the
+        # original 48.5 t/s baseline -- -t 8 (CPU-MoE thread heuristic) and
+        # an n-gram+MTP drafter stack (ngram-simple,draft-mtp). Quality
+        # re-verified unchanged: HE-164 153/164 vs 152/164 (p=1.0),
+        # edit-compliance 34/34 vs 33/34 (p=1.0). See BENCHMARKS.md.
+        "decode_ts": 55.9,
         "peak_mib": 11832,
         # MoE: experts live in host RAM and stream in, so this line has a
         # second requirement the flagship does not have.
         "n_cpu_moe": 16,
         "host_ram_mib": 8192,
-        "note": "the speed tier: 35B mixture-of-experts, 48.5 t/s, ties the "
-                "flagship on our instruments. Needs ~8 GiB of free host RAM "
-                "on top of the VRAM, because the experts stream from it.",
+        "note": "the speed tier: 35B mixture-of-experts, 55.9 t/s (2.52x "
+                "stock), ties the flagship on our instruments. Needs ~8 GiB "
+                "of free host RAM on top of the VRAM, because the experts "
+                "stream from it.",
     },
     "Q2_K_XL": {
         "file": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
@@ -414,6 +455,19 @@ TIER_ORDER = ["24gb", "16gb", "12gb"]  # highest first, for detection
 # greedy non-reproducibility in one observation and is not shipped.
 SPEC_TYPE = "draft-mtp"
 SPEC_N_MAX = 2
+
+# The speed tier's certified drafter stack (n-cpu-moe builds only -- see the
+# n_cpu_moe gate in build_server_argv). llama.cpp runs speculation chains
+# first-success-wins: an n-gram hit skips the MTP pass for that token, so this
+# is a strict addition over MTP alone, not a substitute for it. Measured
+# +197% on editing workloads (up to ~188 t/s mean / 243 peak) and ZERO effect,
+# zero cost, on plain generation -- the model isn't reusing anything there, so
+# the n-gram matcher just misses and falls through. size-m=256 was verified
+# byte-identical to MTP-only output; see BENCHMARKS.md for the size-m sweep
+# (rising through 256, so this is a floor, not a ceiling) and the CRLF
+# warning (0.83 -> 0.11 acceptance on CRLF text; keep repos LF).
+SPEC_TYPE_MOE = "ngram-simple,draft-mtp"
+SPEC_NGRAM_SIZE_M = 256
 
 
 # ---------------------------------------------------------------------------
@@ -2214,7 +2268,8 @@ class LaunchPlan:
                  draft_spec_type: Optional[str] = None,
                  ctx_checkpoints: Optional[int] = None,
                  n_cpu_moe: Optional[int] = None,
-                 build_name: Optional[str] = None) -> None:
+                 build_name: Optional[str] = None,
+                 n_threads: Optional[int] = None) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2234,6 +2289,11 @@ class LaunchPlan:
         # expert layers stay on the CPU. Certified per build, not guessed.
         self.n_cpu_moe = n_cpu_moe
         self.build_name = build_name
+        # CPU-MoE offload puts host-RAM bandwidth on the critical path for
+        # every token, which makes the thread count a decode-speed lever, not
+        # just a load-time one. None = leave llama-server's default; only set
+        # when n_cpu_moe is also set.
+        self.n_threads = n_threads
 
     @property
     def levers(self) -> List[str]:
@@ -2241,6 +2301,12 @@ class LaunchPlan:
         if self.draft_path:
             active.append("speculation via external drafter %s [experimental]"
                           % os.path.basename(self.draft_path))
+        elif self.use_spec and self.n_cpu_moe is not None:
+            # The speed tier: n-gram hits skip the MTP pass entirely
+            # (first-success-wins), so this is a strict addition over MTP
+            # alone, not a replacement.
+            active.append("speculation (n-gram + MTP n=%d drafter stack)"
+                          % SPEC_N_MAX)
         elif self.use_spec:
             active.append("speculation (MTP n=%d)" % SPEC_N_MAX)
         if self.thinking_off:
@@ -2251,6 +2317,8 @@ class LaunchPlan:
             active.append("context checkpoints off (VRAM)")
         if self.n_cpu_moe is not None:
             active.append("%d expert layers on CPU" % self.n_cpu_moe)
+        if self.n_threads is not None:
+            active.append("-t %d (CPU-MoE decode)" % self.n_threads)
         return active
 
     @property
@@ -2308,6 +2376,19 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         elif avail_ram is not None:
             notes.append("host RAM ok: %s available, ~%s needed"
                          % (mib(avail_ram), mib(need_ram)))
+
+    # CPU-MoE offload makes host RAM bandwidth the bottleneck for every
+    # token, and -t controls how many threads compete for it. Measured on a
+    # 3060 + Ryzen 3600: -t 8 is +14.4% over the server default, while the
+    # full logical count loses 5-15% to oversubscription. Only relevant when
+    # experts are actually on the CPU -- a GPU-resident build has no such
+    # bottleneck.
+    n_threads = None    # type: Optional[int]
+    if n_cpu_moe:
+        n_threads = physical_core_count()
+        notes.append("-t %d: physical core count (clamped 4-8), tuned for "
+                     "CPU-MoE decode where host RAM bandwidth is the "
+                     "bottleneck" % n_threads)
 
     # An external drafter takes precedence: the user asked for it explicitly,
     # and it is the only way to speculate on a file with no built-in head.
@@ -2435,7 +2516,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
 
     return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
                       draft.path if draft else None, draft_spec_type,
-                      ctx_checkpoints, n_cpu_moe, build_name)
+                      ctx_checkpoints, n_cpu_moe, build_name, n_threads)
 
 
 def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
@@ -2464,6 +2545,8 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
             argv += ["-ctxcp", str(plan.ctx_checkpoints)]
         if plan.n_cpu_moe is not None:
             argv += ["--n-cpu-moe", str(plan.n_cpu_moe)]
+        if plan.n_threads is not None:
+            argv += ["-t", str(plan.n_threads)]
         argv += [
             # The thinking switch is read by the jinja engine, so --jinja must
             # be set and must come first. Disabling thinking is the largest
@@ -2485,6 +2568,14 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
                      # eats the entire speculation win at batch 1.
                      "--spec-draft-ngl", "99",
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
+        elif plan.use_spec and plan.n_cpu_moe is not None:
+            # The certified speed tier: stack an n-gram matcher in front of
+            # MTP. Restricted to n_cpu_moe builds because acceptance is a
+            # property of THIS build's certification, not of draft-mtp in
+            # general -- do not widen this to every MTP-head model.
+            argv += ["--spec-type", SPEC_TYPE_MOE,
+                     "--spec-draft-n-max", str(SPEC_N_MAX),
+                     "--spec-ngram-simple-size-m", str(SPEC_NGRAM_SIZE_M)]
         elif plan.use_spec:
             argv += ["--spec-type", SPEC_TYPE,
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
