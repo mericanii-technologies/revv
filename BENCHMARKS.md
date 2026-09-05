@@ -750,7 +750,7 @@ either — there is nothing to re-run.
 
 **VRAM cost and the ship point.** The chain is not free: ~100 MiB, measured
 as 11,956 MiB vs 11,854 MiB at c=16384 (otherwise-identical launches). On a
-12GB reference card (12,288 MiB free):
+12GB reference card (12,288 MiB nominal):
 
 | context | peak VRAM (chain included) | headroom |
 |---|---:|---:|
@@ -758,11 +758,21 @@ as 11,956 MiB vs 11,854 MiB at c=16384 (otherwise-identical launches). On a
 | **12288** | **11,822 MiB** | **466 MiB** |
 | 8192 | 11,666 MiB | 622 MiB |
 
-332 MiB of headroom at c=16384 is below the ~400 MiB comfort line this
-program has otherwise held to, so the shipped ceiling for the flagship on a
-12GB card is **c=12288**, not c=16384. Decode throughput is flat across
-8K/12K/16K context on this workload, so shrinking context to buy the headroom
-back costs nothing measurable. `revv`'s planner now charges the chain's
+Headroom figures are against the 12,288 MiB nominal; the usable ceiling on a
+3060 is 12,044 (244 MiB driver-reserved), so real headroom is 244 MiB less --
+the certification standard is >=200 MiB measured under consecutive deep
+requests with `-ctxcp 0`. Read against the usable ceiling the rows above are
+88 / **222** / 378 MiB.
+
+c=16384 leaves 88 MiB of real headroom, far under the >=200 MiB standard, so
+the shipped ceiling for the flagship on a 12GB card is **c=12288**, not
+c=16384, where real headroom is 222 MiB. (This row was originally rejected
+against a ~400 MiB comfort line read off the nominal column -- the same
+accounting error corrected above. The conclusion does not change; the margin
+was simply thinner than it looked, and 12288 remains the ship point.)
+
+Decode throughput is flat across 8K/12K/16K context on this workload, so
+shrinking context to buy the headroom back costs nothing measurable. `revv`'s planner now charges the chain's
 ~100 MiB against free VRAM before sizing context (`SPEC_NGRAM_CHAIN_MIB` in
 `revv.py`) specifically so it lands here automatically instead of shipping a
 config with an unacceptably thin safety margin.
