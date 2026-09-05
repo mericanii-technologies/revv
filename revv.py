@@ -2519,9 +2519,22 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     if peak is not None:
         peak += draft_overhead_mib(draft, ctx, kv) + chain_mib
         if free_mib is not None and peak + VRAM_MARGIN_MIB > free_mib:
-            notes.append("WARNING estimated peak ~%s exceeds %s free once the "
-                         "drafter is counted; reduce --ctx if this OOMs"
-                         % (mib(peak), mib(free_mib)))
+            # Two distinct situations, and saying "exceeds" for both is simply
+            # false: peak can be UNDER free and still trip this, because the
+            # test includes the safety margin. A user who reads "~11,530 MiB
+            # exceeds 11,640 MiB free" and can do arithmetic stops trusting
+            # the rest of the output. Name the drafter only when there is one.
+            why = " once the drafter is counted" if draft is not None else ""
+            if peak > free_mib:
+                notes.append("WARNING estimated peak ~%s exceeds the %s free%s;"
+                             " reduce --ctx if this OOMs"
+                             % (mib(peak), mib(free_mib), why))
+            else:
+                notes.append("WARNING estimated peak ~%s leaves only ~%s of the "
+                             "%s free%s, under the %s revv keeps in reserve for "
+                             "allocator fragmentation; reduce --ctx if this OOMs"
+                             % (mib(peak), mib(free_mib - peak), mib(free_mib),
+                                why, mib(VRAM_MARGIN_MIB)))
 
     # Context checkpoints are allocated lazily, so leaving them on near the
     # ceiling produces a server that passes its health check and then dies on
