@@ -1574,26 +1574,35 @@ def local_models() -> List[str]:
 
 
 def resolve_model(arg: Optional[str]) -> str:
-    """Turn a path, an adopted name, a build name, a bare filename, or nothing
-    into a real path on disk."""
+    """Turn a path, an adopted name, a build or line name, a bare filename, or
+    nothing into a real path on disk."""
     if arg:
         if os.path.isfile(arg):
             return arg
         adopted = registry_lookup(arg)
         if adopted is not None:
             return adopted
-        if arg in BUILDS:
-            path = os.path.join(MODELS_DIR, str(BUILDS[arg]["file"]))
+        # A LINE name (moe/dense, or the deprecated speed/flagship) has to work
+        # everywhere a model can be named, because it is the vocabulary the
+        # README and `revv get` teach. Without this, `revv get moe` succeeds
+        # and the obvious next command, `revv up moe`, fails with "no such
+        # model: moe" -- and the fix hint does not mention the one spelling
+        # that would have worked.
+        build = resolve_model_line(arg) or arg
+        if build in BUILDS:
+            path = os.path.join(MODELS_DIR, str(BUILDS[build]["file"]))
             if os.path.isfile(path):
                 return path
-            die("build %s is not downloaded" % arg,
-                "revv get   # downloads a certified build")
+            die("build %s is not downloaded" % build,
+                "revv get %s" % arg)
         candidate = os.path.join(MODELS_DIR, arg)
         if os.path.isfile(candidate):
             return candidate
         die("no such model: %s" % arg,
-            "revv doctor   # lists the models revv can see\n"
-            "revv adopt    # registers GGUFs ollama or LM Studio already has")
+            "a model line:  %s\n"
+            "revv doctor    # lists the models revv can see\n"
+            "revv adopt     # registers GGUFs ollama or LM Studio already has"
+            % ", ".join(sorted(MODEL_LINES)))
 
     found = local_models()
     registered = sorted(load_registry())
@@ -3936,10 +3945,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     gpus, err = detect_gpus()
     if err is None and gpus:
         g = max(gpus, key=lambda x: x.total_mib)
-        head = g.total_mib - g.used_mib
+        # The driver's own free figure, NOT total-minus-used. On this card
+        # 244 MiB is reserved and appears in neither, so total-minus-used
+        # overstates what is actually available by exactly that much -- and
+        # the near-ceiling note below, which triggers under 200 MiB, could
+        # then never fire: real free would have to go negative first.
+        head = g.free_mib
         print("  vram     %s used of %s  (%s free)"
               % (mib(g.used_mib), mib(g.total_mib), mib(head)))
-        if g.used_mib > CERT_PEAK_MIB and head < 200:
+        if g.reserved_mib:
+            print("           %s reserved by the host and not available to "
+                  "CUDA" % mib(g.reserved_mib))
+        if head < 200:
             print("           %s that is close to the ceiling."
                   % yellow("note:"))
     return 0
