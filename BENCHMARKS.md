@@ -608,6 +608,43 @@ throughput to four decimal places. Anything automating this must verify with
 Acceptance was bit-identical at 0.7756 across every arm, so the locked clocks
 were not a stability risk either — they simply were not an overclock.
 
+## 17b. Planner estimate vs measured peak, and the usable ceiling
+
+Source: `results/revv_qa_20260905.md` (pre-launch QA, 2026-09-05).
+
+**The usable ceiling.** An RTX 3060 12GB reports 12,288 MiB total, but
+`used + free` sums to **12,044 MiB** at every sample: 244 MiB is reserved by
+the host and never available to CUDA. Headroom must be read against 12,044,
+not 12,288. Our certification standard is >=200 MiB of real headroom, measured
+across consecutive deep requests with `-ctxcp 0`.
+
+| build | context | measured peak | real headroom vs 12,044 |
+|---|---:|---:|---:|
+| 35B-A3B (MoE), UD-Q3_K_XL | 16384 | 11,832 MiB | 212 MiB |
+| 27B (dense), UD-IQ3_XXS | 12288 | 11,822 MiB | 222 MiB |
+
+Both clear the standard, and both are thinner than the "~400 MiB comfort line"
+quoted earlier in this program, which was an accounting error: that line was
+read off the 12,288 nominal column rather than the 12,044 usable one.
+
+**The planner's estimate is optimistic, and worsens down the ladder.** revv's
+`model_peak_mib()` anchors on a measured peak and then moves only the KV term
+with context, so the non-KV footprint (compute buffers) is assumed to shrink
+faster than it does. Measured against the 27B build:
+
+| context | planner estimate | measured peak | optimistic by |
+|---|---:|---:|---:|
+| 16384 (the anchor) | 11,930 MiB | 11,956 MiB | 26 MiB |
+| 12288 (the ship point) | 11,746 MiB | 11,822 MiB | 76 MiB |
+| 8192 | 11,562 MiB | 11,666 MiB | 104 MiB |
+
+This is not a live defect -- every shipped config still clears the >=200 MiB
+standard -- but it matters where the ladder steps down, which is exactly the
+low-VRAM WSL2 case. At c=8192 the 104 MiB of optimism consumes 42% of the
+dense build's 250 MiB margin, leaving roughly 146 MiB of true buffer. Treat
+the planner's headroom figure as an upper bound, not a measurement. A build
+whose ship point *is* its anchor (the 35B at c=16384) has zero error there.
+
 ## 18. The 35B-A3B (MoE) build re-certification: 55.9 t/s (2026-09-05)
 
 Three flag changes over the original 48.5 t/s config for this build, all gated
@@ -707,7 +744,6 @@ For anyone trying to reproduce these results from byte-identical inputs:
   `daef7b6874397a5a7c3d7e38b55e2ee0adf7da38` (build b10712), "vulkan: top_k
   radix select for k >= 1024 for Qwen 3.8 Flash Next (#28032)". Both patches
   were verified to apply cleanly to a pristine checkout of that commit.
-</content>
 
 ## MTP losslessness note (2026-09-03)
 

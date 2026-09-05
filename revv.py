@@ -411,10 +411,12 @@ MIN_COMPUTE_CAPABILITY = (7, 5)
 HF_REPO = "unsloth/Qwen3.8-27B-GGUF"
 HF_REPO_35B = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 
-# Two certified lines. FLAGSHIP is the 27B dense model; SPEED is a 35B
-# mixture-of-experts model whose experts stream from host RAM, which is why it
-# is faster despite being a bigger file: only ~3B parameters are active per
-# token. They tie on our instruments; see README for where they differ.
+# Two certified lines, named for what they are. DENSE is the 27B dense model;
+# MOE is a 35B mixture-of-experts model whose experts stream from host RAM,
+# which is why it is faster despite being a bigger file: only ~3B parameters
+# are active per token. The old names (flagship / speed) survive as aliases,
+# but they were inverted: on our multi-file editing instrument the MoE build
+# scored 9/34 first-attempt against the dense build's 4/34 (p=0.039).
 #
 # Sizes are exact bytes from the HuggingFace API. They are the download's
 # integrity check: a truncated or CDN-mangled file is caught before it ever
@@ -424,13 +426,14 @@ BUILDS: Dict[str, Dict[str, object]] = {
         "file": "Qwen3.8-27B-UD-IQ3_XXS.gguf",
         "repo": HF_REPO,
         "size": 10934860704,
-        "line": "flagship",
+        "line": "dense",
         "certified": True,
         "humaneval": 92.7,
         "decode_ts": 37.9,
         "peak_mib": 11830,
-        "note": "the flagship: 27B dense, the build every published number "
-                "was measured on",
+        "note": "27B dense. Needs no host RAM beyond the VRAM. Slower than "
+                "the MoE build, and scored 4/34 against its 9/34 on our "
+                "multi-file editing instrument (p=0.039).",
     },
     "Q3_K_XL_35B": {
         "file": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
@@ -442,7 +445,7 @@ BUILDS: Dict[str, Dict[str, object]] = {
         # headers over a ranged HTTP fetch: this one has 41 layers, 753
         # tensors, and blk.40.nextn.*.
         "size": 17227569440,
-        "line": "speed",
+        "line": "moe",
         "certified": True,
         "humaneval": 92.68,
         # 55.9 t/s: certified 2026-09 with three flag changes over the
@@ -453,19 +456,19 @@ BUILDS: Dict[str, Dict[str, object]] = {
         "decode_ts": 55.9,
         "peak_mib": 11832,
         # MoE: experts live in host RAM and stream in, so this line has a
-        # second requirement the flagship does not have.
+        # second requirement the dense build does not have.
         "n_cpu_moe": 16,
         "host_ram_mib": 8192,
-        "note": "the speed tier: 35B mixture-of-experts, 55.9 t/s (2.52x "
-                "stock), ties the flagship on our instruments. Needs ~8 GiB "
-                "of free host RAM on top of the VRAM, because the experts "
-                "stream from it.",
+        "note": "35B mixture-of-experts, 55.9 t/s (2.52x stock). Scored 9/34 "
+                "against the dense build's 4/34 on our multi-file editing "
+                "instrument (p=0.039). Needs ~8 GiB of free host RAM on top "
+                "of the VRAM, because the experts stream from it.",
     },
     "Q2_K_XL": {
         "file": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
         "repo": HF_REPO,
         "size": 9828981664,
-        "line": "flagship",
+        "line": "dense",
         "certified": False,
         "humaneval": 93.3,
         "note": "1.03 GiB smaller and the same HumanEval, but edit-format "
@@ -476,7 +479,7 @@ BUILDS: Dict[str, Dict[str, object]] = {
         "file": "Qwen3.8-27B-UD-IQ2_XXS.gguf",
         "repo": HF_REPO,
         "size": 7266070528,
-        "line": "flagship",
+        "line": "dense",
         "certified": False,
         "humaneval": 78.0,
         "note": "no MTP draft head (stripped below ~8.4 GiB): no speculation, "
@@ -486,9 +489,73 @@ BUILDS: Dict[str, Dict[str, object]] = {
 }
 
 # The two lines a user can ask for by name.
-MODEL_LINES = {"flagship": "IQ3_XXS", "speed": "Q3_K_XL_35B"}
+MODEL_LINES = {"moe": "Q3_K_XL_35B", "dense": "IQ3_XXS"}
 
+# Deprecated names, kept working so existing scripts and docs do not break.
+# They are deprecated because they were misleading, not merely old: the
+# editing measurement inverted them. Each maps to its new name plus the one
+# line revv prints when it is used.
+DEPRECATED_LINES: Dict[str, Tuple[str, str]] = {
+    "flagship": ("dense",
+                 "`flagship` now means the 27B dense build; on our editing "
+                 "instrument the 35B MoE build scored higher -- see README"),
+    "speed": ("moe",
+              "`speed` now means the 35B MoE build (`moe`); the old names "
+              "were inverted against our editing measurement -- see README"),
+}
+
+# The reference build: the one whose KV cost per token and VRAM peak were
+# measured directly, and which identify_build() matches against. This is a
+# calibration constant, NOT the build `revv get` downloads by default -- for
+# that, see default_build_for_host().
 DEFAULT_BUILD = "IQ3_XXS"
+
+# `revv get` with no argument picks by host RAM. The MoE build keeps 16 blocks
+# of experts in host RAM and streams them per token; it wants ~8-9 GiB free
+# for that on top of the VRAM, and a machine that only just clears 8 GiB free
+# today will not clear it once an editor and a browser are open. 24 GiB total
+# is the line at which recommending it is safe without measuring the moment.
+MOE_DEFAULT_HOST_RAM_MIB = 24 * 1024
+
+
+def resolve_model_line(name: str) -> Optional[str]:
+    """Map a build-line name (or deprecated alias) to a BUILDS key.
+
+    Returns None if the name is not a line at all, so callers can fall
+    through to their tier handling. Prints the deprecation note on the call
+    that used the old name.
+    """
+    key = name.strip().lower()
+    if key in MODEL_LINES:
+        return MODEL_LINES[key]
+    if key in DEPRECATED_LINES:
+        new_name, note = DEPRECATED_LINES[key]
+        print("%s %s" % (yellow("note:"), note))
+        print("       use %s" % bold(new_name))
+        return MODEL_LINES[new_name]
+    return None
+
+
+def default_build_for_host() -> Tuple[str, str]:
+    """(BUILDS key, one-sentence reason) for commands that must pick a build.
+
+    Host RAM decides, because it is the only requirement the two certified
+    builds do not share.
+    """
+    total, _avail = host_ram_mib()
+    if total is None:
+        return (MODEL_LINES["dense"],
+                "could not read host RAM, so the dense build is the default: "
+                "it needs none beyond the VRAM")
+    if total >= MOE_DEFAULT_HOST_RAM_MIB:
+        return (MODEL_LINES["moe"],
+                "this machine has %s of RAM, so the MoE build is the default "
+                "-- its CPU-resident experts want ~8-9 GiB of host RAM, and "
+                "it is the faster of the two" % mib(total))
+    return (MODEL_LINES["dense"],
+            "this machine has %s of RAM and the MoE build wants ~8-9 GiB free "
+            "for its CPU-resident experts, so the dense build is the default"
+            % mib(total))
 
 # Tier -> runtime configuration. Only the 12GB tier is certified; the others
 # are the same certified weights with the extra VRAM spent on context, which
@@ -1520,7 +1587,7 @@ def resolve_model(arg: Optional[str]) -> str:
             if os.path.isfile(path):
                 return path
             die("build %s is not downloaded" % arg,
-                "revv get   # downloads the certified build")
+                "revv get   # downloads a certified build")
         candidate = os.path.join(MODELS_DIR, arg)
         if os.path.isfile(candidate):
             return candidate
@@ -1532,13 +1599,16 @@ def resolve_model(arg: Optional[str]) -> str:
     registered = sorted(load_registry())
     if not found and not registered:
         die("no models found in %s" % MODELS_DIR,
-            "revv get      # downloads the certified build (~10.2 GiB)\n"
+            "revv get      # downloads a certified build (10.2 or 16.0 GiB)\n"
             "revv adopt    # reuses a GGUF ollama or LM Studio already has")
-    # Prefer the certified build wherever it is: it is the only one revv has
-    # numbers for.
-    certified = os.path.join(MODELS_DIR, str(BUILDS[DEFAULT_BUILD]["file"]))
-    if certified in found:
-        return certified
+    # Prefer a certified build wherever it is -- those are the only two revv
+    # has numbers for -- and among them prefer the one this host can actually
+    # feed, which is the same host-RAM question `revv get` answers.
+    preferred, _why = default_build_for_host()
+    for name in (preferred, MODEL_LINES["dense"], MODEL_LINES["moe"]):
+        certified = os.path.join(MODELS_DIR, str(BUILDS[name]["file"]))
+        if certified in found:
+            return certified
     if len(found) == 1 and not registered:
         return found[0]
     if not found and len(registered) == 1:
@@ -2189,23 +2259,35 @@ def hf_url(filename: str, repo: Optional[str] = None) -> str:
         repo or HF_REPO, filename)
 
 
+def get_build_choice(tier_arg: Optional[str]) -> Tuple[str, Optional[str]]:
+    """Which build `revv get <tier_arg>` should fetch, and why (or None).
+
+    A named line wins outright -- it used to be overwritten by the tier
+    default that ran after the whole branch chain, so `revv get speed`
+    silently fetched the dense build. A VRAM tier name does NOT decide the
+    line, because every tier ships the same weights; it falls through to the
+    host-RAM question, same as passing nothing at all.
+    """
+    if tier_arg:
+        named = resolve_model_line(tier_arg)
+        if named is not None:
+            return named, None
+        if tier_arg.strip().lower() not in TIERS:
+            die("unknown target: %s" % tier_arg,
+                "a model line:  %s\n"
+                "or a VRAM tier: %s"
+                % (", ".join(sorted(MODEL_LINES)), ", ".join(sorted(TIERS))))
+    return default_build_for_host()
+
+
 def cmd_get(args: argparse.Namespace) -> int:
     build = args.build
     if build is None:
-        if args.tier and args.tier.lower() in MODEL_LINES:
-            build = MODEL_LINES[args.tier.lower()]
-        elif args.tier:
-            tier = args.tier.lower()
-            if tier not in TIERS:
-                die("unknown target: %s" % args.tier,
-                    "a model line:  %s\n"
-                    "or a VRAM tier: %s"
-                    % (", ".join(sorted(MODEL_LINES)), ", ".join(sorted(TIERS))))
-        else:
+        if not args.tier:
             gpus, err = detect_gpus()
             if err is not None:
-                print("%s %s -- assuming the 12GB tier." % (yellow("note:"), err))
-                tier = "12gb"
+                print("%s %s -- assuming the 12GB tier."
+                      % (yellow("note:"), err))
             else:
                 best = max(gpus, key=lambda g: g.free_mib)
                 detected = tier_for(best.free_mib)
@@ -2214,10 +2296,10 @@ def cmd_get(args: argparse.Namespace) -> int:
                         % (best.name, mib(best.free_mib), mib(best.total_mib)),
                         "revv needs %s free. See README.md."
                         % mib(VRAM_MIN_FREE_MIB))
-                tier = detected
-                print("Detected %s -> %s tier." % (best.name, tier.upper()))
-        # Every tier ships the same weights; see the note on BUILDS.
-        build = DEFAULT_BUILD
+                print("Detected %s -> %s tier." % (best.name, detected.upper()))
+        build, why = get_build_choice(args.tier)
+        if why:
+            print("%s %s." % (yellow("note:"), why))
 
     if build not in BUILDS:
         die("unknown build: %s" % build,
@@ -2435,7 +2517,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         if avail_ram is not None and need_ram and avail_ram < need_ram:
             notes.append("WARNING only %s of host RAM is available and this "
                          "build wants ~%s. It will thrash or be OOM-killed; "
-                         "close something, or use the flagship line instead"
+                         "close something, or use the dense line instead"
                          % (mib(avail_ram), mib(need_ram)))
         elif total_ram is not None and need_ram and total_ram < need_ram + 4096:
             notes.append("WARNING this machine has %s of RAM total and the "
@@ -4126,7 +4208,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     print("\n  " + bold("reference (RTX 3060 12GB, sm_86, c=16384, this "
                         "same protocol)"))
-    print("    %-44s %6.1f t/s" % ("flagship, MTP n=2, q8_0 KV, patched",
+    print("    %-44s %6.1f t/s" % ("27B dense, MTP n=2, q8_0 KV, patched",
                                    BENCH_REF_PATCHED))
     print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
                                    BENCH_REF_NOSPEC))
@@ -4474,7 +4556,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="check this machine and report what is possible")
 
     g = sub.add_parser("get", help="download the certified model")
-    g.add_argument("tier", nargs="?", help="12gb / 16gb / 24gb (default: detect)")
+    g.add_argument("tier", nargs="?",
+                   help="moe / dense, or 12gb / 16gb / 24gb "
+                        "(default: chosen from host RAM)")
     g.add_argument("--build", help="download a specific build: %s"
                    % ", ".join(sorted(BUILDS)))
     g.add_argument("--force", action="store_true",

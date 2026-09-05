@@ -58,6 +58,126 @@ def section(title):
     print("\n" + title)
 
 
+class fake_host_ram(object):
+    """Pin host_ram_mib() for the duration of a block, then restore it.
+
+    The RAM-based default must be tested against chosen values, not against
+    whatever the machine running the suite happens to have.
+    """
+
+    def __init__(self, total_mib, avail_mib=None):
+        self.total = total_mib
+        self.avail = avail_mib if avail_mib is not None else total_mib
+        self.saved = None
+
+    def __enter__(self):
+        self.saved = revv.host_ram_mib
+        revv.host_ram_mib = lambda: (self.total, self.avail)
+        return self
+
+    def __exit__(self, *exc):
+        revv.host_ram_mib = self.saved
+        return False
+
+
+def test_build_names():
+    """Build lines are named for what they are (moe / dense); the old names
+    still work but are deprecated, because they were inverted against the
+    editing measurement rather than merely old."""
+    section("build names and deprecated aliases")
+
+    check("moe -> the 35B MoE build",
+          revv.resolve_model_line("moe"), "Q3_K_XL_35B")
+    check("dense -> the 27B dense build",
+          revv.resolve_model_line("dense"), "IQ3_XXS")
+    check("names are case- and space-insensitive",
+          revv.resolve_model_line("  MoE  "), "Q3_K_XL_35B")
+
+    # The aliases are inverted relative to the old naming, which is the whole
+    # reason they are deprecated rather than silently mapped.
+    check("alias speed -> moe (the 35B)",
+          revv.resolve_model_line("speed"), "Q3_K_XL_35B")
+    check("alias flagship -> dense (the 27B)",
+          revv.resolve_model_line("flagship"), "IQ3_XXS")
+    check("every alias maps to a real line",
+          all(new in revv.MODEL_LINES for new, _ in
+              revv.DEPRECATED_LINES.values()), True)
+    check("a non-line name is not a line", revv.resolve_model_line("12gb"), None)
+    check("an unknown name is not a line",
+          revv.resolve_model_line("nonsense"), None)
+
+    # Both certified builds must be reachable by name. This is the regression
+    # that mattered: `revv get speed` used to resolve the line correctly and
+    # then have it overwritten by the tier default, so it fetched the dense
+    # build while printing nothing about it.
+    check("get speed fetches the MoE build, not the dense one",
+          revv.get_build_choice("speed")[0], "Q3_K_XL_35B")
+    check("get moe fetches the MoE build",
+          revv.get_build_choice("moe")[0], "Q3_K_XL_35B")
+    check("get dense fetches the dense build",
+          revv.get_build_choice("dense")[0], "IQ3_XXS")
+    check("an explicit line needs no explanation",
+          revv.get_build_choice("moe")[1], None)
+
+    check("the two lines cover both certified builds",
+          sorted(revv.MODEL_LINES.values()),
+          sorted(n for n, s in revv.BUILDS.items() if s["certified"]))
+    check("every build is labelled with a live line name",
+          sorted({str(s["line"]) for s in revv.BUILDS.values()}),
+          sorted(revv.MODEL_LINES))
+
+
+def test_ram_based_default():
+    """With no build named, host RAM decides: it is the only requirement the
+    two certified builds do not share. The MoE build streams 16 blocks of
+    experts from host RAM and wants ~8-9 GiB free for them."""
+    section("RAM-based default build")
+
+    with fake_host_ram(32 * 1024):
+        build, why = revv.default_build_for_host()
+        check("32 GiB host -> MoE build", build, "Q3_K_XL_35B")
+        check("...and it says why", "RAM" in (why or ""), True)
+    with fake_host_ram(revv.MOE_DEFAULT_HOST_RAM_MIB):
+        check("exactly at the threshold -> MoE build",
+              revv.default_build_for_host()[0], "Q3_K_XL_35B")
+    with fake_host_ram(revv.MOE_DEFAULT_HOST_RAM_MIB - 1):
+        check("one MiB below the threshold -> dense build",
+              revv.default_build_for_host()[0], "IQ3_XXS")
+    with fake_host_ram(16 * 1024):
+        build, why = revv.default_build_for_host()
+        check("16 GiB host -> dense build", build, "IQ3_XXS")
+        check("...and it says why", "RAM" in (why or ""), True)
+    with fake_host_ram(8 * 1024):
+        check("8 GiB host -> dense build",
+              revv.default_build_for_host()[0], "IQ3_XXS")
+
+    # Unknown RAM must fail toward the build with no host-RAM requirement.
+    saved = revv.host_ram_mib
+    try:
+        revv.host_ram_mib = lambda: (None, None)
+        build, why = revv.default_build_for_host()
+        check("unreadable host RAM -> dense build", build, "IQ3_XXS")
+        check("...and it says why", bool(why), True)
+    finally:
+        revv.host_ram_mib = saved
+
+    # A VRAM tier does not pick a line: every tier ships the same weights.
+    with fake_host_ram(32 * 1024):
+        check("a VRAM tier still asks the host-RAM question",
+              revv.get_build_choice("12gb")[0], "Q3_K_XL_35B")
+        check("no argument asks the same question",
+              revv.get_build_choice(None)[0], "Q3_K_XL_35B")
+    with fake_host_ram(16 * 1024):
+        check("...and answers it differently on a smaller host",
+              revv.get_build_choice("24gb")[0], "IQ3_XXS")
+
+    # The build revv calibrates against is not the build it defaults to.
+    check("DEFAULT_BUILD is still the measured reference build",
+          revv.DEFAULT_BUILD, "IQ3_XXS")
+    check("...and is still what identify_build matches",
+          revv.identify_build(certified_like()), revv.DEFAULT_BUILD)
+
+
 def test_context_checkpoints():
     """Default 32 checkpoints/slot at ~150 MiB each are allocated lazily, so a
     config near the ceiling passes its health check and dies on request two
@@ -245,7 +365,7 @@ def test_speed_tier():
           any("host RAM" in n or "host RAM" in n.lower() for n in p.notes), True)
 
     verdict, _ = revv.classify(info, info.path)
-    check("labelled as the speed line", verdict, "CERTIFIED (speed line)")
+    check("labelled as the moe line", verdict, "CERTIFIED (moe line)")
 
     # The speed tier's OWN settings (n-cpu-moe, host RAM notes) must not leak
     # onto the flagship. Its peak now carries the chain's ~100 MiB, same as
@@ -501,6 +621,8 @@ def main():
     if not os.path.isdir(FIXTURES):
         print("fixtures missing: run python3 tests/make_fixtures.py first")
         return 2
+    test_build_names()
+    test_ram_based_default()
     test_context_checkpoints()
     test_kv_and_context()
     test_levers()

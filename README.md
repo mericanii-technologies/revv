@@ -99,7 +99,7 @@ You need Linux and a working NVIDIA driver (`nvidia-smi` prints a table).
 git clone https://github.com/mericanii-technologies/revv && cd revv
 ./install.sh          # downloads a prebuilt llama-server; no compiler needed
 ./revv.py doctor      # check the card before downloading 16 GB
-./revv.py get speed   # or: ./revv.py get flagship
+./revv.py get moe     # or: ./revv.py get dense
 ./revv.py up
 ```
 
@@ -153,7 +153,7 @@ Five commands do everything:
 
 ```
 ./revv.py doctor      # what this machine can run, and what it will pick
-./revv.py get speed   # download a certified file (resumable)
+./revv.py get moe     # download a certified file (resumable)
 ./revv.py up          # start in the background on 127.0.0.1:8080
 ./revv.py status      # mode, model, port, uptime, VRAM
 ./revv.py down        # stop everything, including orphaned servers
@@ -166,11 +166,12 @@ export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 export OPENAI_API_KEY=revv
 ```
 
-The build keywords are `speed` (the 35B-A3B MoE) and `flagship` (the 27B
-dense). They are historical, they are inverted against the editing result
-above, and they will be renamed; `revv get` with no argument currently gives
-the 27B. On our own measurements, start with `revv get speed` if you have the
-host RAM.
+The two builds are named `moe` (the 35B-A3B) and `dense` (the 27B). The old
+keywords `speed` and `flagship` still work, but they print a deprecation note,
+because they were inverted against the editing result above. `revv get` with no
+argument picks by host RAM — 24 GB or more gets the MoE build, less gets the
+dense one, since the MoE build's CPU-resident experts want ~8–9 GB — and says
+which and why. If you have the RAM, `revv get moe` is the one to start with.
 
 To see the difference on your own card: `revv compare` runs one prompt through
 stock and revv mode back to back, `revv bench` measures your decode rate
