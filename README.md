@@ -1,314 +1,238 @@
 # revv
 
-by [Mericanii](https://github.com/mericanii-technologies). Runs Qwen3.8-27B properly on a consumer NVIDIA GPU.
+by [Mericanii](https://github.com/mericanii-technologies). Apache-2.0.
 
-Most setups run this model far below what the hardware allows — the default
-model file doesn't fit a 12GB card, speculation is off, and a template default
-makes every answer ~3× longer than it needs to be. revv is a small terminal
-tool that applies a measured configuration and gives you a standard
-OpenAI-compatible endpoint. Everything below was measured on an RTX 3060;
-protocols are in [BENCHMARKS.md](BENCHMARKS.md).
+revv is a small terminal program, Python standard library only, that launches
+llama.cpp with a measured configuration for one of two Qwen coding models on a
+12GB-or-larger NVIDIA card, and serves a plain OpenAI-compatible endpoint on
+localhost. Any harness that speaks that API — opencode, aider, Continue, your
+own script — points at it and works. revv does not touch the harness, send your
+prompts anywhere, or train anything. It picks flags, keeps the server alive,
+and gets out of the way. Every number below was measured on an RTX 3060 12GB;
+protocols are in [BENCHMARKS.md](BENCHMARKS.md), and the work that did not pan
+out is in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-## What it does
+## What it does under the hood
 
-- **Picks a model file that actually fits your VRAM.** The popular 4-bit file
-  (15.4GB) spills off a 12GB card and runs at ~5 tok/s. The 3-bit file (10.9GB)
-  fits, runs 4× faster, and scores the same on HumanEval within noise
-  (92.7% vs 94.5%, n=164, statistically indistinguishable).
-- **Turns on the model's built-in speculative decoding** (MTP head), ~1.7×
-  faster. Quality-neutral by measurement (identical pass/fail on all 164
-  HumanEval tasks, McNemar p=1.0); not bit-identical — occasional single-token
-  differences from floating-point batch-order effects, the same class of
-  nondeterminism llama.cpp has across batch sizes. Off in every default setup
-  we checked.
-- **Disables thinking mode by default.** This model ships with reasoning on,
-  which triples tokens per answer. With it off: same pass rate, ~2.8× faster
-  per task.
-- **Tunes KV cache and context** to measured values, not folklore (quantized
-  KV is a capacity trade, not a speed win — we measured it both ways).
-- Optional patches (in `patches/`, pending upstream): a CUDA kernel fix
-  (+3% decode) and session save/restore for this model family (resume an 8K
-  session in 0.9s instead of 16.7s).
+Seven things, each measured separately on the rig in BENCHMARKS.md §2.
 
-## Results (RTX 3060 12GB, same weights throughout)
+- **Thinking mode off.** These models ship with reasoning on, which roughly
+  triples the tokens spent per answer. Off: same pass rate, **2.8× faster
+  wall-clock per task** (4.79 s vs 13.38 s, 158.8 vs 474 tokens). Bigger than
+  every flag below combined.
+- **MTP self-speculation.** The model file carries its own draft head. Depth 2
+  is worth **+68%**. Quality-neutral by measurement (identical per-task outcomes
+  across all 164 HumanEval tasks, p=1.0) but **not bit-exact** — 3 of 5 greedy
+  probes differ from a no-speculation run, because the batched verify pass sums
+  floats in a different order. Depth 3+ loses more than it gains.
+- **An n-gram drafter chained in front of it.** Editing work is mostly
+  re-emitting file content already visible in the prompt, so a literal n-gram
+  matcher lands long runs for free: **2.8–6.1× on editing, byte-identical
+  output, and exactly zero effect on writing new code** (1.00×, no cost — it
+  misses and falls through).
+- **A thread count for CPU-offloaded experts.** The MoE build streams 16 expert
+  layers from host RAM, which puts RAM bandwidth on the critical path. Setting
+  `-t` to the physical core count is worth **+14%**; the default
+  oversubscribes. Output is bit-identical across the whole sweep.
+- **Context sized to free VRAM, not total.** revv reads `memory.free` and picks
+  the largest context off a ladder that fits with a margin. On WSL2, where
+  Windows reserves 1–1.5 GB, that means a smaller context instead of an OOM.
+- **A checkpoint guard near the ceiling.** llama.cpp keeps 32 context
+  checkpoints per slot at ~150 MiB each, allocated lazily, so a tight config
+  loads, passes its health check, serves one request, then dies on the second
+  with an error mentioning neither memory nor checkpoints. revv sets `-ctxcp 0`
+  whenever the planned peak leaves under 500 MiB free.
+- **q8_0 KV cache.** Not a speed win — quantized KV is measurably *slower* than
+  f16 at every depth we tested, because it moves attention onto a compute-bound
+  kernel. It is a capacity trade, and f16 does not fit this model on 12GB. We
+  measured it both ways rather than assuming.
 
-| setup | decode | notes |
+## Results
+
+RTX 3060 12GB, Ubuntu 24.04, headless.
+
+| | 35B-A3B (MoE) | 27B (dense) |
 |---|---|---|
-| default 4-bit file, ollama-style settings | 4.7 tok/s | model spills to CPU; thinking on |
-| right-sized 3-bit file, stock flags | ~20 tok/s | fits VRAM, no speculation |
-| **revv** | **37.9 tok/s** | + ~2.8× fewer tokens per task |
+| model | Qwen3.6-35B-A3B, UD-Q3_K_XL | Qwen3.8-27B, UD-IQ3_XXS |
+| download | 16.0 GiB | 10.2 GiB |
+| generation, stock flags | 22.2 t/s | 22.5 t/s |
+| generation, revv | **55.9 t/s** (2.52×) | **37.9 t/s** |
+| editing, revv | 63 → ~188 t/s mean, 243 peak (+197%) | 40 → 113–246 t/s (2.8–6.1×) |
+| context revv serves | 16,384 | 12,288 |
+| peak VRAM | 11,832 MiB | 11,822 MiB |
+| host RAM needed | ~8 GiB free, on top of the VRAM | not a factor |
+| HumanEval-164 | 153/164 | 152/164 |
+| multi-file editing, 34 tasks | 9/34 first try, 16/34 overall | 4/34 first try, 8/34 overall |
 
-On a 12-task workload (10 HumanEval + 2 long-context), the default setup
-finished 5/12 in 28.6 minutes; revv finished 12/12 in 1.5 minutes.
-Quality: 92.7% HumanEval-164, statistically equal to the uncompressed Q8
-model (93.3%) under the same protocol.
+Reading that table honestly:
 
-Verified output samples — physics sim, SVG drawing, threaded code, CUDA —
-with how each was checked: [examples/](examples/)
+- The stock column is llama.cpp with defaults and a file that fits. The 35B
+  figure is a stock `llama-server` at `-ngl 30`, no tuning, from the same
+  campaign as the 55.9. The 27B figures are one `revv compare` session (22.5
+  stock, 38.4 revv); `revv bench` uses a different prompt and reads 37.9, the
+  reference figure it compares your machine against. Both in BENCHMARKS.md §15.
+- **An ollama-style default is a worse starting point than either.** The popular
+  4-bit file does not fit a 12GB card; it spills to CPU and runs at **2–4.5
+  t/s** (our measured point: 2.12 t/s). Picking a file that fits is most of the
+  first jump.
+- **Editing is a range because it depends on how much of the answer is already
+  in the prompt.** Rewriting a file you pasted in hits the top; inventing new
+  code hits none of it. Both figures are byte-identical to the same config with
+  the matcher off, so nothing is traded for the speed.
+- **On our editing instrument the 35B is both faster and more capable** — 9/34
+  vs 4/34 first-attempt, p=0.039. The 27B produces well-formed edits (34/34
+  format compliance) that are more often wrong. That is why this README names
+  the builds by what they are rather than by tier. What we have *not* measured:
+  the 27B is a generation newer, dense, and needs no host-RAM headroom, and
+  vendor reasoning claims for it are unreplicated by us. Its case is real and
+  unmeasured, not disproven.
+- No head-to-head prefill number: the two figures we have (~500 t/s for the 27B,
+  205 t/s for the 35B) were taken under different configs on different dates.
 
-## Two model lines
+## Install
 
-`revv get flagship` (default) or `revv get speed`. Both are certified, both run
-on the same 12GB card, and on every instrument we have they tie.
+You need Linux and a working NVIDIA driver (`nvidia-smi` prints a table).
 
-| | flagship | speed |
-|---|---|---|
-| model | Qwen3.8-27B, dense | Qwen3.6-35B-A3B, mixture-of-experts |
-| download | 10.2 GiB | 16.0 GiB |
-| decode | 37.9 tok/s | **55.9 tok/s** (2.52× stock 22.2) |
-| editing workloads | **113-246 tok/s (2.8-6.1x)** | **up to ~188 tok/s mean, 243 peak** |
-| prefill | 277 tok/s | 205 tok/s |
-| HumanEval-164 | 92.7% | 92.7% (93.9% without speculation) |
-| peak VRAM | 11,830 MiB | 11,832 MiB |
-| host RAM | not a factor | **~8 GiB free, on top of the VRAM** |
+**1. Linux, prebuilt — simplest.**
 
-**Why the bigger file is faster:** only ~3B of the 35B parameters are active per
-token, and 16 expert layers stream from host RAM. That is also the catch — it
-needs RAM headroom the flagship does not, so `revv doctor` checks host RAM
-before recommending it.
-
-**Why editing is faster still:** both lines now stack an n-gram matcher in
-front of their MTP drafter, and editing tasks hand it text it has already seen
-— the server just reuses what's sitting in the prompt instead of generating it
-token by token. Certified on the flagship 2026-09-05, with zero effect on
-plain generation and byte-identical output. Certification details, the paired
-quality results, and the thread and size_m sweeps are in
-[BENCHMARKS.md](BENCHMARKS.md).
-
-**Pick the flagship if you are unsure.** Three honest reasons:
-
-- Its **prefill is 35% faster** (277 vs 205 tok/s). Long prompts and tool loops
-  are prefill-heavy, so the decode win may not survive contact with an agent
-  workload. The A/B that would settle this **has not been run** — we are not
-  going to guess at it.
-- Every other number in this README was measured on the flagship. Edit-format
-  compliance, the adherence instrument that actually separates builds, is
-  **measured on the flagship and still pending on this speed build**.
-- It is a generation newer (Qwen3.8 vs 3.6). That is a reason for caution on
-  hard reasoning work, not a measured deficit.
-
-**Pick speed if** you are decode-bound — long generations, short prompts — and
-have the RAM. It is 47% faster at the same measured quality, and considerably
-more than that on editing workloads (see above).
-
-## Starting from zero (no model downloaded yet)
-
-**Linux:**
 ```
-# either let revv fetch the certified file directly (recommended):
 git clone https://github.com/mericanii-technologies/revv && cd revv
-./install.sh && ./revv.py get && ./revv.py up
-
-# or, if you prefer ollama for model management:
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen3.8:27b        # note: this pulls a 4-bit file that won't fit 12GB cards
-./revv.py adopt                # revv finds it, warns about the fit, offers the right file
+./install.sh          # downloads a prebuilt llama-server; no compiler needed
+./revv.py doctor      # check the card before downloading 16 GB
+./revv.py get speed   # or: ./revv.py get flagship
+./revv.py up
 ```
 
-`./install.sh` no longer compiles anything by default — it downloads a prebuilt
-binary. See [Install paths](#install-paths-and-what-you-are-trusting) if you
-would rather not run a third-party build.
+> **TODO (founder):** the prebuilt GitHub Release is **not published yet**. As
+> of 2026-09-05 the releases list is empty and the asset URL 404s, so
+> `install.sh` falls through to building from source for everyone. This section
+> is written for how it will read once the release is tagged. Publish the sm_86
+> artifact, then delete this block.
 
-**Windows:** use WSL2 (revv needs Linux + the NVIDIA driver's WSL CUDA support).
+Preconditions, checked first: Linux x86_64, glibc 2.38+ (Ubuntu 24.04+; 22.04
+will not work), and the CUDA *runtime* libraries
+`libcudart`/`libcublas`/`libcublasLt`, which need no compiler. The binary is
+built for sm_86 (30-series); other cards fall back to driver JIT, where
+`--source` is the reliable path. If a precondition fails, `install.sh` names it
+and falls back to building.
 
-Install the NVIDIA driver on the Windows host itself, before touching WSL2 --
-never install an NVIDIA driver inside the WSL2 guest, since CUDA support is
-passed through from the Windows host driver. This is the single most common
-first-run failure.
+**2. Windows, via WSL2.** The rule that breaks most first runs: **install the
+NVIDIA driver on the Windows host, before touching WSL2. Never install an
+NVIDIA driver inside the WSL2 guest** — CUDA is passed through from the host
+driver. A working `nvidia-smi` inside Ubuntu does not mean the CUDA toolkit is
+present.
 
 ```
-wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
-# then, inside Ubuntu — note: a working nvidia-smi does NOT mean the CUDA
-# toolkit is installed; install.sh needs cmake and nvcc to build llama-server.
-# Use NVIDIA's WSL repo and a RECENT toolkit (Ubuntu's packaged CUDA and older
-# 12.x toolkits fail against new glibc/gcc — verified on a real setup):
+wsl --install -d Ubuntu          # PowerShell (admin), reboot, open Ubuntu
 sudo apt update && sudo apt install -y git cmake build-essential
 wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
-sudo apt install -y cuda-toolkit-13-3   # or newest cuda-toolkit-13-x listed
-export PATH=/usr/local/cuda/bin:$PATH   # add to ~/.bashrc too
-# then follow the Linux steps above
-
-# WSL2 VRAM note: Windows typically reserves ~1-1.5GB of the GPU. revv reads
-# free VRAM (not total) and automatically picks the largest context that fits,
-# so on WSL2 it will usually choose 8192 instead of 16384 and tell you why.
-# `./revv.py doctor` shows the reservation and the choice. --ctx overrides it.
+sudo apt install -y cuda-toolkit-13-3    # or the newest cuda-toolkit-13-x listed
+export PATH=/usr/local/cuda/bin:$PATH    # add to ~/.bashrc too
+# then follow the Linux steps
 ```
 
-**Windows native (PowerShell, no WSL) — manual config, untested by us:**
-the revv tool itself needs Linux for now (installer + daemon), but the
-configuration it applies works with llama.cpp's official Windows CUDA build:
-```powershell
-# 1. get llama.cpp: download the latest cudart+bin win-cuda zip from
-#    https://github.com/ggml-org/llama.cpp/releases and unzip
-# 2. get the certified model file (10.9GB):
-Invoke-WebRequest -Uri "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-IQ3_XXS.gguf" -OutFile Qwen3.8-27B-UD-IQ3_XXS.gguf
-# 3. run with the certified flags:
-.\llama-server.exe -m .\Qwen3.8-27B-UD-IQ3_XXS.gguf -ngl 99 -fa on -c 16384 `
-  -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 2 --parallel 1 `
-  --jinja --reasoning off --cache-ram 0 --port 8080
-```
-That's the whole trick minus the conveniences (no adopt/toggle/bench/patches).
-Our numbers are from Linux; Windows-native reports welcome. A native Windows
-revv is on the list.
+Ubuntu's packaged CUDA and older 12.x toolkits fail against recent glibc/gcc,
+which is why the NVIDIA WSL repo is used above. Expect a smaller context:
+Windows reserves roughly 1–1.5 GB of the card, revv plans against free VRAM,
+and will pick 8192 or lower. `revv doctor` shows the reservation and the choice.
 
-`./revv.py get` downloads the certified file (unsloth Qwen3.8-27B-UD-IQ3_XXS,
-10.9GB) with resume support. `./revv.py inspect <file>` explains any GGUF you
-already have.
+**3. From source — the fallback.** `./install.sh --source` clones llama.cpp at
+the pinned commit, applies the two patches in `patches/` (or `--stock` for
+none), and builds with CUDA. You can read every patch first. It needs cmake, a
+CUDA toolkit, and a host compiler `nvcc` accepts — that chain is the single
+biggest obstacle to a first working install, and the reason the prebuilt
+exists. `./install.sh --upstream` fetches official llama.cpp binaries instead,
+but on Linux those are Vulkan, not CUDA: it runs, the kernel patch does not
+apply, and none of these numbers were measured on it. `revv doctor` reports
+which path built the binary you are running.
 
-## Quickstart
+## Usage
+
+Five commands do everything:
 
 ```
-git clone https://github.com/mericanii-technologies/revv && cd revv
-./install.sh          # downloads a prebuilt llama-server. No compiler needed.
-./revv.py adopt       # finds Qwen3.8 models you already downloaded via ollama
-                      # (or: ./revv.py get   to download the certified file)
-./revv.py up          # starts in the background on localhost:8080
+./revv.py doctor      # what this machine can run, and what it will pick
+./revv.py get speed   # download a certified file (resumable)
+./revv.py up          # start in the background on 127.0.0.1:8080
+./revv.py status      # mode, model, port, uptime, VRAM
+./revv.py down        # stop everything, including orphaned servers
 ```
 
-Then point anything OpenAI-compatible at it:
+Then point any OpenAI-compatible client at it:
 
 ```
-export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
 export OPENAI_API_KEY=revv
 ```
 
-To see the difference on your own card: `./revv.py compare` runs the same
-prompt in stock mode and revv mode, back to back. `./revv.py bench` measures
-your decode speed against our reference numbers. `./revv.py down` stops everything.
+The build keywords are `speed` (the 35B-A3B MoE) and `flagship` (the 27B
+dense). They are historical, they are inverted against the editing result
+above, and they will be renamed; `revv get` with no argument currently gives
+the 27B. On our own measurements, start with `revv get speed` if you have the
+host RAM.
 
-## Install paths, and what you are trusting
-
-`install.sh` has three rungs. The default downloads a binary, because the CUDA
-build chain — cmake, then the toolkit, then a host compiler `nvcc` accepts,
-then a glibc that toolkit accepts — is the single biggest obstacle to a first
-working install. One reported setup lost about half an hour to it.
-
-| | command | what you get | what you trust |
-|---|---|---|---|
-| **1. default** | `./install.sh` | our patched llama-server, CUDA, the certified config | a **third-party fork build** signed off by Mericanii |
-| **2. upstream** | `./install.sh --upstream` | the official llama.cpp prebuilt | **official upstream binaries**, nothing of ours |
-| **3. source** | `./install.sh --source` | you compile it, patched or `--stock` | **your own machine** — you can read every patch first |
-
-**The awkward fact about rung 2.** Upstream llama.cpp publishes prebuilt CUDA
-binaries **for Windows only**. For Linux it ships CPU, Vulkan, ROCm and SYCL —
-no CUDA. So "official prebuilt" on a Linux NVIDIA box means the *Vulkan* build:
-it will run, but it is a different backend, the CUDA kernel patch does not
-apply to it, and **none of the numbers in this README were measured on it**.
-That is why rung 2 is a deliberate choice and revv will never fall back to it
-silently. Verified against the GitHub API on 2026-09-03 for builds b10712,
-b10770 and b10776.
-
-**Rung 2 is also the older-distro option.** The upstream Vulkan build needs only
-glibc 2.34, so it runs on Ubuntu 22.04, where our CUDA prebuilt (glibc 2.38)
-does not. If you are on an older distro and do not want to compile, that is the
-path — at the cost of the Vulkan backend's unmeasured performance.
-
-Rung 1 requirements, checked before it will install: Linux x86_64, **glibc 2.38
-or newer** (Ubuntu 24.04+; 22.04 will not work), and the CUDA *runtime*
-libraries — `libcudart`, `libcublas`, `libcublasLt`, which are far smaller than
-the full toolkit and need no compiler. The binary is built for **sm_86**
-(Ampere, 30-series); other cards rely on driver JIT and `--source` is the
-reliable path there. If any precondition fails, `install.sh` says which one and
-falls back to rung 3 automatically.
-
-Every download is pinned to a tested release tag, never "latest", and verified
-by sha256. `revv doctor` reports which rung produced the binary you are running.
-
-**This path is new.** The prebuilt has been packaged and its provenance
-verified, but it has not yet been installed from scratch on a machine other
-than the one that built it. If it fails on yours, that report is genuinely
-useful — open an issue with `revv doctor` output.
+To see the difference on your own card: `revv compare` runs one prompt through
+stock and revv mode back to back, `revv bench` measures your decode rate
+against the reference, and `revv toggle` switches modes without moving the
+port. `revv inspect <file>` explains any GGUF you already have, and
+`revv adopt` finds models pulled through ollama or LM Studio.
 
 ## Supported
 
-- Qwen3.8-27B GGUF files (any quant; `inspect` tells you what a file supports —
-  some third-party conversions strip the speculation head)
-- NVIDIA GPUs, 12GB+ VRAM, Turing or newer, Linux
-- Community finetunes of the same architecture (works; our quality numbers don't transfer)
+- **Models:** Qwen3.6-35B-A3B and Qwen3.8-27B in the GGUF builds above. Other
+  quants of the same two models run; `revv inspect` tells you what a file
+  supports, since some third-party conversions strip the draft head.
+- **Hardware:** NVIDIA, 12GB or more of *free* VRAM, Turing or newer, Linux
+  (WSL2 works).
 
-**Other models will run, but may gain nothing.** revv's speed comes from
-levers that are properties of the model, not of the server: speculative
-decoding needs an MTP draft head in the file, and the thinking-off win needs a
-chat template that has a thinking mode to turn off. A model with neither —
-most GGUFs — gets no benefit, and a measured field case ran 2.5% *slower* in
-revv mode than stock before revv learned to check. **Models without a draft
-head may see little or no gain — `revv inspect` will tell you before you
-serve.** revv now picks its flags per model, says which levers apply, and when
-none do it says so plainly and serves the best-known stock config instead of
-staging a meaningless A/B. If your model has no built-in draft head you can
-still get speculation by supplying your own drafter — `revv serve --draft
-small-model.gguf` (experimental, uncertified; community MTP drafts exist for
-some families, revv will not download one for you, and `revv bench` reports
-the acceptance rate so you can judge whether that pair is worth it).
+The planner's rules are general — read free VRAM not total, size context to
+fit, disable checkpoints near the ceiling, don't quantize KV for speed. Only
+these two builds are certified. Certification takes days per model.
 
-## Troubleshooting
+## Not supported
 
-**Server starts fine, then dies on the second request.** Almost always
-llama.cpp's context checkpoints: 32 per slot by default at ~150 MiB each,
-allocated lazily, so the first one lands *after* the health check has passed.
-The error names `cudaGraphInstantiate` and mentions neither memory nor
-checkpoints. revv sets `-ctxcp 0` automatically when the planned peak leaves
-under 500 MiB free, and says so in the plan it prints. If you overrode `--ctx`,
-you may have re-created the condition.
+- Under 12GB free VRAM, AMD, Apple Silicon, native Windows, CPU-only,
+  multi-GPU splitting.
+- FP8, AWQ, EXL3. We tested EXL3: it tied on quality, ran slower, and saved
+  less VRAM than we had estimated (EXPERIMENTS.md §3).
+- **Other model families run but may gain nothing.** revv's speed comes from
+  properties of the model, not the server: speculation needs a draft head in
+  the file, and the thinking-off win needs a chat template with a thinking mode
+  to turn off. A model with neither gets no benefit — we measured one case
+  running 2.5% *slower* in revv mode than stock. revv now derives flags per
+  model, says plainly when no lever applies, and serves the best-known stock
+  config instead of staging a meaningless A/B.
 
-**Don't expect anything from GPU overclocking.** On 30-series with driver 535
-headless, clock *offsets* are impossible — they need `nvidia-settings`, which
-needs X, and NVML exposes no offset API. The one real lever is the power limit,
-and raising it 170 W → 190 W measured **+1.4%** on the shipping config for
-**+12% power** and +7 °C; the workload is power-capped, not clock-capped.
-Worse, `nvidia-smi -lgc 2400` and `-lmc 8000` print "All done." and silently
-clamp to stock — measured clocks under load were identical to the in-spec arm.
-**Never trust the exit status; verify with `--query-gpu=clocks.sm,clocks.mem`
-under load.**
+## Limits and known issues
 
-## Roadmap
+- **12GB is the real floor, and it is tight.** revv refuses to start below
+  11,528 MiB of free VRAM. A 12GB 3060 reports 12,288 MiB and offers about
+  12,044; the rest is driver-reserved. Certified configs land with 212–222 MiB
+  of real headroom, so a desktop session on the same card can cause an OOM.
+- **WSL2 gets less.** If the host reserves more than ~760 MiB, revv refuses
+  outright; below that it serves a smaller context. Both are intended.
+- **The planner's headroom figure is an upper bound that drifts.** It anchors on
+  a measured peak and scales only the KV term, so it is optimistic by ~26 MiB at
+  the anchor context and ~104 MiB three rungs down the ladder. Shipped configs
+  still clear our ≥200 MiB standard, but the small-context margin is thinner
+  than it looks.
+- **MTP speculation is not bit-exact.** Quality-neutral by a full paired
+  HumanEval-164 run, not byte-identical. If you need reproducible bytes, turn
+  speculation off.
+- **The n-gram matcher needs LF line endings.** It is a literal byte match; a
+  repo checked out with CRLF drops acceptance from 0.83 to 0.11.
+- **The prebuilt has never been installed on a machine other than the one that
+  built it**, and revv has not been run end to end on a second GPU.
+- Every number here is one card, one protocol, one workload type. Speculation
+  speedup is a property of the content: +110% on code, −2% to −4% on prose.
 
-**1. A prebuilt Linux CUDA binary, hosted on Releases. — SHIPPING.**
-`./install.sh` now downloads instead of compiling. The remaining work is
-breadth: the binary is built for sm_86 only, so a multi-architecture build is
-needed before it covers most cards, and it has not yet been installed from
-scratch on a machine other than the one that built it. The original note is
-kept below because it is still why this mattered. Right now the single
-biggest thing standing between a new user and a working setup is not revv and
-not the model — it is the CUDA build gauntlet: cmake, then the CUDA toolkit,
-then a host-compiler version nvcc accepts, then a glibc that toolkit accepts.
-A real fresh install burned about half an hour walking that chain before
-landing on `cuda-toolkit-13-3`. `install.sh` now detects the common mismatches
-early and tells you the fix instead of failing deep in a build, but detecting a
-problem is a consolation prize. A prebuilt binary deletes the problem. Until it
-ships, building from source is the supported path.
+## Feedback
 
-**2. Auto-sizing beyond context.** revv now sizes context to free VRAM. The
-same treatment for KV precision and speculation depth is the natural next step.
-
-**3. Certification on a second GPU tier.** Everything here is one card. A 16GB
-and a 24GB tier need their own measurements before they stop being derived
-settings.
-
-## Not supported (yet)
-
-- <12GB VRAM, AMD, Apple Silicon, Windows (WSL2 works)
-
-**Under 12GB — what we think would happen (unmeasured):** on an 8GB card
-(3070/3070 Ti class) the certified 10.9GB file spills to CPU and we'd expect
-~8-12 tok/s. The 2-bit file (6.8GB) fits and should be fast — possibly
-35-50 tok/s given the memory bandwidth — but quality drops measurably
-(~78% HumanEval vs 92.7%, and instruction-following degrades more than that
-number suggests). Fine for chat, not recommended for agent work. `revv doctor`
-will tell you which case you're in. If you try it anyway, `revv bench` +
-an issue report would genuinely help — nobody has published numbers for
-these cards yet. The proper 8GB tier arrives when a strong-enough smaller
-model exists.
-- FP8 / AWQ / EXL3 formats
-- Other model families — the pipeline generalizes; certification takes days per model
-
-Numbers here come from one card and one protocol. If yours differ, run
-`./revv.py bench` and open an issue — hardware reports are the most useful
-contribution right now.
-
-Feedback, hardware reports, questions: **contact@mericanii.com** or open an issue.
+Hardware reports, corrections, questions: **contact@mericanii.com**, or open an
+issue. `revv bench` plus `revv doctor` output from a card we have not tested is
+the most useful contribution right now.
 
 Credits: [llama.cpp](https://github.com/ggml-org/llama.cpp) does the heavy
-lifting; quantized files by [Unsloth](https://huggingface.co/unsloth);
-model by the Qwen team. Apache-2.0.
+lifting; quantized files by [Unsloth](https://huggingface.co/unsloth); models by
+the Qwen team.

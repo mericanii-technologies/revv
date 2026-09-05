@@ -136,7 +136,7 @@ Protocol: full HumanEval-164, greedy, thinking off, on the 3060.
 | UD-IQ3_XXS **[SHIPPING]** | 10,934,860,704 B | 92.7% |
 | UD-IQ2_XXS | 7,266,070,528 B | 78.0% |
 
-The finding that matters here: the shipping flagship (IQ3_XXS) is
+The finding that matters here: the shipping 27B build (IQ3_XXS) is
 statistically indistinguishable from its own uncompressed Q8_0 anchor on
 this benchmark — about 99% retention. The old rule of thumb we used to quote,
 "~10 points of HumanEval per GiB," is retired. It turned out to be an
@@ -380,14 +380,14 @@ box and driven through its own commands. Every phase of `TEST_3060.md` passed.
 
 | what | measured |
 |---|---|
-| flagship, patched build, `revv bench` | **37.86 t/s**, spread 0.8% |
+| 27B (dense), patched build, `revv bench` | **37.86 t/s**, spread 0.8% |
 | peak VRAM for the flags revv actually launches | **11,830 MiB** |
 | v1.1 candidate (ASCII-pruned) | **40.10 t/s**, peak **11,502 MiB** |
 | `revv compare`, revv vs STOCK | 38.4 vs 22.5 t/s decode; 2.01x time-to-done |
 | toggle latency | 3.4 s and 3.8 s |
 | teardown | GPU to 1 MiB, 0 stray processes; orphan reaping worked |
 
-**The harness gap, stated plainly.** `revv bench` reads the flagship at
+**The harness gap, stated plainly.** `revv bench` reads the 27B at
 37.86 t/s where the certification in Section 3 reads 34.39 t/s for the same
 build on the same card. This is not a discrepancy to be resolved — it is two
 different prompts producing different MTP acceptance rates. `revv bench`
@@ -400,7 +400,7 @@ one harness in one session:
 |---|---:|---:|
 | v1.1 candidate (ASCII prune + merged kernel) | 40.10 | 11,502 MiB |
 | ASCII prune + stock kernel | 38.92 | 11,500 MiB |
-| flagship + merged kernel | 37.86 | 11,830 MiB |
+| 27B + merged kernel | 37.86 | 11,830 MiB |
 
 Isolating the two effects: the kernel patch is **+3.03%** here against the
 +2.5% in Section 5, and the ASCII prune is **+5.92% and −328 MiB** against a
@@ -429,7 +429,7 @@ the certified run under the external template, so revv does not ship a template
 file and does not need to.
 
 **What the v1.1 candidate is, and is not.** It is the ASCII-vocab-pruned
-flagship (vocab 127,947) on the merged build: faster, and roomier at 542 MiB
+27B (vocab 127,947) on the merged build: faster, and roomier at 542 MiB
 free versus 214 MiB. Its 25-task spot-check was byte-identical to the certified
 baseline, which is strong evidence of output-neutrality on that workload but is
 **not** a certification — 25 tasks bounds pass@1 only to roughly [86.7%, 100%].
@@ -608,10 +608,10 @@ throughput to four decimal places. Anything automating this must verify with
 Acceptance was bit-identical at 0.7756 across every arm, so the locked clocks
 were not a stability risk either — they simply were not an overclock.
 
-## 18. Speed tier re-certification: 55.9 t/s (2026-09-05)
+## 18. The 35B-A3B (MoE) build re-certification: 55.9 t/s (2026-09-05)
 
-Three flag changes over the original 48.5 t/s speed-tier config, all gated to
-the n_cpu_moe (MoE, host-RAM-offload) build only -- the flagship's flags are
+Three flag changes over the original 48.5 t/s config for this build, all gated
+to the n_cpu_moe (MoE, host-RAM-offload) build only -- the 27B's flags are
 untouched:
 
 1. **`-t <n>`, an explicit thread count** for the server process. CPU-MoE
@@ -720,11 +720,11 @@ exhibits generally. Measured quality impact: none (full HumanEval-164 A/B,
 identical per-task outcomes, p=1.0). We previously wrote "byte-identical";
 that was wrong and is corrected throughout.
 
-## Flagship n-gram chain certification (2026-09-05)
+## 27B (dense) n-gram chain certification (2026-09-05)
 
 Section 18 certified the n-gram+MTP drafter chain (`--spec-type
 ngram-simple,draft-mtp --spec-ngram-simple-size-m 256`) for the n_cpu_moe
-speed tier only. It now ships on the flagship too: the chain is a strict,
+35B-A3B build only. It now ships on the 27B too: the chain is a strict,
 first-success-wins addition over MTP alone, and nothing about the acceptance
 mechanism is specific to the MoE build — an n-gram hit still just means the
 model is about to reproduce text already visible in the prompt.
@@ -765,7 +765,7 @@ requests with `-ctxcp 0`. Read against the usable ceiling the rows above are
 88 / **222** / 378 MiB.
 
 c=16384 leaves 88 MiB of real headroom, far under the >=200 MiB standard, so
-the shipped ceiling for the flagship on a 12GB card is **c=12288**, not
+the shipped ceiling for the 27B on a 12GB card is **c=12288**, not
 c=16384, where real headroom is 222 MiB. (This row was originally rejected
 against a ~400 MiB comfort line read off the nominal column -- the same
 accounting error corrected above. The conclusion does not change; the margin
