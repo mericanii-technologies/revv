@@ -16,11 +16,14 @@ LLAMA_REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 # revv's own patched, CUDA-enabled prebuilt (rung 1). Not published at the
 # time this script was written -- the 404 case below is expected, not a bug.
 PREBUILT_URL="https://github.com/mericanii-technologies/revv/releases/download/v1.1.0-binaries/revv-llama-server-1.1.0-linux-x86_64-cuda12.tar.gz"
-PREBUILT_SHA256="3522ef73cb9a93b865e0cfe26c6ccb0f7021e3415fc011e844537bf948bc4423"
-# The prebuilt binary is compiled for this compute capability only (Ampere /
-# 30-series). Other cards rely on driver JIT from PTX, which may simply not
-# work -- see check_prebuilt_arch below.
-PREBUILT_CUDA_ARCH="8.6"
+PREBUILT_SHA256="c4af4f1f62955498c43008b50243d0fd8ab102b6380eb84a715301bf3bac32c6"
+# The prebuilt binary is a multi-arch build covering these compute
+# capabilities (space-separated): Turing, Ampere (datacenter and consumer),
+# Ada Lovelace, Hopper. Cards outside this list rely on driver JIT from PTX,
+# which may simply not work -- see check_prebuilt_arch below. NOT included:
+# sm_120 (RTX 50-series / Blackwell) -- the build toolchain (nvcc 12.0)
+# cannot target it; those cards want --upstream or --source.
+PREBUILT_CUDA_ARCHS="7.5 8.0 8.6 8.9 9.0"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -89,14 +92,15 @@ Environment:
                   even when no sha256 tool is available to verify it. Off by
                   default: an unverifiable download is refused, not accepted.
   REVV_ALLOW_ARCH_MISMATCH
-                  (--prebuilt only) The revv prebuilt is compiled for sm_86
-                  (compute capability 8.6) only. Set to any non-empty value
-                  to install it on a different card anyway -- it may fail to
-                  load, or fall back to slow driver JIT. Off by default: an
-                  explicit --prebuilt on a mismatched card fails with an
-                  explanation instead of silently installing a binary that
-                  may not run; the automatic (no-flag) path just falls back
-                  to --source without needing this.
+                  (--prebuilt only) The revv prebuilt is compiled for
+                  sm_75/80/86/89/90 (compute capabilities 7.5/8.0/8.6/8.9/
+                  9.0) only -- notably not sm_120 (RTX 50-series). Set to any
+                  non-empty value to install it on a different card anyway --
+                  it may fail to load, or fall back to slow driver JIT. Off
+                  by default: an explicit --prebuilt on a mismatched card
+                  fails with an explanation instead of silently installing a
+                  binary that may not run; the automatic (no-flag) path just
+                  falls back to --source without needing this.
   REVV_SKIP_TOOLCHAIN_CHECK
                   (--source only) Set to any non-empty value to skip
                   the CUDA/host-compiler preflight check and proceed
@@ -863,7 +867,7 @@ verify_sha256_or_confirm() {
     return 1
 }
 
-# Checked before downloading anything (no point spending 78 MB finding this
+# Checked before downloading anything (no point spending 690 MiB finding this
 # out afterward). Returns 0 to proceed -- either it matches, or the check
 # itself couldn't be done and we don't block on a missing check. Returns 1
 # with PREBUILT_FAIL_REASON set on a genuine mismatch, so the existing
@@ -871,11 +875,12 @@ verify_sha256_or_confirm() {
 # explicit --prebuilt then surfaces that reason as a hard failure the same
 # way a 404 or a bad sha256 would, unless REVV_ALLOW_ARCH_MISMATCH is set.
 check_prebuilt_arch() {
-    sm_target=$(printf '%s' "$PREBUILT_CUDA_ARCH" | tr -d '.')
+    # e.g. "7.5 8.0 8.6 8.9 9.0" -> "75/80/86/89/90", for the messages below.
+    sm_list=$(printf '%s' "$PREBUILT_CUDA_ARCHS" | tr -d '.' | tr ' ' '/')
 
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         echo "  warning: 'nvidia-smi' not found -- could not verify GPU architecture" >&2
-        echo "           against the prebuilt's sm_$sm_target target. Proceeding anyway." >&2
+        echo "           against the prebuilt's sm_$sm_list targets. Proceeding anyway." >&2
         return 0
     fi
 
@@ -902,40 +907,48 @@ check_prebuilt_arch() {
 
     if [ -z "$caps" ] || [ "$caps" = "BAD" ]; then
         echo "  warning: could not parse a GPU compute capability from nvidia-smi --" >&2
-        echo "           could not verify it against the prebuilt's sm_$sm_target target." >&2
+        echo "           could not verify it against the prebuilt's sm_$sm_list targets." >&2
         echo "           Proceeding anyway." >&2
         return 0
     fi
 
+    # Every detected GPU's capability must be one of the prebuilt's archs --
+    # this is a multi-arch build, so membership, not a single exact value.
     mismatch=0
     for cc in $caps; do
-        [ "$cc" = "$PREBUILT_CUDA_ARCH" ] || mismatch=1
+        supported=0
+        for want in $PREBUILT_CUDA_ARCHS; do
+            [ "$cc" = "$want" ] && supported=1 && break
+        done
+        [ "$supported" -eq 1 ] || mismatch=1
     done
     [ "$mismatch" -eq 0 ] && return 0
 
     detected=$(printf '%s\n' "$caps" | tr '\n' ',' | sed 's/,$//')
     echo ""
     echo "warning: GPU architecture mismatch."
-    echo "         The revv prebuilt is compiled for sm_$sm_target (compute capability"
-    echo "         $PREBUILT_CUDA_ARCH) only. This machine reports: $detected."
+    echo "         The revv prebuilt is compiled for sm_$sm_list (compute capabilities"
+    echo "         $PREBUILT_CUDA_ARCHS) only. This machine reports: $detected."
+    echo "         sm_120 (RTX 50-series / Blackwell) is not among them: the build"
+    echo "         toolchain cannot target it. Use --upstream or --source there."
     echo "         The binary may fail to load, or fall back to slow driver JIT"
     echo "         compilation from PTX, on this card."
     echo "         The reliable path here is --source: it auto-detects and compiles"
     echo "         for the local architecture."
 
     if [ -n "$REVV_ALLOW_ARCH_MISMATCH" ]; then
-        echo "         REVV_ALLOW_ARCH_MISMATCH is set: proceeding with the sm_$sm_target"
+        echo "         REVV_ALLOW_ARCH_MISMATCH is set: proceeding with the sm_$sm_list"
         echo "         prebuilt anyway."
         return 0
     fi
 
-    PREBUILT_FAIL_REASON="GPU compute capability $detected does not match the prebuilt's sm_$sm_target target (override with REVV_ALLOW_ARCH_MISMATCH=1)"
+    PREBUILT_FAIL_REASON="GPU compute capability $detected does not match any of the prebuilt's sm_$sm_list targets (override with REVV_ALLOW_ARCH_MISMATCH=1)"
     return 1
 }
 
 # Downloads the revv prebuilt into $REVV_HOME/cache/, reusing it if
 # already present and sha256-verified (idempotent: re-running does not
-# re-fetch ~78 MB). Sets PREBUILT_CACHE_FILE on success; sets
+# re-fetch ~690 MiB). Sets PREBUILT_CACHE_FILE on success; sets
 # PREBUILT_FAIL_REASON (one line) and returns 1 on failure -- 404, network
 # error, or a sha256 mismatch -- without printing; the caller reports it.
 # On a 404 or network error, also sets PREBUILT_FAIL_DETAIL to a longer,

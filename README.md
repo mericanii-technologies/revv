@@ -105,11 +105,12 @@ git clone https://github.com/mericanii-technologies/revv && cd revv
 
 
 Preconditions, checked first: Linux x86_64, glibc 2.38+ (Ubuntu 24.04+; 22.04
-will not work), and the CUDA *runtime* libraries
-`libcudart`/`libcublas`/`libcublasLt`, which need no compiler. The binary is
-built for sm_86 (30-series); other cards fall back to driver JIT, where
-`--source` is the reliable path. If a precondition fails, `install.sh` names it
-and falls back to building.
+will not work), and an NVIDIA driver providing `libcuda.so.1`. The CUDA
+*runtime* libraries `libcudart`/`libcublas`/`libcublasLt` ship inside the
+archive, so no compiler and no CUDA toolkit are needed. The binary is built
+for sm_75/80/86/89/90 (Turing through Hopper/Ada); **RTX 50-series (sm_120) is
+not included** — use `--upstream` or `--source` there. If a precondition
+fails, `install.sh` names it and falls back to building.
 
 **2. Windows, via WSL2.** The rule that breaks most first runs: **install the
 NVIDIA driver on the Windows host, before touching WSL2. Never install an
