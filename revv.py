@@ -459,6 +459,19 @@ BUILDS: Dict[str, Dict[str, object]] = {
         # second requirement the dense build does not have.
         "n_cpu_moe": 16,
         "host_ram_mib": 8192,
+        # What STOCK means for THIS build. `-ngl 99` is not a stock config
+        # here, it is an impossible one: without --n-cpu-moe, all 41 layers
+        # go to VRAM and llama-server dies asking for 15,499 MiB on a 12 GiB
+        # card. A user meeting this model with llama.cpp defaults would lower
+        # -ngl until it fit, and this is that config -- the certified nominal
+        # baseline B2, measured at 22.17 t/s, which is exactly the comparator
+        # behind the published "2.52x stock".
+        "stock": {
+            "n_gpu_layers": 30,
+            "ctx": 16384,
+            "decode_ts": 22.17,
+            "why": "llama-server defaults with -ngl 30 so the model fits",
+        },
         "note": "35B mixture-of-experts, 55.9 t/s (2.52x stock). Scored 9/34 "
                 "against the dense build's 4/34 on our multi-file editing "
                 "instrument (p=0.039). Needs ~8 GiB of free host RAM on top "
@@ -2726,10 +2739,39 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                       ctx_checkpoints, n_cpu_moe, build_name, n_threads)
 
 
+def stock_spec(build_name: Optional[str]) -> Optional[Dict[str, object]]:
+    """The per-build definition of STOCK, or None for "the ordinary default".
+
+    STOCK is the control arm, so it has to be a config a user could actually
+    run. For a dense build that is llama.cpp's defaults with everything on the
+    GPU. For a build that only fits via expert offload it cannot be, because
+    that config does not load at all -- see the `stock` key on the MoE entry.
+    """
+    spec = BUILDS.get(build_name) if build_name else None
+    if spec is None:
+        return None
+    stock = spec.get("stock")
+    return stock if isinstance(stock, dict) else None
+
+
+def stock_description(build_name: Optional[str]) -> str:
+    """One line naming which stock definition a comparison used."""
+    stock = stock_spec(build_name)
+    if stock is None:
+        return "llama-server defaults, all layers on the GPU"
+    return str(stock.get("why") or "llama-server defaults")
+
+
 def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
                       mode: str, passthrough: Sequence[str]) -> List[str]:
     """Apply the plan. Which levers are in the revv arm is decided per model."""
-    argv = [exe, "-m", model, "-ngl", "99", "-c", str(plan.ctx),
+    # STOCK on a build that cannot hold every layer is defined by the registry,
+    # not by -ngl 99. Using 99 there does not produce a slow baseline, it
+    # produces a CUDA OOM and a failed A/B.
+    stock = stock_spec(plan.build_name) if mode == MODE_STOCK else None
+    ngl = str(stock["n_gpu_layers"]) if stock else "99"
+    ctx = str(stock["ctx"]) if stock else str(plan.ctx)
+    argv = [exe, "-m", model, "-ngl", ngl, "-c", ctx,
             # Certified at one slot. Concurrency splits the context and was
             # never measured, and the 12GB tier has 86 MiB of headroom.
             "--parallel", "1",
@@ -2904,7 +2946,10 @@ class Backend:
 
     def start(self, mode: str, wait_s: float = 600.0) -> None:
         self.port = _free_port()
-        self.mode = mode
+        # self.mode is NOT committed until the backend is actually healthy.
+        # Committing it up front meant a failed switch left the status endpoint
+        # reporting the mode that had just failed to load, with no process
+        # behind it -- `revv status` said STOCK while the backend was dead.
         argv = self.argv(mode, self.port)
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         log = open(self.log_path, "ab", 0)
@@ -2918,8 +2963,10 @@ class Backend:
         if not self._await_health(wait_s):
             self.stop()
             raise RuntimeError(
-                "llama-server did not become healthy.\n"
-                "Last lines of %s:\n%s" % (self.log_path, _tail(self.log_path)))
+                "llama-server did not become healthy in %s mode.\n"
+                "Last lines of %s:\n%s"
+                % (mode, self.log_path, _tail(self.log_path)))
+        self.mode = mode
         if self.on_change is not None:
             self.on_change()
 
@@ -3086,6 +3133,19 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
                     # compare can refuse to stage a meaningless A/B.
                     "levers": plan.levers,
                     "tuning_is_noop": plan.is_noop,
+                    # Is the child process actually up? The mode label alone
+                    # cannot answer that, and a dead backend used to be
+                    # indistinguishable from a healthy one in `revv status`.
+                    "backend_alive": backend.alive(),
+                    # The definitive anti-fake-A/B check: not "do the levers
+                    # look inert" but "would the two arms be the same command".
+                    "modes_identical": (
+                        backend.argv(MODE_STOCK, backend.port)
+                        == backend.argv(MODE_REVV, backend.port)),
+                    "stock_description": stock_description(plan.build_name),
+                    # Which registry build this is, so `revv bench` grades
+                    # against the right reference instead of the dense one.
+                    "build": plan.build_name,
                     "speculation": plan.use_spec and backend.mode == MODE_REVV,
                     "backend_port": backend.port,
                     # `revv down` uses this to reap an orphaned llama-server if
@@ -3615,11 +3675,33 @@ def cmd_compare(args: argparse.Namespace) -> int:
         print("  draft head that revv's speed actually depends on.")
         return 0
 
+    # The definitive anti-fake-A/B check. `tuning_is_noop` above reasons about
+    # levers; this one asks the only question that settles it -- would the two
+    # arms run the same command line? If so there is no experiment here, and
+    # printing two numbers with a ratio between them would be inventing one.
+    if start_status.get("modes_identical"):
+        print(bold("revv %s  --  compare" % __version__))
+        print("  model    %s" % start_status["model"])
+        print("\n  %s refusing to run this comparison."
+              % yellow("note:"))
+        print("  STOCK and REVV would launch llama-server with byte-identical")
+        print("  arguments for this model, so any difference between them would")
+        print("  be measurement noise reported as a speedup.")
+        print("\n  Use %s to measure the configuration revv is serving."
+              % bold("revv bench"))
+        return 0
+
     print(bold("revv %s  --  compare" % __version__))
     print("  model    %s" % start_status["model"])
     print("  prompt   the certified bench prompt, greedy, one request per mode")
     print("  budget   %d tokens max; each mode stops when it is done"
           % args.max_tokens)
+    # Which control arm this is. STOCK is not one fixed thing across builds:
+    # a model that only fits with expert offload has no all-on-GPU baseline,
+    # so its stock arm is the config a user would actually reach for.
+    print("  stock    %s"
+          % (start_status.get("stock_description")
+             or "llama-server defaults, all layers on the GPU"))
     print("  warmup   one exchange per mode is run and discarded, so switching\n"
           "           cost never lands inside a timed window (same rule as\n"
           "           `revv bench`)\n")
@@ -3699,10 +3781,11 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
     print("\n  " + dim("STOCK = the same weights on the same GPU with"
                        " llama.cpp's defaults for"))
-    print("  " + dim("speculation, KV precision and the thinking switch. It is"
-                     " a control for"))
-    print("  " + dim("revv's configuration, not a measurement of any other"
-                     " product."))
+    print("  " + dim("speculation, KV precision and the thinking switch"
+                     " (%s)." % (start_status.get("stock_description") or "")))
+    print("  " + dim("It is a control for revv's configuration, not a"
+                     " measurement of any"))
+    print("  " + dim("other product."))
     print("  " + dim("Restored to %s mode." % original.upper()))
     return 0
 
@@ -3919,6 +4002,17 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     print(bold("revv %s  --  status" % __version__))
     print("  api      %s/v1" % base)
+    # The supervisor answering does NOT mean the model is loaded. If a mode
+    # switch failed, the proxy is still up and still knows its mode, but there
+    # is no llama-server behind it -- every request will fail. Say so first,
+    # before any line that would read as healthy.
+    if st.get("backend_alive") is False:
+        print("  %s the supervisor is up but llama-server is NOT running"
+              % red("backend down:"))
+        print("           the last start or mode switch failed; requests will"
+              " fail too")
+        print("           %s to see why, then %s"
+              % (bold("revv doctor"), bold("revv down && revv up")))
     print("  mode     %s -- %s" % (bold(str(st["mode"]).upper()),
                                    st["mode_description"]))
     print("  model    %s   (send \"%s\" as the model name)"
@@ -4138,12 +4232,48 @@ def thinking_check(base: str, timeout: float) -> Tuple[bool, str]:
     return True, "\n".join(lines)
 
 
+def bench_reference(build_name: Optional[str],
+                    patched: bool) -> Tuple[float, float, str]:
+    """(target, reference t/s, human name) for the build actually loaded.
+
+    Grading every build against the dense build's number made the instrument
+    unable to fail: the MoE build reads ~55.9 t/s, and against a 36.9 target
+    that is a 51% overshoot which the old one-sided `ratio >= 0.95` test
+    reported as "on target". A MoE regression all the way down to 40 t/s would
+    still have passed.
+    """
+    spec = BUILDS.get(build_name) if build_name else None
+    if build_name == DEFAULT_BUILD:
+        # The dense build has a figure measured under THIS protocol, which is
+        # not the same as its registry decode_ts (37.86 vs the certification
+        # protocol's 34.39). Prefer the protocol-matched one.
+        ref_ts = BENCH_REF_PATCHED
+        name = "27B dense, MTP n=2, q8_0 KV, patched"
+    elif spec is not None and spec.get("decode_ts"):
+        ref_ts = float(spec["decode_ts"])
+        name = "%s (%s line), certified" % (build_name, spec.get("line"))
+    else:
+        ref_ts = BENCH_REF_PATCHED
+        name = "27B dense (stand-in: unregistered model)"
+    # Charge the kernel patch's +2.5% to the build, not to the user's hardware.
+    return (ref_ts if patched else ref_ts / 1.025), ref_ts, name
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     base = (args.url or default_url()).rstrip("/")
     print(bold("revv %s  --  bench" % __version__))
     print("  target   %s" % base)
     print("  protocol %d requests, %d new tokens, greedy, thinking off"
           % (BENCH_REQUESTS, BENCH_N_PREDICT))
+
+    # Which build is loaded decides which reference applies. Best-effort: a
+    # plain llama-server behind --url has no revv control endpoint, and that is
+    # fine -- bench_reference falls back to the dense stand-in and says so.
+    build_name = None       # type: Optional[str]
+    try:
+        build_name = _control(base, "status", timeout=5).get("build")
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
 
     try:
         with urllib.request.urlopen(base + "/health", timeout=10) as resp:
@@ -4216,28 +4346,33 @@ def cmd_bench(args: argparse.Namespace) -> int:
     manifest = read_build_manifest()
     patched = bool(manifest and "mmvq_iquant_decode.patch"
                    in (manifest.get("patches") or []))
-    # Compare against the patched figure only when we know the build is
-    # patched; the +2.5% would otherwise be charged to the user's hardware.
-    target = BENCH_REF_PATCHED if patched else BENCH_REF_PATCHED / 1.025
+    target, ref_ts, ref_name = bench_reference(build_name, patched)
     target_label = ("kernel-patched build" if patched else
                     "stock build" if manifest else
                     "stock build (assumed: unknown provenance)")
 
-    print("\n  " + bold("reference (RTX 3060 12GB, sm_86, c=16384, this "
-                        "same protocol)"))
-    print("    %-44s %6.1f t/s" % ("27B dense, MTP n=2, q8_0 KV, patched",
-                                   BENCH_REF_PATCHED))
+    print("\n  " + bold("reference (RTX 3060 12GB, sm_86, this same protocol)"))
+    print("    %-44s %6.1f t/s" % (ref_name, ref_ts))
     print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
                                    BENCH_REF_NOSPEC))
-    print("    %-44s %6.1f t/s" % ("v1.1 candidate (ASCII prune, not default)",
-                                   V11_TS))
     print("    comparing against the %s (%.1f t/s)" % (target_label, target))
+    if build_name is None:
+        print(dim("    This model is not a registered build, so the dense"))
+        print(dim("    reference is used as a stand-in. Treat it loosely."))
     print(dim("    Certification used a different prompt and reads 34.4-36.7"))
-    print(dim("    t/s for the same build; see BENCHMARKS.md. Do not mix them."))
+    print(dim("    t/s for the dense build; see BENCHMARKS.md. Do not mix them."))
 
     print("\n  " + bold("reading"))
     ratio = mean / target
-    if ratio >= 0.95:
+    if ratio > 1.05:
+        # Never a silent pass. Being far above the reference is a result that
+        # needs explaining -- a different protocol, a shorter prompt, an
+        # overclock, or a genuinely faster machine -- not a green tick.
+        print("    %s %.2f t/s is %.0f%% ABOVE the %.1f t/s reference."
+              % (yellow("above reference:"), mean, (ratio - 1.0) * 100, target))
+        print("    Verify the GPU and clocks (nvidia-smi --query-gpu=clocks.sm)")
+        print("    and that this is the build you think it is; then report it.")
+    elif ratio >= 0.95:
         print("    %s within 5%% of the reference (%.1f t/s)."
               % (green("on target:"), target))
     elif mean < BENCH_REF_NOSPEC * 1.10:

@@ -14,6 +14,7 @@ if tests/fixtures/ is missing.
 import os
 import socket
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -617,6 +618,144 @@ def test_port_fallback():
         sock.close()
 
 
+def test_stock_is_per_build():
+    """STOCK is not one config, it is a property of the build. `-ngl 99` on
+    the MoE build is not a slow baseline, it is a CUDA OOM (llama-server asks
+    for 15,499 MiB on a 12 GiB card), so STOCK for that build is the
+    certified `-ngl 30 -c 16384` baseline instead of "every layer on the
+    GPU"."""
+    section("STOCK is defined per build")
+
+    moe = speed_like()
+    p_moe = revv.plan_launch(moe, "12gb", None, REF_3060_FREE_MIB)
+    stock_argv = revv.build_server_argv("/x/llama-server", moe.path, p_moe,
+                                        8080, revv.MODE_STOCK, [])
+    check("MoE stock uses -ngl 30, not 99",
+          stock_argv[stock_argv.index("-ngl") + 1], "30")
+    check("MoE stock pins c=16384",
+          stock_argv[stock_argv.index("-c") + 1], "16384")
+    check("MoE stock does not offload experts",
+          "--n-cpu-moe" in stock_argv, False)
+    check("MoE stock does not speculate",
+          "--spec-type" in stock_argv, False)
+    check("MoE stock leaves KV at the default",
+          "-ctk" in stock_argv, False)
+
+    dense = certified_like()
+    p_dense = revv.plan_launch(dense, "12gb", None, REF_3060_FREE_MIB)
+    dense_stock_argv = revv.build_server_argv("/x/llama-server", dense.path,
+                                              p_dense, 8080,
+                                              revv.MODE_STOCK, [])
+    check("dense stock still uses -ngl 99",
+          dense_stock_argv[dense_stock_argv.index("-ngl") + 1], "99")
+    check("dense stock uses the planned ctx",
+          dense_stock_argv[dense_stock_argv.index("-c") + 1],
+          str(p_dense.ctx))
+
+    revv_argv = revv.build_server_argv("/x/llama-server", moe.path, p_moe,
+                                       8080, revv.MODE_REVV, [])
+    check("MoE revv mode still uses -ngl 99",
+          revv_argv[revv_argv.index("-ngl") + 1], "99")
+    check("MoE revv mode still offloads experts",
+          "--n-cpu-moe" in revv_argv, True)
+
+    check("stock_spec is None for the dense build",
+          revv.stock_spec("IQ3_XXS"), None)
+    check("stock_spec exists for the MoE build",
+          revv.stock_spec("Q3_K_XL_35B") is not None, True)
+    check("stock_description names the -ngl 30 fit",
+          "-ngl 30" in revv.stock_description("Q3_K_XL_35B"), True)
+
+
+def test_modes_are_not_identical():
+    """compare refuses when the two arms would launch byte-identical argv --
+    an A/B that never differs is not an A/B."""
+    section("anti-fake A/B")
+
+    for label, info in (("MoE", speed_like()), ("dense", certified_like())):
+        p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
+        stock_argv = revv.build_server_argv("/x/llama-server", info.path, p,
+                                            8080, revv.MODE_STOCK, [])
+        revv_argv = revv.build_server_argv("/x/llama-server", info.path, p,
+                                           8080, revv.MODE_REVV, [])
+        check("%s: stock and revv argv differ" % label,
+              stock_argv == revv_argv, False)
+        if label == "MoE":
+            check("MoE arms differ in -ngl",
+                  stock_argv[stock_argv.index("-ngl") + 1] !=
+                  revv_argv[revv_argv.index("-ngl") + 1], True)
+
+
+def test_bench_reference():
+    """The old code graded every build against the dense reference, so a MoE
+    result of 40.0 t/s (a 28% regression) scored ratio 40.0/36.94 = 1.08 and
+    printed "on target". bench_reference() fixes this by keying the
+    reference to the build actually loaded."""
+    section("bench reference is per build")
+
+    check("dense reference is the bench-protocol figure",
+          round(revv.bench_reference("IQ3_XXS", True)[1], 2),
+          round(revv.BENCH_REF_PATCHED, 2))
+    check("MoE reference is its certified 55.9",
+          revv.bench_reference("Q3_K_XL_35B", True)[1],
+          revv.BUILDS["Q3_K_XL_35B"]["decode_ts"])
+    check("unpatched target is 2.5% lower",
+          round(revv.bench_reference("Q3_K_XL_35B", False)[0], 2),
+          round(55.9 / 1.025, 2))
+    check("an unregistered model falls back to dense",
+          round(revv.bench_reference(None, True)[1], 2),
+          round(revv.BENCH_REF_PATCHED, 2))
+    check("the MoE reference names the MoE build",
+          "moe" in revv.bench_reference("Q3_K_XL_35B", True)[2].lower(), True)
+
+    # Regression guard for the actual bug: under the old dense-only
+    # reference, a MoE result of 40.0 t/s (a 28% regression from 55.9)
+    # scored 40.0 / (BENCH_REF_PATCHED / 1.025) = 1.08 and printed "on
+    # target". The per-build reference below correctly fails it.
+    moe_target = revv.bench_reference("Q3_K_XL_35B", False)[0]
+    check("MoE at 55.94 is on target",
+          0.95 <= 55.94 / moe_target <= 1.05, True)
+    check("a MoE regression to 40 t/s is NOT on target",
+          (40.0 / moe_target) < 0.95, True)
+    # This documents the bug the fix closes: the old dense-only target would
+    # have waved the same 40.0 t/s regression through.
+    check("the old dense target would have passed it",
+          (40.0 / (revv.BENCH_REF_PATCHED / 1.025)) >= 0.95, True)
+
+    dense_target = revv.bench_reference("IQ3_XXS", False)[0]
+    check("dense at 37.20 is on target",
+          0.95 <= 37.20 / dense_target <= 1.05, True)
+
+
+def test_failed_start_does_not_move_the_mode():
+    """A start that never becomes healthy must leave the mode label alone.
+
+    Backend.start() used to set self.mode before launching, so a mode switch
+    that OOMed left the status endpoint reporting the mode that had just
+    failed to load, with no process behind it -- `revv status` said STOCK
+    while the backend was dead. Observed for real on the MoE build, whose
+    stock arm could not fit before the per-build STOCK definition landed.
+    """
+    section("a failed start does not move the mode label")
+    info = certified_like()
+    plan = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
+    log = os.path.join(tempfile.mkdtemp(prefix="revv-qa-"), "llama-server.log")
+    # /bin/false exits immediately, which is what a CUDA OOM at load looks
+    # like to the supervisor: the process is gone before /health ever answers.
+    backend = revv.Backend("/bin/false", "/m.gguf", "12gb", plan, [], log)
+    check("backend starts out in revv mode", backend.mode, revv.MODE_REVV)
+
+    raised = False
+    try:
+        backend.start(revv.MODE_STOCK, wait_s=5.0)
+    except RuntimeError:
+        raised = True
+    check("a start that never gets healthy raises", raised, True)
+    check("...and the mode label did NOT move to stock",
+          backend.mode, revv.MODE_REVV)
+    check("...and alive() reports the truth", backend.alive(), False)
+
+
 def main():
     if not os.path.isdir(FIXTURES):
         print("fixtures missing: run python3 tests/make_fixtures.py first")
@@ -636,6 +775,10 @@ def main():
     test_real_hardware_fixtures()
     test_forced_tier_guard()
     test_port_fallback()
+    test_stock_is_per_build()
+    test_modes_are_not_identical()
+    test_bench_reference()
+    test_failed_start_does_not_move_the_mode()
     print("\n%s" % ("ALL PASSED" if not _failures
                     else "%d FAILED: %s" % (len(_failures), ", ".join(_failures))))
     return 1 if _failures else 0
