@@ -17,17 +17,13 @@ LLAMA_REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 # time this script was written -- the 404 case below is expected, not a bug.
 PREBUILT_URL="https://github.com/mericanii-technologies/revv/releases/download/v1.1.0-binaries/revv-llama-server-1.1.0-linux-x86_64-cuda12.tar.gz"
 PREBUILT_SHA256="c4af4f1f62955498c43008b50243d0fd8ab102b6380eb84a715301bf3bac32c6"
-# The prebuilt binary is a multi-arch build covering these compute
-# capabilities (space-separated): Turing, Ampere (datacenter and consumer),
-# Ada Lovelace, Hopper. Cards outside this list rely on driver JIT from PTX,
-# which may simply not work -- see check_prebuilt_arch below. NOT included:
-# sm_120 (RTX 50-series / Blackwell) -- the build toolchain (nvcc 12.0)
-# cannot target it; those cards want --upstream or --source.
+# Multi-arch build, space-separated: Turing, Ampere (datacenter and
+# consumer), Ada Lovelace, Hopper. Cards outside this list fall back to
+# driver JIT from PTX, which may not work -- see check_prebuilt_arch. NOT
+# sm_120 (RTX 50-series): nvcc 12.0 cannot target it; use --upstream/--source.
 PREBUILT_CUDA_ARCHS="7.5 8.0 8.6 8.9 9.0"
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---------------------------------------------------------------
 
 fail() {
     printf 'error: %s\n' "$1" >&2
@@ -117,10 +113,9 @@ so that stays an explicit choice.
 EOF
 }
 
-# True (0) iff $1 is a plain non-negative integer. Used before doing any
-# arithmetic comparison on a version field we parsed out of tool output --
-# garbage input (missing tool, unexpected format) should degrade to
-# "skip the check", never to a shell arithmetic error.
+# True (0) iff $1 is a plain non-negative integer. Guards every arithmetic
+# comparison on a version parsed out of tool output: garbage input must
+# degrade to "skip the check", never to a shell arithmetic error.
 is_int() {
     case "$1" in
         ''|*[!0-9]*) return 1 ;;
@@ -144,9 +139,7 @@ nproc_portable() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# Resolve paths
-# ---------------------------------------------------------------------------
+# --- Resolve paths ---------------------------------------------------------
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) \
     || fail "could not resolve the directory this script lives in"
@@ -160,9 +153,7 @@ SRC_DIR="$REVV_HOME/src"
 LLAMA_SRC="$SRC_DIR/llama.cpp"
 BUILD_MANIFEST="$REVV_HOME/build.json"
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+# --- Argument parsing ------------------------------------------------------
 
 RUNG=""
 SRC_MODE=""
@@ -204,9 +195,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# ---------------------------------------------------------------------------
-# Checks
-# ---------------------------------------------------------------------------
+# --- Checks ----------------------------------------------------------------
 
 check_python() {
     if ! command -v python3 >/dev/null 2>&1; then
@@ -248,9 +237,7 @@ it instead of building."
     fi
 }
 
-# ---------------------------------------------------------------------------
-# Existing llama-server detection
-# ---------------------------------------------------------------------------
+# --- Existing llama-server detection ---------------------------------------
 
 find_existing_llama_server() {
     if [ -x "$BIN_DIR/llama-server" ]; then
@@ -273,9 +260,7 @@ get_llama_version() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# Mode selection (--source rung: patched vs. stock)
-# ---------------------------------------------------------------------------
+# --- Mode selection (--source rung: patched vs. stock) ---------------------
 
 choose_mode() {
     if [ -t 0 ] && [ -t 1 ]; then
@@ -298,9 +283,7 @@ choose_mode() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# llama.cpp source checkout
-# ---------------------------------------------------------------------------
+# --- llama.cpp source checkout ---------------------------------------------
 
 setup_llama_src() {
     mkdir -p "$SRC_DIR"
@@ -342,9 +325,7 @@ against."
     fi
 }
 
-# ---------------------------------------------------------------------------
-# Patch application
-# ---------------------------------------------------------------------------
+# --- Patch application -----------------------------------------------------
 
 apply_patch() {
     patch_file="$1"
@@ -379,56 +360,52 @@ this script to fetch the pinned commit fresh:
   rm -rf $LLAMA_SRC"
 }
 
-# ---------------------------------------------------------------------------
-# Build (--source rung)
-# ---------------------------------------------------------------------------
+# --- Build (--source rung) -------------------------------------------------
+
+# cmake leaves binaries in one of two places depending on its version.
+find_built_binary() {
+    for candidate in "$LLAMA_SRC/build/bin/$1" "$LLAMA_SRC/build/$1"; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Symlink a built binary into $BIN_DIR, copying where symlinks are not
+# available (some mounts), so the install works either way.
+link_or_copy() {
+    src="$1"
+    dest="$BIN_DIR/$(basename "$src")"
+    rm -f "$dest"
+    if ! ln -s "$src" "$dest" 2>/dev/null; then
+        cp "$src" "$dest"
+    fi
+    chmod +x "$dest" 2>/dev/null || true
+    echo "installed: $dest -> $src"
+}
 
 install_binaries() {
     mkdir -p "$BIN_DIR"
 
-    SERVER_BIN=""
-    for candidate in "$LLAMA_SRC/build/bin/llama-server" "$LLAMA_SRC/build/llama-server"; do
-        if [ -x "$candidate" ]; then
-            SERVER_BIN="$candidate"
-            break
-        fi
-    done
-    if [ -z "$SERVER_BIN" ]; then
+    server_bin=$(find_built_binary llama-server) || \
         fail "build finished but no llama-server binary was found" \
 "Looked in $LLAMA_SRC/build/bin and $LLAMA_SRC/build. Check the build
 output above for errors."
-    fi
-    rm -f "$BIN_DIR/llama-server"
-    if ! ln -s "$SERVER_BIN" "$BIN_DIR/llama-server" 2>/dev/null; then
-        cp "$SERVER_BIN" "$BIN_DIR/llama-server"
-    fi
-    chmod +x "$BIN_DIR/llama-server" 2>/dev/null || true
-    echo "installed: $BIN_DIR/llama-server -> $SERVER_BIN"
+    link_or_copy "$server_bin"
 
-    CLI_BIN=""
-    for candidate in "$LLAMA_SRC/build/bin/llama-cli" "$LLAMA_SRC/build/llama-cli"; do
-        if [ -x "$candidate" ]; then
-            CLI_BIN="$candidate"
-            break
-        fi
-    done
-    if [ -n "$CLI_BIN" ]; then
-        rm -f "$BIN_DIR/llama-cli"
-        if ! ln -s "$CLI_BIN" "$BIN_DIR/llama-cli" 2>/dev/null; then
-            cp "$CLI_BIN" "$BIN_DIR/llama-cli"
-        fi
-        chmod +x "$BIN_DIR/llama-cli" 2>/dev/null || true
-        echo "installed: $BIN_DIR/llama-cli -> $CLI_BIN"
+    # llama-cli is a bonus, not a requirement: revv only ever runs the server.
+    if cli_bin=$(find_built_binary llama-cli); then
+        link_or_copy "$cli_bin"
     fi
 }
 
 # Writes $REVV_HOME/build.json. Shared by all three rungs.
-#   $1 install_method  "prebuilt" | "upstream" | "source"
-#   $2 patch_list       e.g. '"mmvq_iquant_decode.patch", "..."' or ''
-#   $3 source_str        short human string: a URL for downloads, or
-#                        "built from source"
-#   $4 extra_json        optional extra keys, e.g. ',\n  "backend": "vulkan"'
-#                        (must already include its own leading comma)
+#   $1 method      "prebuilt" | "upstream" | "source"
+#   $2 patch_list  e.g. '"mmvq_iquant_decode.patch", "..."', or empty
+#   $3 source_str  a URL for downloads, or "built from source"
+#   $4 extra_json  optional extra keys, with their own leading comma
 write_manifest() {
     method="$1"
     patch_list="$2"
@@ -450,12 +427,32 @@ MANIFEST_EOF
     echo "wrote build manifest: $BUILD_MANIFEST"
 }
 
-# Picks the -DCMAKE_CUDA_ARCHITECTURES value. Building the full default
-# fan-out (50/61/70/75/80/86/89/90...) is far slower and produces a much
-# larger binary than a build pinned to the card(s) actually present, so we
-# try hard to detect it rather than let cmake fall back on its own default.
-#
-# Sets CUDA_ARCH_REASON as a side effect, for logging by the caller.
+# The one nvidia-smi compute-capability parser: takes that command's raw
+# output as $1 and prints each distinct capability on its own line, "BAD" if
+# any line does not look like a compute capability (e.g. "N/A"), or nothing
+# when there is nothing to report. Callers treat both of the latter as
+# "could not verify" rather than as a mismatch.
+parse_compute_caps() {
+    printf '%s\n' "$1" | tr -d ' \r' | awk '
+        NF == 0 { next }
+        !/^[0-9]+\.[0-9]+$/ { bad = 1; exit }
+        {
+            if (!($0 in seen)) {
+                seen[$0] = 1
+                out = out (out == "" ? "" : "\n") $0
+            }
+        }
+        END {
+            if (bad) { print "BAD"; exit }
+            if (out != "") print out
+        }
+    '
+}
+
+# Picks -DCMAKE_CUDA_ARCHITECTURES. cmake's default fan-out
+# (50/61/70/75/80/86/89/90...) is far slower to build and much larger than a
+# binary pinned to the card actually present, so detect rather than default.
+# Sets CUDA_ARCH_REASON for the caller to log.
 detect_cuda_archs() {
     if [ -n "$CUDAARCHS" ]; then
         CUDA_ARCH_REASON="from CUDAARCHS"
@@ -470,37 +467,19 @@ detect_cuda_archs() {
     fi
 
     raw=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
-
-    # Convert each "8.6"-style line to "86", dedupe, and join with ';'
-    # (CMake's list separator). Bail to "BAD" on anything that doesn't look
-    # like a compute capability -- e.g. "N/A" -- so the caller falls back
-    # to 'native' instead of handing cmake garbage.
-    result=$(printf '%s\n' "$raw" | tr -d ' \r' | awk '
-        NF == 0 { next }
-        !/^[0-9]+\.[0-9]+$/ { bad = 1; exit }
-        {
-            gsub(/\./, "", $0)
-            if (!($0 in seen)) {
-                seen[$0] = 1
-                out = out (out == "" ? "" : ";") $0
-                n++
-            }
-        }
-        END {
-            if (bad || out == "") { print "BAD"; exit }
-            print out
-            print n
-        }
-    ')
-    archs=$(printf '%s\n' "$result" | sed -n '1p')
-
-    if [ "$archs" = "BAD" ] || [ -z "$archs" ]; then
+    caps=$(parse_compute_caps "$raw")
+    if [ -z "$caps" ] || [ "$caps" = "BAD" ]; then
         CUDA_ARCH_REASON="could not detect; letting CMake probe the local card"
         printf 'native\n'
         return 0
     fi
 
-    count=$(printf '%s\n' "$result" | sed -n '2p')
+    # "8.6" -> "86", deduped again once the dots are out, joined with ';'
+    # (CMake's list separator).
+    stripped=$(printf '%s\n' "$caps" | tr -d '.' | awk '!seen[$0]++')
+    archs=$(printf '%s\n' "$stripped" | tr '\n' ';' | sed 's/;$//')
+    count=$(printf '%s\n' "$stripped" | wc -l | tr -d ' ')
+
     if [ "$count" -gt 1 ]; then
         CUDA_ARCH_REASON="detected, $count GPUs"
     else
@@ -510,20 +489,14 @@ detect_cuda_archs() {
     printf '%s\n' "$archs"
 }
 
-# ---------------------------------------------------------------------------
-# CUDA / host-compiler / glibc preflight
-# ---------------------------------------------------------------------------
+# --- CUDA / host-compiler / glibc preflight --------------------------------
 #
-# A real fresh-user install lost ~30 minutes here: CUDA 12.6's headers
-# against glibc 2.43 + gcc-15 fail deep inside the nvcc build with
-# confusing template/__builtin errors that look like an llama.cpp bug but
-# are actually a toolchain mismatch -- and the previous version of this
-# script only surfaced that after cmake configure and part of a build had
-# already run. Catch it here instead, before any of that starts.
+# Known-bad CUDA/gcc/glibc pairs fail deep inside the nvcc build with errors
+# that look like an llama.cpp bug. Catch them before cmake runs, not after.
+# (~30 minutes lost to exactly this on a real install: BENCHMARKS.md s16.)
 
-# Is this WSL2? Only needs a case-insensitive substring match on
-# /proc/version, but the path is read from a variable (not hardcoded) so
-# tests can point it at a fixture instead of the real kernel file.
+# Is this WSL2? A case-insensitive match on /proc/version; the path comes
+# from a variable so tests can point it at a fixture.
 is_wsl2() {
     proc_version_file="${REVV_PROC_VERSION_FILE:-/proc/version}"
     [ -r "$proc_version_file" ] || return 1
@@ -531,9 +504,8 @@ is_wsl2() {
 }
 
 # Parses "ldd --version"'s first line into GLIBC_VER / GLIBC_MAJOR /
-# GLIBC_MINOR. Shared by the source-build toolchain preflight and the
-# --prebuilt rung's platform check, so there's exactly one place that
-# knows how to read glibc's version out of ldd.
+# GLIBC_MINOR. The one place that knows how to read glibc's version, shared
+# by the source preflight and the --prebuilt platform check.
 parse_glibc() {
     glibc_line=$(ldd --version 2>/dev/null | head -n 1)
     GLIBC_VER=$(printf '%s\n' "$glibc_line" | awk '{print $NF}')
@@ -541,10 +513,9 @@ parse_glibc() {
     GLIBC_MINOR=${GLIBC_VER#*.}
 }
 
-# Prints the maximum host-gcc major version a given CUDA major/minor
-# supports, per NVIDIA's documented compiler support matrix. Empty output
-# means "no data for this CUDA version" -- the caller skips the pair check
-# rather than risk a false failure on an untabulated CUDA release.
+# Max host-gcc major a given CUDA major/minor supports, per NVIDIA's
+# compiler support matrix. Empty means "no data for this CUDA version": the
+# caller then skips the check rather than risk a false failure.
 max_host_gcc_for_cuda() {
     cmaj="$1"
     cmin="$2"
@@ -570,10 +541,9 @@ max_host_gcc_for_cuda() {
     esac
 }
 
-# Looks for an older g++ already installed that satisfies max gcc major
-# $1, newest-to-oldest so the suggestion is as close to the broken one as
-# possible. Prints the command name (e.g. "g++-13") and returns 0 if
-# found; returns 1 with no output otherwise.
+# An installed g++ no newer than major $1, searched newest-first so the
+# suggestion stays close to the broken one. Prints e.g. "g++-13", or
+# returns 1 with no output.
 find_compatible_hostcxx() {
     want_max="$1"
     for cand in g++-14 g++-13 g++-12 g++-11; do
@@ -696,11 +666,9 @@ do_build() {
     echo "  (pinned instead of the default arch fan-out -- significantly"
     echo "  faster to build and a much smaller binary)"
 
-    # cmake caches CMAKE_CUDA_ARCHITECTURES in build/CMakeCache.txt. If a
-    # previous run configured it with a different value, cmake will happily
-    # keep using the stale one instead of picking up ours -- drop just the
-    # cache file (not the whole build dir) so the configure step below
-    # genuinely re-runs with the architecture we just chose.
+    # cmake keeps CMAKE_CUDA_ARCHITECTURES in build/CMakeCache.txt and will
+    # happily reuse a stale value. Drop just the cache file, not the build
+    # dir, so configure re-runs with the architecture we chose.
     cache_file="$LLAMA_SRC/build/CMakeCache.txt"
     if [ -f "$cache_file" ]; then
         cached_arch=$(sed -n 's/^CMAKE_CUDA_ARCHITECTURES:STRING=//p' "$cache_file")
@@ -739,9 +707,15 @@ install the full CUDA Toolkit and re-run this script."
     write_manifest "source" "$patch_list" "built from source" ""
 }
 
-# ---------------------------------------------------------------------------
-# Prebuilt install (rung 1: revv's patched CUDA binary)
-# ---------------------------------------------------------------------------
+# --- Prebuilt install (rung 1: revv's patched CUDA binary) -----------------
+
+# Both download paths need one of these, and neither can proceed without it.
+no_downloader_fail() {
+    fail "neither curl nor wget found on PATH" \
+"revv needs curl or wget to download prebuilt binaries. Install one (e.g.
+'brew install curl' on macOS, 'apt install curl' on Debian/Ubuntu), or use
+--source to build llama.cpp from source instead."
+}
 
 sha256_of() {
     file="$1"
@@ -754,10 +728,8 @@ sha256_of() {
     fi
 }
 
-# Downloads $1 to $2 with curl if available, else wget. Both show a
-# progress meter by default, so nothing extra is needed for that. Hard
-# fails (there is no rung that doesn't eventually need one of these) if
-# neither is installed.
+# Downloads $1 to $2 with curl, else wget; both show a progress meter by
+# default. Hard fails if neither is installed -- every rung needs one.
 download_with_progress() {
     url="$1"
     dest="$2"
@@ -766,21 +738,15 @@ download_with_progress() {
     elif command -v wget >/dev/null 2>&1; then
         wget -O "$dest" "$url"
     else
-        fail "neither curl nor wget found on PATH" \
-"revv needs curl or wget to download prebuilt binaries. Install one (e.g.
-'brew install curl' on macOS, 'apt install curl' on Debian/Ubuntu), or use
---source to build llama.cpp from source instead."
+        no_downloader_fail
     fi
 }
 
-# Like download_with_progress, but for the prebuilt rung specifically:
-# classifies *why* a failed download failed, so the caller can tell "the
-# release isn't published yet" (benign, expected right now) apart from "this
-# machine can't reach GitHub" (the user's network). Sets DOWNLOAD_HTTP_CODE
-# to the HTTP status if one was obtained (e.g. "404"), or "000" if the
-# request never got far enough to get one at all (DNS/route/TLS/timeout).
-# Returns 0 on a clean 200, 1 otherwise -- never calls fail() itself, this
-# rung already has its own soft-fail/auto-fallback convention.
+# As download_with_progress, but classifies *why* a download failed so the
+# caller can tell "not published yet" from "cannot reach GitHub". Sets
+# DOWNLOAD_HTTP_CODE to the HTTP status, or "000" if the request never got
+# one (DNS/route/TLS/timeout). Returns 0 only on a clean 200, and never
+# calls fail(): this rung soft-fails so the caller can fall back.
 download_prebuilt() {
     url="$1"
     dest="$2"
@@ -806,12 +772,9 @@ download_prebuilt() {
             return 0
         fi
         wget_status=$?
-        # wget exposes no numeric status the way curl's -w does; exit 8
-        # ("server issued an error response") is the closest signal that we
-        # got a real HTTP response and it was bad, rather than never
-        # reaching the server at all. Grep its log for the specific case we
-        # care about distinguishing; anything else stays "unknown" and gets
-        # the generic message.
+        # wget has no -w equivalent. Exit 8 ("server issued an error
+        # response") is the closest signal that we got a real HTTP response
+        # and it was bad; grep the log for the one case worth telling apart.
         if [ "$wget_status" -eq 8 ] && grep -q '404' "$wget_log" 2>/dev/null; then
             DOWNLOAD_HTTP_CODE="404"
         fi
@@ -819,10 +782,7 @@ download_prebuilt() {
         return 1
     fi
 
-    fail "neither curl nor wget found on PATH" \
-"revv needs curl or wget to download prebuilt binaries. Install one (e.g.
-'brew install curl' on macOS, 'apt install curl' on Debian/Ubuntu), or use
---source to build llama.cpp from source instead."
+    no_downloader_fail
 }
 
 # Verifies $1 against expected sha256 $2. If neither sha256sum nor shasum
@@ -852,10 +812,9 @@ verify_sha256_or_confirm() {
             *) return 1 ;;
         esac
     fi
-    # Fail CLOSED. This is a binary download; "could not check" must not
-    # silently become "checked". sha256sum ships with coreutils on every
-    # mainstream Linux, so reaching here at all is unusual and worth stopping
-    # for. The escape hatch is explicit and has to be typed on purpose.
+    # Fail CLOSED: for a binary download, "could not check" must not become
+    # "checked". sha256sum ships with coreutils everywhere mainstream, so
+    # reaching here is unusual. The escape hatch has to be typed on purpose.
     if [ -n "${REVV_ALLOW_UNVERIFIED:-}" ]; then
         echo "REVV_ALLOW_UNVERIFIED is set: continuing without verification." >&2
         return 0
@@ -867,13 +826,11 @@ verify_sha256_or_confirm() {
     return 1
 }
 
-# Checked before downloading anything (no point spending 690 MiB finding this
-# out afterward). Returns 0 to proceed -- either it matches, or the check
-# itself couldn't be done and we don't block on a missing check. Returns 1
-# with PREBUILT_FAIL_REASON set on a genuine mismatch, so the existing
-# auto-fallback machinery in try_prebuilt()/main drops to --source; an
-# explicit --prebuilt then surfaces that reason as a hard failure the same
-# way a 404 or a bad sha256 would, unless REVV_ALLOW_ARCH_MISMATCH is set.
+# Checked before downloading 690 MiB. Returns 0 to proceed -- the arch
+# matches, or the check itself could not run, and a missing check must not
+# block. Returns 1 with PREBUILT_FAIL_REASON set only on a genuine mismatch,
+# which drops the no-flag path to --source and makes an explicit --prebuilt
+# fail, unless REVV_ALLOW_ARCH_MISMATCH is set.
 check_prebuilt_arch() {
     # e.g. "7.5 8.0 8.6 8.9 9.0" -> "75/80/86/89/90", for the messages below.
     sm_list=$(printf '%s' "$PREBUILT_CUDA_ARCHS" | tr -d '.' | tr ' ' '/')
@@ -884,26 +841,10 @@ check_prebuilt_arch() {
         return 0
     fi
 
+    # A partial or garbage nvidia-smi output degrades to "could not verify",
+    # never to a false mismatch report.
     raw=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
-
-    # One compute-capability value per line, deduped. Same "bail to BAD on
-    # anything that doesn't look like a compute capability" approach as
-    # detect_cuda_archs -- a partial/garbage nvidia-smi output should
-    # degrade to "could not verify", not to a false mismatch report.
-    caps=$(printf '%s\n' "$raw" | tr -d ' \r' | awk '
-        NF == 0 { next }
-        !/^[0-9]+\.[0-9]+$/ { bad = 1; exit }
-        {
-            if (!($0 in seen)) {
-                seen[$0] = 1
-                out = out (out == "" ? "" : "\n") $0
-            }
-        }
-        END {
-            if (bad) { print "BAD"; exit }
-            if (out != "") print out
-        }
-    ')
+    caps=$(parse_compute_caps "$raw")
 
     if [ -z "$caps" ] || [ "$caps" = "BAD" ]; then
         echo "  warning: could not parse a GPU compute capability from nvidia-smi --" >&2
@@ -946,13 +887,11 @@ check_prebuilt_arch() {
     return 1
 }
 
-# Downloads the revv prebuilt into $REVV_HOME/cache/, reusing it if
-# already present and sha256-verified (idempotent: re-running does not
-# re-fetch ~690 MiB). Sets PREBUILT_CACHE_FILE on success; sets
-# PREBUILT_FAIL_REASON (one line) and returns 1 on failure -- 404, network
-# error, or a sha256 mismatch -- without printing; the caller reports it.
-# On a 404 or network error, also sets PREBUILT_FAIL_DETAIL to a longer,
-# case-specific explanation for main's explicit-rung fail() path.
+# Downloads the prebuilt into $REVV_HOME/cache/, reusing a present and
+# sha256-verified copy so a re-run does not re-fetch ~690 MiB. Sets
+# PREBUILT_CACHE_FILE on success. On failure (404, network, bad sha256)
+# sets PREBUILT_FAIL_REASON, plus PREBUILT_FAIL_DETAIL for the cases where
+# main's explicit-rung fail() has something longer to say.
 ensure_prebuilt_downloaded() {
     cache_dir="$REVV_HOME/cache"
     mkdir -p "$cache_dir"
@@ -1006,10 +945,8 @@ llama.cpp from source instead."
     return 0
 }
 
-# Checks that the dynamic loader can resolve every shared library the
-# real binary needs -- the prebuilt's CUDA libs come from the system, not
-# the archive, so this is the one part of "install" that a download alone
-# can't guarantee. Never fails hard; reports and lets the user fix it.
+# Can the dynamic loader resolve every shared library the real binary
+# needs? Never fails hard: reports, and lets the user fix it.
 check_cuda_runtime_libs() {
     bin_path="$1"
     if ! command -v ldd >/dev/null 2>&1; then
@@ -1032,67 +969,82 @@ check_cuda_runtime_libs() {
     fi
 }
 
-# Rung 1. Returns 0 on success (installed + manifest written). Returns 1
-# and sets PREBUILT_FAIL_REASON, having already printed "skip prebuilt:
-# <reason>", if any precondition or the download/verify step fails --
-# never calls fail() for those, so the auto-fallback path can fall
+# Unpacks a downloaded rung's tarball into its runtime dir. $3 is the
+# fail() detail, which differs per rung.
+extract_runtime() {
+    rm -rf "$2"
+    mkdir -p "$2"
+    if ! tar -xzf "$1" -C "$2" --strip-components=1; then
+        fail "failed to extract $1" "$3"
+    fi
+}
+
+# Points $BIN_DIR/llama-server at an extracted runtime's launcher script.
+link_runtime_server() {
+    mkdir -p "$BIN_DIR"
+    rm -f "$BIN_DIR/llama-server"
+    ln -s "$1/llama-server" "$BIN_DIR/llama-server"
+    echo "installed: $BIN_DIR/llama-server -> $1/llama-server"
+}
+
+# Rung 1. Returns 0 once installed and the manifest is written; returns 1
+# having printed "skip prebuilt: <reason>" if a precondition or the
+# download fails. Never fail()s on those, so the no-flag path can fall
 # through to --source cleanly.
+# Records why rung 1 is being skipped and says so; callers `return 1` after
+# it, which the no-flag path treats as "fall through to --source".
+skip_prebuilt() {
+    PREBUILT_FAIL_REASON="$1"
+    echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+}
+
 try_prebuilt() {
     PREBUILT_FAIL_REASON=""
     PREBUILT_FAIL_DETAIL=""
 
     uname_s=$(uname -s)
     if [ "$uname_s" != "Linux" ]; then
-        PREBUILT_FAIL_REASON="not running on Linux (uname -s reports '$uname_s')"
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "not running on Linux (uname -s reports '$uname_s')"
         return 1
     fi
 
     uname_m=$(uname -m)
     if [ "$uname_m" != "x86_64" ]; then
-        PREBUILT_FAIL_REASON="not running on x86_64 (uname -m reports '$uname_m')"
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "not running on x86_64 (uname -m reports '$uname_m')"
         return 1
     fi
 
     if ! command -v ldd >/dev/null 2>&1; then
-        PREBUILT_FAIL_REASON="could not determine the glibc version ('ldd' not found)"
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "could not determine the glibc version ('ldd' not found)"
         return 1
     fi
     parse_glibc
     if ! is_int "$GLIBC_MAJOR" || ! is_int "$GLIBC_MINOR"; then
-        PREBUILT_FAIL_REASON="could not parse a glibc version out of 'ldd --version'"
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "could not parse a glibc version out of 'ldd --version'"
         return 1
     fi
     if [ "$GLIBC_MAJOR" -lt 2 ] || { [ "$GLIBC_MAJOR" -eq 2 ] && [ "$GLIBC_MINOR" -lt 38 ]; }; then
-        PREBUILT_FAIL_REASON="glibc $GLIBC_VER is older than the 2.38 minimum the revv prebuilt requires"
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "glibc $GLIBC_VER is older than the 2.38 minimum the revv prebuilt requires"
         return 1
     fi
     echo "  platform OK for the revv prebuilt: Linux x86_64, glibc $GLIBC_VER"
 
     if ! check_prebuilt_arch; then
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "$PREBUILT_FAIL_REASON"
         return 1
     fi
 
     if ! ensure_prebuilt_downloaded; then
-        echo "  skip prebuilt: $PREBUILT_FAIL_REASON"
+        skip_prebuilt "$PREBUILT_FAIL_REASON"
         return 1
     fi
 
     runtime_dir="$REVV_HOME/runtime/prebuilt"
-    rm -rf "$runtime_dir"
-    mkdir -p "$runtime_dir"
-    if ! tar -xzf "$PREBUILT_CACHE_FILE" -C "$runtime_dir" --strip-components=1; then
-        fail "failed to extract $PREBUILT_CACHE_FILE" \
+    extract_runtime "$PREBUILT_CACHE_FILE" "$runtime_dir" \
 "The sha256 checksum matched, so this looks like a local problem (e.g. no
 'tar', or a full disk) rather than a bad download. Remove the cache file and
 re-run to fetch it fresh:
   rm -f $PREBUILT_CACHE_FILE"
-    fi
     chmod +x "$runtime_dir/llama-server" "$runtime_dir/llama-server.bin" 2>/dev/null || true
     if [ ! -x "$runtime_dir/llama-server" ]; then
         fail "extracted prebuilt archive has no llama-server launcher" \
@@ -1101,10 +1053,7 @@ fetch it fresh:
   rm -f $PREBUILT_CACHE_FILE"
     fi
 
-    mkdir -p "$BIN_DIR"
-    rm -f "$BIN_DIR/llama-server"
-    ln -s "$runtime_dir/llama-server" "$BIN_DIR/llama-server"
-    echo "installed: $BIN_DIR/llama-server -> $runtime_dir/llama-server"
+    link_runtime_server "$runtime_dir"
 
     if [ -x "$runtime_dir/llama-server.bin" ]; then
         check_cuda_runtime_libs "$runtime_dir/llama-server.bin"
@@ -1116,15 +1065,11 @@ fetch it fresh:
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Upstream install (rung 2: official ggml-org/llama.cpp prebuilt)
-# ---------------------------------------------------------------------------
+# --- Upstream install (rung 2: official ggml-org/llama.cpp prebuilt) -------
 
-# Rung 2, explicit only -- this script never auto-falls-back into it,
-# because Vulkan is a different backend with different performance, not a
-# strictly-worse-but-safe substitute for CUDA. Fails hard (not a soft
-# "skip") on an unsupported platform, since the user asked for this rung
-# by name.
+# Rung 2, explicit only: Vulkan is a different backend with different
+# performance, not a safe substitute for CUDA, so nothing auto-falls-back
+# into it. Fails hard on an unsupported platform -- the user named this rung.
 do_install_upstream() {
     echo "installing the official upstream llama.cpp prebuilt (rung 2)..."
     echo "note: ggml-org/llama.cpp publishes no Linux CUDA prebuilt. On Linux"
@@ -1171,13 +1116,9 @@ instead."
     echo "that it actually extracts and contains llama-server."
 
     runtime_dir="$REVV_HOME/runtime/upstream"
-    rm -rf "$runtime_dir"
-    mkdir -p "$runtime_dir"
-    if ! tar -xzf "$dest" -C "$runtime_dir" --strip-components=1; then
-        fail "failed to extract $dest" \
+    extract_runtime "$dest" "$runtime_dir" \
 "The download may be corrupt. Remove it and re-run to fetch it fresh:
   rm -f $dest"
-    fi
     chmod +x "$runtime_dir/llama-server" 2>/dev/null || true
     if [ ! -x "$runtime_dir/llama-server" ]; then
         fail "extracted upstream archive does not contain an executable llama-server" \
@@ -1186,18 +1127,13 @@ re-run to fetch it fresh:
   rm -f $dest"
     fi
 
-    mkdir -p "$BIN_DIR"
-    rm -f "$BIN_DIR/llama-server"
-    ln -s "$runtime_dir/llama-server" "$BIN_DIR/llama-server"
-    echo "installed: $BIN_DIR/llama-server -> $runtime_dir/llama-server"
+    link_runtime_server "$runtime_dir"
 
     write_manifest "upstream" "" "$url" ',
   "backend": "vulkan"'
 }
 
-# ---------------------------------------------------------------------------
-# revv CLI wrapper
-# ---------------------------------------------------------------------------
+# --- revv CLI wrapper ------------------------------------------------------
 
 install_revv_wrapper() {
     mkdir -p "$BIN_DIR"
@@ -1226,9 +1162,7 @@ report_path() {
     esac
 }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# --- Main ------------------------------------------------------------------
 
 echo "revv installer"
 echo "  source dir: $REVV_DIR"
