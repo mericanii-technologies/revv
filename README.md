@@ -103,11 +103,6 @@ git clone https://github.com/mericanii-technologies/revv && cd revv
 ./revv.py up
 ```
 
-> **TODO (founder):** the prebuilt GitHub Release is **not published yet**. As
-> of 2026-09-05 the releases list is empty and the asset URL 404s, so
-> `install.sh` falls through to building from source for everyone. This section
-> is written for how it will read once the release is tagged. Publish the sm_86
-> artifact, then delete this block.
 
 Preconditions, checked first: Linux x86_64, glibc 2.38+ (Ubuntu 24.04+; 22.04
 will not work), and the CUDA *runtime* libraries
