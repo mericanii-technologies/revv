@@ -664,6 +664,17 @@ logical core count is 12 (6 physical, SMT-2); by -t 10 it is already losing
 5-15% against the -t 8 peak, which is why the heuristic clamps to physical
 cores rather than `os.cpu_count()`.
 
+**A note on where 8 comes from.** This sweep was certified at `-t 8` on the
+reference box, which is a 10-vCPU guest running on a 6-core/12-thread host.
+The heuristic returns 8 there because it clamps to [4, 8] and the guest
+presents 10 distinct core ids. On 6-core bare metal -- the same physical
+host, no virtualization -- `physical_core_count()` returns 6, not 8, so the
+heuristic instead yields `-t 6` = 55.1 t/s in this same sweep, -1.4% against
+the -t 8 peak; for completeness, -t 7 measured 54.7 and -t 8 measured 55.9.
+The heuristic is deliberately not overfitted to the reference box's
+virtualization -- users who want the exact certified point can override the
+thread count themselves.
+
 **`size_m` sweep summary.** The n-gram matcher's default window (`size_m=48`)
 gives ~100 t/s mean on editing tasks; `size_m=256` gives **~188 t/s mean**.
 The curve was still rising at 256, so this is a floor for a wider window, not

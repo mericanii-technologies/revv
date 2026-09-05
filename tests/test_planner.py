@@ -23,6 +23,18 @@ FIXTURES = os.path.join(HERE, "fixtures")
 CERT_SIZE = int(revv.BUILDS[revv.DEFAULT_BUILD]["size"])
 CERT_NAME = str(revv.BUILDS[revv.DEFAULT_BUILD]["file"])
 
+# An RTX 3060 12GB reports 12,288 MiB total, but 244 MiB of that is reserved
+# by the driver and shows up in neither `used` nor `free` -- so `memory.free`
+# on an otherwise-idle card maxes out at 12,288 - 244 = 12,044 MiB. A previous
+# revision of this suite planned against a 12,287 MiB fixture, which is
+# physically unreachable on real hardware; that unreachable fixture was green
+# while the speed tier could not actually reach its certified c=16384 on any
+# real card. REF_3060_FREE_MIB replaces it with the true idle ceiling.
+REF_3060_FREE_MIB = 12044
+# A 3060 under WSL2, with Windows itself holding onto roughly 1.2 GB of the
+# card before revv ever launches.
+WSL2_3060_FREE_MIB = 11000
+
 _failures = []
 
 
@@ -64,7 +76,7 @@ def test_context_checkpoints():
     check("headroom one below threshold -> disabled", p.ctx_checkpoints, 0)
 
     # A clean 12GB card running the certified config IS near the ceiling.
-    p = revv.plan_launch(info, "12gb", None, 12287)
+    p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
     check("certified config on a clean 12GB card -> disabled",
           p.ctx_checkpoints, 0)
     check("...and it is named as a lever",
@@ -76,12 +88,14 @@ def test_context_checkpoints():
     p = revv.plan_launch(info, "12gb", None, 24476)
     check("24GB card -> default left alone", p.ctx_checkpoints, None)
 
-    # Never guess when the GPU is unknown (forced tier, no nvidia-smi).
+    # Never guess when the GPU is unknown (forced tier, no nvidia-smi): the
+    # planner now refuses to leave checkpoints at their default and forces
+    # them off instead, since it has no VRAM reading to know it is safe.
     p = revv.plan_launch(info, "12gb", None, None)
-    check("free VRAM unknown -> default left alone", p.ctx_checkpoints, None)
+    check("free VRAM unknown -> checkpoints forced off", p.ctx_checkpoints, 0)
 
     # The flag must actually reach the command line, and only in revv mode.
-    p = revv.plan_launch(info, "12gb", None, 12287)
+    p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
     argv = revv.build_server_argv("/x/llama-server", "/m.gguf", p, 8080,
                                   revv.MODE_REVV, [])
     check("argv carries -ctxcp 0", "-ctxcp" in argv and
@@ -98,17 +112,22 @@ def test_kv_and_context():
     section("KV precision and context sizing")
     info = certified_like()
 
-    p = revv.plan_launch(info, "12gb", None, 12287)
-    check("certified on 12GB -> ctx 16384", p.ctx, 16384)
+    p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
+    # On a real (not the old, unreachable 12,287 MiB) 12GB card, the
+    # chain-aware boundary math (see test_flagship_ngram_chain) caps the
+    # flagship at 12288, not 16384.
+    check("certified on 12GB -> ctx 12288", p.ctx, 12288)
     check("certified on 12GB -> q8_0 (f16 does not fit)", p.kv, "q8_0")
-    # 11830 (the certified, chain-less measurement) plus the chain's own
+    # 11746 is model_peak_mib(info, 12288, "q8_0") plus the chain's own
     # ~100 MiB, which now runs on the flagship too.
-    check("certified on 12GB -> peak 11830 + chain",
-          p.estimated_peak, 11830 + revv.SPEC_NGRAM_CHAIN_MIB)
+    check("certified on 12GB -> peak is ctx-12288 peak + chain",
+          p.estimated_peak,
+          revv.model_peak_mib(info, 12288, "q8_0") + revv.SPEC_NGRAM_CHAIN_MIB)
 
-    # The chain's ~100 MiB tips this scenario over what 8192 can hold, once
-    # the chain is correctly counted -- a strictly-tighter card than before,
-    # not a regression: the OOM risk was always there once the chain ships.
+    # A WSL2-sized card forces a lower rung than the reference card above.
+    # This value is unchanged by MEASURED_PEAK_MARGIN_MIB: the flagship runs
+    # the n-gram chain, so its peak carries an estimated term and keeps the
+    # wide 250 MiB margin (see vram_margin_for).
     p = revv.plan_launch(info, "12gb", None, 11744)
     check("WSL2-style 11744 free -> ctx reduced to 6144 (chain counted)",
           p.ctx, 6144)
@@ -118,18 +137,18 @@ def test_kv_and_context():
 
     # A small model on a roomy card must not be taxed.
     small = revv.read_gguf(os.path.join(FIXTURES, "gemma_like.gguf"))
-    p = revv.plan_launch(small, "12gb", None, 12287)
+    p = revv.plan_launch(small, "12gb", None, REF_3060_FREE_MIB)
     check("small model on 12GB -> f16 KV, not quantized", p.kv, "f16")
 
     # Explicit --ctx was once snapped UP to the smallest ladder rung, silently
     # handing out more context than asked for.
     for want in (1024, 2048, 8192):
-        p = revv.plan_launch(info, "12gb", want, 12287)
+        p = revv.plan_launch(info, "12gb", want, REF_3060_FREE_MIB)
         check("explicit --ctx %d honoured exactly" % want, p.ctx, want)
 
     # More free VRAM must never yield less context.
     ctxs = [revv.plan_launch(info, "12gb", None, f).ctx
-            for f in (11744, 12287, 13000, 24476)]
+            for f in (11744, REF_3060_FREE_MIB, 13000, 24476)]
     check("context is monotonic in free VRAM", ctxs == sorted(ctxs), True)
 
 
@@ -145,7 +164,7 @@ def test_levers():
     }
     for name, (spec, think, noop) in cases.items():
         info = revv.read_gguf(os.path.join(FIXTURES, name + ".gguf"))
-        p = revv.plan_launch(info, "12gb", None, 12287)
+        p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
         check("%s: speculation" % name, p.use_spec, spec)
         check("%s: thinking off" % name, p.thinking_off, think)
         check("%s: is_noop" % name, p.is_noop, noop)
@@ -205,7 +224,7 @@ def test_speed_tier():
     check("peak anchored on the measurement, not the file size",
           revv.model_peak_mib(info, 16384, "q8_0"), 11832)
 
-    p = revv.plan_launch(info, "12gb", None, 12287)
+    p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
     check("certified context survives planning", p.ctx, 16384)
     check("certified KV survives planning", p.kv, "q8_0")
     # This build was certified WITH the n-gram chain already running (11,832
@@ -232,11 +251,15 @@ def test_speed_tier():
     # onto the flagship. Its peak now carries the chain's ~100 MiB, same as
     # the speed tier -- that part is shared, not speed-tier-specific.
     f = certified_like()
-    pf = revv.plan_launch(f, "12gb", None, 12287)
-    check("flagship still plans ctx 16384 / q8_0, no n_cpu_moe",
-          (pf.ctx, pf.kv, pf.n_cpu_moe), (16384, "q8_0", None))
-    check("flagship peak is 11830 + chain",
-          pf.estimated_peak, 11830 + revv.SPEC_NGRAM_CHAIN_MIB)
+    pf = revv.plan_launch(f, "12gb", None, REF_3060_FREE_MIB)
+    # On a real 12GB card the flagship's own chain-aware boundary math caps
+    # it at 12288 (see test_flagship_ngram_chain) -- still q8_0, still no
+    # n_cpu_moe, since that lever belongs to the speed tier only.
+    check("flagship plans ctx 12288 / q8_0, no n_cpu_moe",
+          (pf.ctx, pf.kv, pf.n_cpu_moe), (12288, "q8_0", None))
+    check("flagship peak is ctx-12288 peak + chain",
+          pf.estimated_peak,
+          revv.model_peak_mib(f, 12288, "q8_0") + revv.SPEC_NGRAM_CHAIN_MIB)
 
 
 def test_thread_heuristic():
@@ -249,7 +272,7 @@ def test_thread_heuristic():
           4 <= revv.physical_core_count() <= 8, True)
 
     speed = speed_like()
-    p = revv.plan_launch(speed, "12gb", None, 12287)
+    p = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB)
     check("n_cpu_moe > 0 -> n_threads is set", p.n_threads is not None, True)
     check("n_threads is clamped to [4, 8]", 4 <= p.n_threads <= 8, True)
     argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
@@ -264,7 +287,7 @@ def test_thread_heuristic():
 
     # No CPU-MoE offload -> no thread flag, on either certified line.
     flagship = certified_like()
-    pf = revv.plan_launch(flagship, "12gb", None, 12287)
+    pf = revv.plan_launch(flagship, "12gb", None, REF_3060_FREE_MIB)
     check("flagship (no n_cpu_moe) -> n_threads is None", pf.n_threads, None)
     argv_f = revv.build_server_argv("/x/llama-server", flagship.path, pf, 8080,
                                     revv.MODE_REVV, [])
@@ -280,7 +303,7 @@ def test_speed_tier_drafter_stack():
     speculates through its own MTP head."""
     section("drafter chain (n-gram + MTP), both tiers")
     speed = speed_like()
-    p = revv.plan_launch(speed, "12gb", None, 12287)
+    p = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB)
     argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
                                   revv.MODE_REVV, [])
     check("speed tier argv carries the n-gram+MTP chain",
@@ -292,7 +315,7 @@ def test_speed_tier_drafter_stack():
 
     # The flagship gets the identical chain now -- no longer speed-tier-only.
     flagship = certified_like()
-    pf = revv.plan_launch(flagship, "12gb", None, 12287)
+    pf = revv.plan_launch(flagship, "12gb", None, REF_3060_FREE_MIB)
     argv_f = revv.build_server_argv("/x/llama-server", flagship.path, pf, 8080,
                                     revv.MODE_REVV, [])
     check("flagship argv carries the n-gram+MTP chain",
@@ -362,7 +385,7 @@ def test_flagship_ngram_chain():
     # already running (11,832 MiB peak includes it), so it must not pay the
     # cost a second time.
     speed = speed_like()
-    ps = revv.plan_launch(speed, "12gb", None, 12287)
+    ps = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB)
     check("speed tier: ctx unchanged at 16384", ps.ctx, 16384)
     check("speed tier: peak unchanged at 11832 (no double-counted chain)",
           ps.estimated_peak, 11832)
@@ -379,6 +402,73 @@ def test_speed_tier_is_the_mtp_build():
           "unsloth/Qwen3.6-35B-A3B-MTP-GGUF")
     check("size is the MTP build's", spec["size"], 17227569440)
     check("NOT the headless build's size", spec["size"] == 16845511648, False)
+
+
+def test_real_hardware_fixtures():
+    """The old 12,287 MiB fixture used across this file is physically
+    unreachable: an RTX 3060 12GB tops out at 12,044 MiB free once the driver
+    takes its 244 MiB, so a suite that only ever planned against 12,287 was
+    green while the speed tier could not reach its certified c=16384 on any
+    real card. These are the two real profiles that matter: an idle 3060, and
+    a 3060 under WSL2 with Windows holding back roughly 1.2 GB more."""
+    section("real-hardware VRAM fixtures")
+
+    speed = speed_like()
+    p = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB)
+    check("reference 3060: speed tier reaches certified 16384", p.ctx, 16384)
+    check("reference 3060: speed tier peak is the measured 11832",
+          p.estimated_peak, 11832)
+    check("reference 3060: speed tier still disables checkpoints",
+          p.ctx_checkpoints, 0)
+
+    flagship = certified_like()
+    pf = revv.plan_launch(flagship, "12gb", None, REF_3060_FREE_MIB)
+    check("reference 3060: flagship lands on 12288", pf.ctx, 12288)
+    check("reference 3060: flagship still disables checkpoints",
+          pf.ctx_checkpoints, 0)
+
+    speed_wsl = speed_like()
+    p_wsl = revv.plan_launch(speed_wsl, "12gb", None, WSL2_3060_FREE_MIB)
+    check("WSL2 3060: speed tier steps down from 16384", p_wsl.ctx < 16384,
+          True)
+
+    flagship_wsl = certified_like()
+    pf_wsl = revv.plan_launch(flagship_wsl, "12gb", None, WSL2_3060_FREE_MIB)
+    check("WSL2 3060: flagship steps down from 16384", pf_wsl.ctx < 16384,
+          True)
+
+    check("measured-peak builds use the 150 MiB margin",
+          revv.vram_margin_for(speed_like()), revv.MEASURED_PEAK_MARGIN_MIB)
+
+    # Guard so nobody reintroduces the unreachable fixture value.
+    check("the 12287 fixture is unreachable on real hardware",
+          REF_3060_FREE_MIB < 12287, True)
+
+
+def test_forced_tier_guard():
+    """--tier forces a speed tier without ever reading nvidia-smi. With no
+    free-VRAM reading, the planner has no basis to know a stack of lazily
+    allocated context checkpoints is safe, so it must always disable them
+    and say so, rather than leaving the (possibly unsafe) default alone."""
+    section("forced tier (--tier, no VRAM reading)")
+
+    pf = revv.plan_launch(certified_like(), "12gb", None, None)
+    check("forced tier disables checkpoints (flagship)",
+          pf.ctx_checkpoints, 0)
+
+    ps = revv.plan_launch(speed_like(), "12gb", None, None)
+    check("forced tier disables checkpoints (speed)",
+          ps.ctx_checkpoints, 0)
+
+    info = certified_like()
+    p = revv.plan_launch(info, "12gb", None, None)
+    argv = revv.build_server_argv("/x/llama-server", info.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("forced tier argv carries -ctxcp 0",
+          "-ctxcp" in argv and argv[argv.index("-ctxcp") + 1] == "0", True)
+
+    check("forced tier warns that VRAM was not read",
+          any("--tier was given" in n for n in p.notes), True)
 
 
 def test_port_fallback():
@@ -421,6 +511,8 @@ def main():
     test_thread_heuristic()
     test_speed_tier_drafter_stack()
     test_flagship_ngram_chain()
+    test_real_hardware_fixtures()
+    test_forced_tier_guard()
     test_port_fallback()
     print("\n%s" % ("ALL PASSED" if not _failures
                     else "%d FAILED: %s" % (len(_failures), ", ".join(_failures))))

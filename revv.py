@@ -141,6 +141,63 @@ CONTEXT_LADDER = [65536, 49152, 32768, 24576, 16384, 12288, 8192, 6144, 4096]
 # historically sat 86 MiB from the ceiling.
 VRAM_MARGIN_MIB = 250
 
+# The same headroom, for a build whose peak is a MEASUREMENT rather than an
+# estimate. 250 MiB exists to cover the geometric estimator's error; a build in
+# BUILDS with a `peak_mib` has no estimator error to cover, because the number
+# came off this hardware with the allocator's real fragmentation already in it.
+#
+# Applying the estimator's margin to a measured peak excluded the certified
+# configuration from its own planner. An RTX 3060 12GB reports 12,288 MiB total
+# but only 12,044 MiB free -- 244 MiB is reserved by the driver and appears in
+# neither `used` nor `free`. The speed tier's measured peak is 11,832 MiB at
+# c=16384, so 11,832 + 250 = 12,082 > 12,044 and the ladder stepped down to
+# c=12288 on every 12GB card in existence, while tests/test_planner.py asserted
+# the certified 16384 against a free_mib=12287 fixture that no such card can
+# ever report.
+#
+# Certification for the 150: 11,832 MiB peak at c=16384 with -ctxcp 0, verified
+# across consecutive deep requests -- i.e. past the request-two checkpoint
+# allocation that kills configs which only pass a load-time check. Real headroom
+# 212 MiB against the 12,044 usable ceiling.
+MEASURED_PEAK_MARGIN_MIB = 150
+
+
+def has_measured_peak(info: "GGUFInfo") -> bool:
+    """Is this file's peak a registry MEASUREMENT rather than an estimate?
+
+    Decides which of the two margins above applies. Mirrors the condition
+    model_peak_mib() uses to anchor on `peak_mib`, so the two never disagree
+    about which arm a given file is on.
+    """
+    build_name = identify_build(info)
+    spec = BUILDS.get(build_name) if build_name else None
+    return bool(spec is not None and spec.get("peak_mib"))
+
+
+def vram_margin_for(info: "GGUFInfo", chain_mib: int = 0,
+                    draft: Optional["GGUFInfo"] = None) -> int:
+    """Headroom to leave unclaimed for this file.
+
+    The reduced margin is for a peak that is PURELY a measurement. The moment
+    an estimated term is added on top of the measured `peak_mib` -- the n-gram
+    chain's ~100 MiB, or an external drafter's weights plus its KV -- the total
+    is part measurement, part estimate, and that estimate is exactly what the
+    250 MiB exists to cover. So a mixed sum falls back to the wide margin.
+
+    This is not hypothetical. The flagship's measured peak is 11,830 MiB, and
+    with the chain running the planner charges it 11,930. Granting that sum the
+    narrow margin would let the flagship take c=16384 with as little as 150 MiB
+    of headroom on a card reporting ~12,080 MiB free, undoing the chain-aware
+    step-down to c=12288 that was certified on 2026-09-05 for exactly this
+    reason. The speed tier is unaffected: its 11,832 MiB was measured WITH the
+    chain already running, so chain_mib is 0 there and its peak stays purely
+    measured.
+    """
+    if has_measured_peak(info) and chain_mib == 0 and draft is None:
+        return MEASURED_PEAK_MARGIN_MIB
+    return VRAM_MARGIN_MIB
+
+
 # llama-server keeps up to 32 context checkpoints PER SLOT by default
 # (upstream PR #15293), and on this model each one is ~150 MiB. They are
 # allocated lazily, so the first one lands during the SECOND request -- after
@@ -2435,6 +2492,12 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     chain_active = use_spec and draft is None and n_cpu_moe is None
     chain_mib = SPEC_NGRAM_CHAIN_MIB if chain_active else 0
 
+    # How much headroom to leave unclaimed: 150 MiB when the peak below is
+    # purely a measurement, 250 when any part of it is estimated. Decided here
+    # rather than at the top of the function because it depends on chain_mib
+    # and the drafter, which are the estimated terms. See vram_margin_for().
+    margin = vram_margin_for(info, chain_mib, draft)
+
     thinking_off = info.supports_thinking
     if not thinking_off:
         notes.append("this model's chat template has no thinking switch, so "
@@ -2450,7 +2513,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         peak = model_peak_mib(info, ctx, str(t["kv"]))
         if peak is not None and free_mib is not None:
             peak += draft_overhead_mib(draft, ctx, str(t["kv"])) + chain_mib
-            if peak + VRAM_MARGIN_MIB > free_mib:
+            if peak + margin > free_mib:
                 notes.append("--ctx %s needs ~%s but only %s is free; expect a "
                              "CUDA OOM" % ("{:,}".format(ctx), mib(peak),
                                            mib(free_mib)))
@@ -2462,7 +2525,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             peak = model_peak_mib(info, cand, "q8_0")
             if peak is not None:
                 peak += draft_overhead_mib(draft, cand, "q8_0") + chain_mib
-            if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
+            if peak is None or peak + margin <= free_mib:
                 chosen = cand
                 break
         if chosen is None:
@@ -2474,7 +2537,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                 peak = model_peak_mib(info, cand, "q4_0")
                 if peak is not None:
                     peak += draft_overhead_mib(draft, cand, "q4_0") + chain_mib
-                if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
+                if peak is None or peak + margin <= free_mib:
                     chosen = cand
                     break
         if chosen is None:
@@ -2494,7 +2557,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         f16_peak = model_peak_mib(info, ctx, "f16")
         if f16_peak is not None:
             f16_peak += draft_overhead_mib(draft, ctx, "f16") + chain_mib
-        if f16_peak is not None and f16_peak + VRAM_MARGIN_MIB <= free_mib:
+        if f16_peak is not None and f16_peak + margin <= free_mib:
             if kv != "f16":
                 notes.append("f16 KV fits (~%s of %s free) and is the faster "
                              "kernel, so revv is not quantizing the cache"
@@ -2505,7 +2568,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                 peak = model_peak_mib(info, ctx, cand)
                 if peak is not None:
                     peak += draft_overhead_mib(draft, ctx, cand) + chain_mib
-                if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
+                if peak is None or peak + margin <= free_mib:
                     kv = cand
                     break
             else:
@@ -2518,7 +2581,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     peak = model_peak_mib(info, ctx, kv)
     if peak is not None:
         peak += draft_overhead_mib(draft, ctx, kv) + chain_mib
-        if free_mib is not None and peak + VRAM_MARGIN_MIB > free_mib:
+        if free_mib is not None and peak + margin > free_mib:
             # Two distinct situations, and saying "exceeds" for both is simply
             # false: peak can be UNDER free and still trip this, because the
             # test includes the safety margin. A user who reads "~11,530 MiB
@@ -2534,13 +2597,30 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                              "%s free%s, under the %s revv keeps in reserve for "
                              "allocator fragmentation; reduce --ctx if this OOMs"
                              % (mib(peak), mib(free_mib - peak), mib(free_mib),
-                                why, mib(VRAM_MARGIN_MIB)))
+                                why, mib(margin)))
 
     # Context checkpoints are allocated lazily, so leaving them on near the
     # ceiling produces a server that passes its health check and then dies on
     # the second request. Turn them off before that can happen.
     ctx_checkpoints = None      # type: Optional[int]
-    if peak is not None and free_mib is not None:
+    if free_mib is None:
+        # Tier forced with --tier, so there is no VRAM reading and the ladder
+        # never ran: ctx is whatever the tier declares, which on the 12GB tier
+        # is 16384 -- the rung a real 12GB card cannot hold. Headroom here is
+        # not "large", it is UNKNOWN, and the failure mode of guessing wrong is
+        # the nasty one: the server passes its health check, serves one
+        # request, and dies on the next with a cudaGraphInstantiate error that
+        # names neither memory nor checkpoints. Disabling checkpoints costs
+        # ~2.7% on short prompts and gains at depth, so it is the cheap side of
+        # the bet. Always take it when we are flying blind.
+        ctx_checkpoints = 0
+        notes.append("WARNING --tier was given, so revv did NOT read free "
+                     "VRAM: the context above is the tier's declared %s, not a "
+                     "measured fit, and could OOM. Context checkpoints are "
+                     "disabled (-ctxcp 0) because headroom is unknown. Drop "
+                     "--tier to let revv size this against the actual card."
+                     % "{:,}".format(ctx))
+    elif peak is not None:
         headroom = free_mib - peak
         if headroom < CHECKPOINT_HEADROOM_MIB:
             ctx_checkpoints = 0

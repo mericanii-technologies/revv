@@ -109,14 +109,20 @@ ollama pull qwen3.8:27b        # note: this pulls a 4-bit file that won't fit 12
 binary. See [Install paths](#install-paths-and-what-you-are-trusting) if you
 would rather not run a third-party build.
 
-**Windows:** use WSL2 (revv needs Linux + the NVIDIA driver's WSL CUDA support):
+**Windows:** use WSL2 (revv needs Linux + the NVIDIA driver's WSL CUDA support).
+
+Install the NVIDIA driver on the Windows host itself, before touching WSL2 --
+never install an NVIDIA driver inside the WSL2 guest, since CUDA support is
+passed through from the Windows host driver. This is the single most common
+first-run failure.
+
 ```
 wsl --install -d Ubuntu        # from PowerShell (admin), reboot, open Ubuntu
 # then, inside Ubuntu — note: a working nvidia-smi does NOT mean the CUDA
 # toolkit is installed; install.sh needs cmake and nvcc to build llama-server.
 # Use NVIDIA's WSL repo and a RECENT toolkit (Ubuntu's packaged CUDA and older
 # 12.x toolkits fail against new glibc/gcc — verified on a real setup):
-sudo apt update && sudo apt install -y cmake build-essential
+sudo apt update && sudo apt install -y git cmake build-essential
 wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
 sudo apt install -y cuda-toolkit-13-3   # or newest cuda-toolkit-13-x listed
