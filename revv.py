@@ -456,18 +456,32 @@ TIER_ORDER = ["24gb", "16gb", "12gb"]  # highest first, for detection
 SPEC_TYPE = "draft-mtp"
 SPEC_N_MAX = 2
 
-# The speed tier's certified drafter stack (n-cpu-moe builds only -- see the
-# n_cpu_moe gate in build_server_argv). llama.cpp runs speculation chains
-# first-success-wins: an n-gram hit skips the MTP pass for that token, so this
-# is a strict addition over MTP alone, not a substitute for it. Measured
-# +197% on editing workloads (up to ~188 t/s mean / 243 peak) and ZERO effect,
-# zero cost, on plain generation -- the model isn't reusing anything there, so
-# the n-gram matcher just misses and falls through. size-m=256 was verified
-# byte-identical to MTP-only output; see BENCHMARKS.md for the size-m sweep
-# (rising through 256, so this is a floor, not a ceiling) and the CRLF
-# warning (0.83 -> 0.11 acceptance on CRLF text; keep repos LF).
-SPEC_TYPE_MOE = "ngram-simple,draft-mtp"
+# The n-gram+MTP drafter chain. Originally shipped speed-tier-only, then
+# certified on the flagship too (2026-09-05): editing workloads 40.3 ->
+# 222.8 / 246.0 / 113.3 t/s (2.81-6.10x), pure generation 35.17 -> 35.16 t/s
+# (1.00x, inert -- the model isn't reusing anything there, so the n-gram
+# matcher just misses and falls through), outputs byte-identical to
+# plain-MTP on all 4 workloads. It now applies to EVERY build that
+# speculates through its own MTP head, not just the n_cpu_moe (host-RAM
+# offload) tier -- see build_server_argv. llama.cpp runs speculation chains
+# first-success-wins: an n-gram hit skips the MTP pass for that token, so
+# this is a strict addition over MTP alone, not a substitute for it.
+# size-m=256 was verified byte-identical to MTP-only output; see
+# BENCHMARKS.md for the size-m sweep (rising through 256, so this is a
+# floor, not a ceiling) and the CRLF warning (0.83 -> 0.11 acceptance on
+# CRLF text; keep repos LF).
+SPEC_TYPE_CHAIN = "ngram-simple,draft-mtp"
 SPEC_NGRAM_SIZE_M = 256
+
+# The chain's own VRAM cost. Small but real, and it has to be counted before
+# the context ladder picks a rung or a "certified" config can OOM once the
+# chain is actually running. Measured on the flagship: 11,956 MiB vs
+# 11,854 MiB at c=16384, both otherwise-identical launches -- a delta of
+# ~100 MiB. Only added for builds whose registered peak_mib does NOT already
+# bake the chain in: the n_cpu_moe speed tier was certified WITH the chain
+# from the start (11,832 MiB peak already includes it), so adding this again
+# there would double-count it and needlessly shrink its context.
+SPEC_NGRAM_CHAIN_MIB = 100
 
 
 # ---------------------------------------------------------------------------
@@ -2301,14 +2315,12 @@ class LaunchPlan:
         if self.draft_path:
             active.append("speculation via external drafter %s [experimental]"
                           % os.path.basename(self.draft_path))
-        elif self.use_spec and self.n_cpu_moe is not None:
-            # The speed tier: n-gram hits skip the MTP pass entirely
+        elif self.use_spec:
+            # Certified on both tiers: n-gram hits skip the MTP pass entirely
             # (first-success-wins), so this is a strict addition over MTP
             # alone, not a replacement.
-            active.append("speculation (n-gram + MTP n=%d drafter stack)"
+            active.append("speculation (n-gram + MTP n=%d drafter chain)"
                           % SPEC_N_MAX)
-        elif self.use_spec:
-            active.append("speculation (MTP n=%d)" % SPEC_N_MAX)
         if self.thinking_off:
             active.append("thinking off")
         if self.kv != "f16":
@@ -2394,7 +2406,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # and it is the only way to speculate on a file with no built-in head.
     draft_spec_type = None      # type: Optional[str]
     if draft is not None:
-        draft_spec_type = ("draft-mtp" if draft.has_mtp_head
+        draft_spec_type = (SPEC_TYPE if draft.has_mtp_head
                            else "draft-simple")
         notes.append("external drafter %s (%s, %s) -- speculation is "
                      "EXPERIMENTAL and uncertified; acceptance depends on the "
@@ -2412,6 +2424,17 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         notes.append("no MTP draft head in this file, so speculative decoding "
                      "is off (that is where most of revv's speed comes from); "
                      "an external drafter can supply it: --draft <file.gguf>")
+
+    # The built-in n-gram+MTP chain (see SPEC_TYPE_CHAIN in build_server_argv)
+    # runs whenever the file speculates on its own MTP head and there is no
+    # external drafter overriding it. It costs real VRAM, so that cost has to
+    # be in the budget before the context ladder picks a rung -- except for
+    # the n_cpu_moe speed tier, whose certified peak_mib already measures the
+    # chain running; counting it twice there would shrink its context for no
+    # reason.
+    chain_active = use_spec and draft is None and n_cpu_moe is None
+    chain_mib = SPEC_NGRAM_CHAIN_MIB if chain_active else 0
+
     thinking_off = info.supports_thinking
     if not thinking_off:
         notes.append("this model's chat template has no thinking switch, so "
@@ -2426,7 +2449,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     if explicit_ctx is not None:
         peak = model_peak_mib(info, ctx, str(t["kv"]))
         if peak is not None and free_mib is not None:
-            peak += draft_overhead_mib(draft, ctx, str(t["kv"]))
+            peak += draft_overhead_mib(draft, ctx, str(t["kv"])) + chain_mib
             if peak + VRAM_MARGIN_MIB > free_mib:
                 notes.append("--ctx %s needs ~%s but only %s is free; expect a "
                              "CUDA OOM" % ("{:,}".format(ctx), mib(peak),
@@ -2438,7 +2461,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                 continue
             peak = model_peak_mib(info, cand, "q8_0")
             if peak is not None:
-                peak += draft_overhead_mib(draft, cand, "q8_0")
+                peak += draft_overhead_mib(draft, cand, "q8_0") + chain_mib
             if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
                 chosen = cand
                 break
@@ -2450,7 +2473,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                     continue
                 peak = model_peak_mib(info, cand, "q4_0")
                 if peak is not None:
-                    peak += draft_overhead_mib(draft, cand, "q4_0")
+                    peak += draft_overhead_mib(draft, cand, "q4_0") + chain_mib
                 if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
                     chosen = cand
                     break
@@ -2470,7 +2493,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     else:
         f16_peak = model_peak_mib(info, ctx, "f16")
         if f16_peak is not None:
-            f16_peak += draft_overhead_mib(draft, ctx, "f16")
+            f16_peak += draft_overhead_mib(draft, ctx, "f16") + chain_mib
         if f16_peak is not None and f16_peak + VRAM_MARGIN_MIB <= free_mib:
             if kv != "f16":
                 notes.append("f16 KV fits (~%s of %s free) and is the faster "
@@ -2481,7 +2504,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             for cand in ("q8_0", "q4_0"):
                 peak = model_peak_mib(info, ctx, cand)
                 if peak is not None:
-                    peak += draft_overhead_mib(draft, ctx, cand)
+                    peak += draft_overhead_mib(draft, ctx, cand) + chain_mib
                 if peak is None or peak + VRAM_MARGIN_MIB <= free_mib:
                     kv = cand
                     break
@@ -2494,7 +2517,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
 
     peak = model_peak_mib(info, ctx, kv)
     if peak is not None:
-        peak += draft_overhead_mib(draft, ctx, kv)
+        peak += draft_overhead_mib(draft, ctx, kv) + chain_mib
         if free_mib is not None and peak + VRAM_MARGIN_MIB > free_mib:
             notes.append("WARNING estimated peak ~%s exceeds %s free once the "
                          "drafter is counted; reduce --ctx if this OOMs"
@@ -2568,17 +2591,17 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
                      # eats the entire speculation win at batch 1.
                      "--spec-draft-ngl", "99",
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
-        elif plan.use_spec and plan.n_cpu_moe is not None:
-            # The certified speed tier: stack an n-gram matcher in front of
-            # MTP. Restricted to n_cpu_moe builds because acceptance is a
-            # property of THIS build's certification, not of draft-mtp in
-            # general -- do not widen this to every MTP-head model.
-            argv += ["--spec-type", SPEC_TYPE_MOE,
+        elif plan.use_spec:
+            # The certified drafter chain: stack an n-gram matcher in front
+            # of MTP. Certified 2026-09-05 on BOTH tiers -- originally
+            # speed-tier-only, now shipped on the flagship too (2.81-6.10x on
+            # editing workloads, inert and byte-identical on plain
+            # generation). Do not widen this further than "any build that
+            # speculates through its own MTP head" without re-measuring;
+            # acceptance is a property of the specific target model.
+            argv += ["--spec-type", SPEC_TYPE_CHAIN,
                      "--spec-draft-n-max", str(SPEC_N_MAX),
                      "--spec-ngram-simple-size-m", str(SPEC_NGRAM_SIZE_M)]
-        elif plan.use_spec:
-            argv += ["--spec-type", SPEC_TYPE,
-                     "--spec-draft-n-max", str(SPEC_N_MAX)]
     argv += list(passthrough)
     return argv
 

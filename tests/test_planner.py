@@ -52,7 +52,9 @@ def test_context_checkpoints():
     with a cudaGraphInstantiate error naming neither memory nor checkpoints."""
     section("context checkpoints (-ctxcp)")
     info = certified_like()
-    base = revv.model_peak_mib(info, 16384, "q8_0")
+    # The flagship now runs the n-gram+MTP chain too, so its own ~100 MiB has
+    # to be in the boundary math or this test drifts by exactly that amount.
+    base = revv.model_peak_mib(info, 16384, "q8_0") + revv.SPEC_NGRAM_CHAIN_MIB
 
     # Boundary is exact: at the threshold we leave the default alone.
     p = revv.plan_launch(info, "12gb", 16384, base + revv.CHECKPOINT_HEADROOM_MIB)
@@ -99,10 +101,17 @@ def test_kv_and_context():
     p = revv.plan_launch(info, "12gb", None, 12287)
     check("certified on 12GB -> ctx 16384", p.ctx, 16384)
     check("certified on 12GB -> q8_0 (f16 does not fit)", p.kv, "q8_0")
-    check("certified on 12GB -> peak 11830", p.estimated_peak, 11830)
+    # 11830 (the certified, chain-less measurement) plus the chain's own
+    # ~100 MiB, which now runs on the flagship too.
+    check("certified on 12GB -> peak 11830 + chain",
+          p.estimated_peak, 11830 + revv.SPEC_NGRAM_CHAIN_MIB)
 
+    # The chain's ~100 MiB tips this scenario over what 8192 can hold, once
+    # the chain is correctly counted -- a strictly-tighter card than before,
+    # not a regression: the OOM risk was always there once the chain ships.
     p = revv.plan_launch(info, "12gb", None, 11744)
-    check("WSL2-style 11744 free -> ctx reduced to 8192", p.ctx, 8192)
+    check("WSL2-style 11744 free -> ctx reduced to 6144 (chain counted)",
+          p.ctx, 6144)
 
     p = revv.plan_launch(info, "12gb", None, 24476)
     check("24GB -> f16 KV (the faster kernel, and it fits)", p.kv, "f16")
@@ -199,6 +208,10 @@ def test_speed_tier():
     p = revv.plan_launch(info, "12gb", None, 12287)
     check("certified context survives planning", p.ctx, 16384)
     check("certified KV survives planning", p.kv, "q8_0")
+    # This build was certified WITH the n-gram chain already running (11,832
+    # MiB peak includes it), so the planner must not add SPEC_NGRAM_CHAIN_MIB
+    # a second time -- that would needlessly shrink its context.
+    check("peak is not double-counting the chain", p.estimated_peak, 11832)
     check("expert offload is applied", p.n_cpu_moe, 16)
     argv = revv.build_server_argv("/x/llama-server", info.path, p, 8080,
                                   revv.MODE_REVV, [])
@@ -215,12 +228,15 @@ def test_speed_tier():
     verdict, _ = revv.classify(info, info.path)
     check("labelled as the speed line", verdict, "CERTIFIED (speed line)")
 
-    # The flagship must be untouched by any of this.
+    # The speed tier's OWN settings (n-cpu-moe, host RAM notes) must not leak
+    # onto the flagship. Its peak now carries the chain's ~100 MiB, same as
+    # the speed tier -- that part is shared, not speed-tier-specific.
     f = certified_like()
     pf = revv.plan_launch(f, "12gb", None, 12287)
-    check("flagship still plans ctx 16384 / q8_0 / 11830 peak",
-          (pf.ctx, pf.kv, pf.estimated_peak, pf.n_cpu_moe),
-          (16384, "q8_0", 11830, None))
+    check("flagship still plans ctx 16384 / q8_0, no n_cpu_moe",
+          (pf.ctx, pf.kv, pf.n_cpu_moe), (16384, "q8_0", None))
+    check("flagship peak is 11830 + chain",
+          pf.estimated_peak, 11830 + revv.SPEC_NGRAM_CHAIN_MIB)
 
 
 def test_thread_heuristic():
@@ -256,45 +272,100 @@ def test_thread_heuristic():
 
 
 def test_speed_tier_drafter_stack():
-    """The n-gram+MTP drafter stack is a strict addition over MTP alone
-    (first-success-wins chain), certified ONLY for the n_cpu_moe speed tier
-    -- it must not leak onto the flagship, which keeps its plain draft-mtp."""
-    section("speed tier drafter stack (n-gram + MTP)")
+    """The n-gram+MTP drafter chain is a strict addition over MTP alone
+    (first-success-wins chain). Originally certified ONLY for the n_cpu_moe
+    speed tier; certified 2026-09-05 on the flagship too (2.81-6.10x on
+    editing workloads, 1.00x/inert on plain generation, byte-identical
+    output on all 4 workloads) -- it now ships on every build that
+    speculates through its own MTP head."""
+    section("drafter chain (n-gram + MTP), both tiers")
     speed = speed_like()
     p = revv.plan_launch(speed, "12gb", None, 12287)
     argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
                                   revv.MODE_REVV, [])
-    check("argv carries the n-gram+MTP chain",
+    check("speed tier argv carries the n-gram+MTP chain",
           "--spec-type" in argv and
-          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE_MOE, True)
-    check("argv carries --spec-ngram-simple-size-m 256",
+          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE_CHAIN, True)
+    check("speed tier argv carries --spec-ngram-simple-size-m 256",
           "--spec-ngram-simple-size-m" in argv and
           argv[argv.index("--spec-ngram-simple-size-m") + 1] == "256", True)
-    check("the speed tier no longer ships plain draft-mtp alone",
-          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE, False)
 
-    # The flagship is untouched: still plain draft-mtp, no n-gram flag.
+    # The flagship gets the identical chain now -- no longer speed-tier-only.
     flagship = certified_like()
     pf = revv.plan_launch(flagship, "12gb", None, 12287)
     argv_f = revv.build_server_argv("/x/llama-server", flagship.path, pf, 8080,
                                     revv.MODE_REVV, [])
-    check("flagship argv carries plain draft-mtp",
+    check("flagship argv carries the n-gram+MTP chain",
           "--spec-type" in argv_f and
-          argv_f[argv_f.index("--spec-type") + 1] == revv.SPEC_TYPE, True)
-    check("flagship argv never gets --spec-ngram-simple-size-m",
-          "--spec-ngram-simple-size-m" in argv_f, False)
+          argv_f[argv_f.index("--spec-type") + 1] == revv.SPEC_TYPE_CHAIN, True)
+    check("flagship argv carries --spec-ngram-simple-size-m 256",
+          "--spec-ngram-simple-size-m" in argv_f and
+          argv_f[argv_f.index("--spec-ngram-simple-size-m") + 1] == "256", True)
+    check("flagship no longer ships plain draft-mtp alone",
+          argv_f[argv_f.index("--spec-type") + 1] == revv.SPEC_TYPE, False)
 
-    # An external drafter still takes precedence over both built-in stacks,
-    # on either line.
+    # An external drafter still takes precedence over the built-in chain, on
+    # either line.
     drafter = revv.read_gguf(os.path.join(FIXTURES, "gemma_like.gguf"))
     drafter.file_size = 3_000_000_000
     pd = revv.plan_launch(speed, "12gb", 8192, 24476, drafter)
     argv_d = revv.build_server_argv("/x/llama-server", speed.path, pd, 8080,
                                     revv.MODE_REVV, [])
-    check("external drafter overrides the n-gram+MTP stack",
+    check("external drafter overrides the n-gram+MTP chain",
           "--spec-ngram-simple-size-m" in argv_d, False)
     check("external drafter argv carries --spec-draft-model",
           "--spec-draft-model" in argv_d, True)
+
+    pd_f = revv.plan_launch(flagship, "12gb", 8192, 24476, drafter)
+    argv_df = revv.build_server_argv("/x/llama-server", flagship.path, pd_f,
+                                     8080, revv.MODE_REVV, [])
+    check("external drafter overrides the chain on the flagship too",
+          "--spec-ngram-simple-size-m" in argv_df, False)
+
+
+def test_flagship_ngram_chain():
+    """Certified 2026-09-05: the n-gram+MTP chain, previously speed-tier
+    only, now ships on the flagship. Editing workloads 40.3 -> 222.8 / 246.0
+    / 113.3 t/s (2.81-6.10x); pure generation 35.17 -> 35.16 t/s (1.00x,
+    inert -- the matcher just misses and falls through); outputs
+    byte-identical to plain-MTP on all 4 workloads. It costs ~100 MiB of
+    VRAM (measured 11,956 vs 11,854 MiB at c=16384), so the planner has to
+    count it before sizing context: left uncounted, a 12GB card would be
+    handed ctx=16384 with only ~330 MiB of headroom once the chain is
+    actually running, below the ~400 MiB comfort line noted when this was
+    certified. The shipped ceiling is ctx=12288."""
+    section("flagship n-gram chain sizing (certified 2026-09-05)")
+    info = certified_like()
+    peak12 = revv.model_peak_mib(info, 12288, "q8_0")
+
+    # A free-VRAM reading tight enough that 16384 no longer clears the
+    # chain-inclusive margin, but loose enough that 12288 still leaves >=400
+    # MiB of headroom -- i.e. a normal 12GB card, tighter than the pristine
+    # 12,287 fixture used elsewhere in this file (which predates the chain
+    # shipping on the flagship and still has slack to spare at 16384).
+    free = peak12 + revv.SPEC_NGRAM_CHAIN_MIB + 420
+
+    p = revv.plan_launch(info, "12gb", None, free)
+    check("12GB reference: chain-aware sizing lands on 12288, not 16384",
+          p.ctx, 12288)
+    check("12GB reference: headroom stays >= 400 MiB",
+          free - p.estimated_peak >= 400, True)
+
+    argv = revv.build_server_argv("/x/llama-server", info.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("chain flags present on the flagship plan",
+          "--spec-type" in argv and
+          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE_CHAIN and
+          "--spec-ngram-simple-size-m" in argv, True)
+
+    # The speed tier's plan is unchanged: it was certified WITH the chain
+    # already running (11,832 MiB peak includes it), so it must not pay the
+    # cost a second time.
+    speed = speed_like()
+    ps = revv.plan_launch(speed, "12gb", None, 12287)
+    check("speed tier: ctx unchanged at 16384", ps.ctx, 16384)
+    check("speed tier: peak unchanged at 11832 (no double-counted chain)",
+          ps.estimated_peak, 11832)
 
 
 def test_speed_tier_is_the_mtp_build():
@@ -349,6 +420,7 @@ def main():
     test_speed_tier_is_the_mtp_build()
     test_thread_heuristic()
     test_speed_tier_drafter_stack()
+    test_flagship_ngram_chain()
     test_port_fallback()
     print("\n%s" % ("ALL PASSED" if not _failures
                     else "%d FAILED: %s" % (len(_failures), ", ".join(_failures))))

@@ -708,3 +708,50 @@ the batched verify pass — the same batch-shape nondeterminism llama.cpp
 exhibits generally. Measured quality impact: none (full HumanEval-164 A/B,
 identical per-task outcomes, p=1.0). We previously wrote "byte-identical";
 that was wrong and is corrected throughout.
+
+## Flagship n-gram chain certification (2026-09-05)
+
+Section 18 certified the n-gram+MTP drafter chain (`--spec-type
+ngram-simple,draft-mtp --spec-ngram-simple-size-m 256`) for the n_cpu_moe
+speed tier only. It now ships on the flagship too: the chain is a strict,
+first-success-wins addition over MTP alone, and nothing about the acceptance
+mechanism is specific to the MoE build — an n-gram hit still just means the
+model is about to reproduce text already visible in the prompt.
+
+**Result, 4 workloads (t/s, greedy, server-reported decode rate):**
+
+| workload | before (plain MTP) | after (chain) | speedup | output |
+|---|---:|---:|---:|---|
+| editing 1 | 40.3 | 222.8 | 5.53x | byte-identical |
+| editing 2 | 40.3 | 246.0 | 6.10x | byte-identical |
+| editing 3 | 40.3 | 113.3 | 2.81x | byte-identical |
+| pure generation | 35.17 | 35.16 | 1.00x | byte-identical |
+
+Editing workloads gain 2.81-6.10x, because the n-gram matcher gets to reuse
+text the server can already see in the prompt instead of generating it token
+by token. Pure generation is flat (1.00x, within noise) and costs nothing —
+there is nothing for the matcher to reuse, so it misses every time and falls
+straight through to MTP. All 4 workloads produced byte-identical output
+against plain-MTP: the chain changes nothing about which tokens get emitted,
+only how many of them are drafted for free. Because output did not change on
+a single byte, quality scores (HumanEval, edit-compliance) cannot have moved
+either — there is nothing to re-run.
+
+**VRAM cost and the ship point.** The chain is not free: ~100 MiB, measured
+as 11,956 MiB vs 11,854 MiB at c=16384 (otherwise-identical launches). On a
+12GB reference card (12,288 MiB free):
+
+| context | peak VRAM (chain included) | headroom |
+|---|---:|---:|
+| 16384 | 11,956 MiB | 332 MiB |
+| **12288** | **11,822 MiB** | **466 MiB** |
+| 8192 | 11,666 MiB | 622 MiB |
+
+332 MiB of headroom at c=16384 is below the ~400 MiB comfort line this
+program has otherwise held to, so the shipped ceiling for the flagship on a
+12GB card is **c=12288**, not c=16384. Decode throughput is flat across
+8K/12K/16K context on this workload, so shrinking context to buy the headroom
+back costs nothing measurable. `revv`'s planner now charges the chain's
+~100 MiB against free VRAM before sizing context (`SPEC_NGRAM_CHAIN_MIB` in
+`revv.py`) specifically so it lands here automatically instead of shipping a
+config with an unacceptably thin safety margin.
