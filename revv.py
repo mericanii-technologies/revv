@@ -48,9 +48,7 @@ def version_string() -> str:
     sha = _git_sha()
     return "revv %s (%s)" % (__version__, sha) if sha else "revv %s" % __version__
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+# --- Paths -----------------------------------------------------------------
 
 REVV_HOME = os.environ.get("REVV_HOME") or os.path.join(
     os.path.expanduser("~"), ".revv")
@@ -58,17 +56,13 @@ MODELS_DIR = os.path.join(REVV_HOME, "models")
 BIN_DIR = os.path.join(REVV_HOME, "bin")
 BUILD_MANIFEST = os.path.join(REVV_HOME, "build.json")
 
-# ---------------------------------------------------------------------------
-# The certified configuration.
+# --- The certified configuration --------------------------------------------
 #
-# Measured on: RTX 3060 12GB (sm_86, driver 535.309.01), Ryzen 5 3600, DDR4,
-# Ubuntu 24.04, headless. Protocol: thinking off, greedy, 400 new tokens,
-# 1 discarded warmup + 4 measured requests, decode rate from llama-server's
-# own timings. Do not edit without a new measurement in BENCHMARKS.md.
-#
-# The two speed figures come from two different measurement sessions and are
-# both real; revv reports whichever matches the build actually installed.
-# ---------------------------------------------------------------------------
+# RTX 3060 12GB (sm_86, driver 535.309.01), Ryzen 5 3600, Ubuntu 24.04,
+# headless. Thinking off, greedy, 400 new tokens, 1 discarded warmup + 4
+# measured requests, decode rate from llama-server's own timings. The two
+# speed figures are from two sessions and both real; revv reports whichever
+# matches the installed build. Do not edit without a new BENCHMARKS.md row.
 
 CERT_TS_PATCHED = 36.7    # kernel-patched, MTP path A/B (stock arm 35.8 same session)
 CERT_TS_STOCK = 34.39     # upstream llama.cpp, shipping row of the re-certification
@@ -78,58 +72,45 @@ CERT_PEAK_MIB = 11958     # peak DURING requests, not after load. See BENCHMARKS
                           # three configs pass a load-time check then OOM mid-request.
 CERT_ACCEPT = 0.781       # MTP draft acceptance, shipping config, novel prompt
 
-# The standing harness canary: under the corrected protocol a HumanEval task
-# averages 158.8 completion tokens. Above ~350 means the model is still
-# emitting reasoning and the thinking switch is not taking effect -- which is
-# exactly the bug that made every pre-2026-09-02 quality number wrong.
+# Harness canary: a HumanEval task averages 158.8 completion tokens, so above
+# ~350 the thinking switch is not taking effect. BENCHMARKS.md s7 -- the bug
+# that invalidated every pre-2026-09-02 quality number.
 THINK_LEAK_TOKENS = 350
 
 # The headline figure, used wherever "what revv delivers" is meant.
 CERT_TS = CERT_TS_PATCHED
 
-# What `revv bench` itself measures on the reference box.
-#
-# These are NOT the same numbers as CERT_* above and must not be compared with
-# them. The certification harness and the bench harness use different prompts,
-# which changes MTP acceptance and therefore decode rate: on one box, in one
-# session, the same dense build reads 37.86 t/s under this protocol and
-# 34.39 under the certification protocol. Bench compares your machine against
-# the figure measured with the protocol bench actually runs, otherwise every
-# result would read a few percent high.
+# What `revv bench` measures on the reference box. NOT comparable with CERT_*
+# above: the two harnesses use different prompts, which changes MTP acceptance
+# and so decode rate -- the same dense build reads 37.86 t/s here and 34.39
+# under the certification protocol, one box, one session. Bench must grade
+# against the protocol it actually runs or every result reads high.
 BENCH_REF_PATCHED = 37.86     # 27B dense + kernel patch, 3060, revv bench
 BENCH_REF_NOSPEC = 22.5       # same weights, speculation off (revv compare, STOCK)
 BENCH_PEAK_MIB = 11830        # peak during requests for the flags revv launches
 
-# v1.1 candidate: the ASCII-vocab-pruned dense build on the same merged build.
-# Faster and roomier, and byte-identical to the certified baseline on a 25-task
-# HumanEval spot-check -- but 25 tasks is not a certification, so it is not the
-# default and is not quoted as a quality result.
+# v1.1 candidate: the ASCII-vocab-pruned dense build. Faster and roomier, and
+# byte-identical to the certified baseline on a 25-task HumanEval spot-check --
+# but 25 tasks is not a certification, so it neither ships nor is quoted.
 V11_TS = 40.10
 V11_PEAK_MIB = 11502
 
-# A 12GB card has ~12044 MiB usable. The certified config peaks at 11958.
-# That is 86 MiB of headroom, so an X server or a stray process is the
-# difference between "works" and "CUDA out of memory".
+# 12,044 MiB usable against an 11,958 MiB peak is 86 MiB of headroom: an X
+# server or a stray process is the difference between working and CUDA OOM.
 VRAM_IDLE_WARN_MIB = 250
 
-# ---------------------------------------------------------------------------
-# Fitting the model to the VRAM that is actually available.
+# --- Fitting the model to the VRAM actually available ------------------------
 #
-# Total VRAM is the wrong number to plan against. Windows/WSL2 reserves roughly
-# 1-1.5 GB of a card for the desktop compositor, so a "12GB" card there offers
-# noticeably less than 12 GB to CUDA, and the certified c=16384 config OOMs on
-# hardware that a total-VRAM check waves through. revv plans against
-# nvidia-smi's memory.free instead.
+# Plan against nvidia-smi's memory.free, never total: Windows/WSL2 keeps
+# 1-1.5 GB of the card, so the certified c=16384 OOMs on hardware a
+# total-VRAM check waves through.
 #
 # Cost model:  peak(ctx, kv) = FOOTPRINT_BASE_MIB + ctx * KV_MIB_PER_TOKEN[kv]
 # FOOTPRINT_BASE_MIB is weights plus compute buffers, back-solved from the
-# measured 11,830 MiB peak at c=16384 with q8_0 KV -- the flags revv actually
-# launches, on an RTX 3060. The KV rate comes from the measured ~368 MiB per
-# 16K tokens at q4_0 (~23 KiB/token), doubled for q8_0 and again for f16.
-#
-# Corroborated by a fresh WSL2 install: this predicts 11,462 MiB at c=8192, and
-# that machine reported 12,006 MiB in use with ~544 MiB reserved by Windows.
-# ---------------------------------------------------------------------------
+# measured 11,830 MiB peak at c=16384 q8_0 on a 3060. The KV rate is the
+# measured ~368 MiB per 16K tokens at q4_0, doubled per step up.
+# Corroborated on a fresh WSL2 install: predicts 11,462 MiB at c=8192 against
+# 12,006 MiB reported in use. BENCHMARKS.md s17b.
 
 KV_MIB_PER_TOKEN = {"q4_0": 0.0225, "q8_0": 0.0449, "f16": 0.0898}
 FOOTPRINT_BASE_MIB = 11830 - 16384 * KV_MIB_PER_TOKEN["q8_0"]
@@ -146,28 +127,20 @@ VRAM_MARGIN_MIB = 250
 # BUILDS with a `peak_mib` has no estimator error to cover, because the number
 # came off this hardware with the allocator's real fragmentation already in it.
 #
-# Applying the estimator's margin to a measured peak excluded the certified
-# configuration from its own planner. An RTX 3060 12GB reports 12,288 MiB total
-# but only 12,044 MiB free -- 244 MiB is reserved by the driver and appears in
-# neither `used` nor `free`. The MoE build's measured peak is 11,832 MiB at
-# c=16384, so 11,832 + 250 = 12,082 > 12,044 and the ladder stepped down to
-# c=12288 on every 12GB card in existence, while tests/test_planner.py asserted
-# the certified 16384 against a free_mib=12287 fixture that no such card can
-# ever report.
-#
-# Certification for the 150: 11,832 MiB peak at c=16384 with -ctxcp 0, verified
-# across consecutive deep requests -- i.e. past the request-two checkpoint
-# allocation that kills configs which only pass a load-time check. Real headroom
-# 212 MiB against the 12,044 usable ceiling.
+# The wide margin on a measured peak excluded the certified config from its own
+# planner: a 3060 reports 12,288 MiB total but only 12,044 free (244 reserved
+# by the driver, in neither `used` nor `free`), and 11,832 + 250 > 12,044
+# stepped every 12GB card down to c=12288.
+# The 150 is certified: 11,832 MiB at c=16384 with -ctxcp 0, held across
+# consecutive deep requests, 212 MiB real headroom. BENCHMARKS.md s17b.
 MEASURED_PEAK_MARGIN_MIB = 150
 
 
 def has_measured_peak(info: "GGUFInfo") -> bool:
     """Is this file's peak a registry MEASUREMENT rather than an estimate?
 
-    Decides which of the two margins above applies. Mirrors the condition
-    model_peak_mib() uses to anchor on `peak_mib`, so the two never disagree
-    about which arm a given file is on.
+    Picks the margin. Mirrors model_peak_mib()'s anchoring condition, so the
+    two never disagree about which arm a file is on.
     """
     build_name = identify_build(info)
     spec = BUILDS.get(build_name) if build_name else None
@@ -178,40 +151,31 @@ def vram_margin_for(info: "GGUFInfo", chain_mib: int = 0,
                     draft: Optional["GGUFInfo"] = None) -> int:
     """Headroom to leave unclaimed for this file.
 
-    The reduced margin is for a peak that is PURELY a measurement. The moment
-    an estimated term is added on top of the measured `peak_mib` -- the n-gram
-    chain's ~100 MiB, or an external drafter's weights plus its KV -- the total
-    is part measurement, part estimate, and that estimate is exactly what the
-    250 MiB exists to cover. So a mixed sum falls back to the wide margin.
+    The narrow margin is only for a peak that is PURELY a measurement. Add an
+    estimated term -- the chain's ~100 MiB, or a drafter's weights plus KV --
+    and the sum is part estimate, which is what the 250 exists to cover.
 
-    This is not hypothetical. The dense build's measured peak is 11,830 MiB,
-    and with the chain running the planner charges it 11,930. Granting that sum
-    the narrow margin would let it take c=16384 with as little as 150 MiB
-    of headroom on a card reporting ~12,080 MiB free, undoing the chain-aware
-    step-down to c=12288 that was certified on 2026-09-05 for exactly this
-    reason. The MoE build is unaffected: its 11,832 MiB was measured WITH the
-    chain already running, so chain_mib is 0 there and its peak stays purely
-    measured.
+    Not hypothetical: the dense build measures 11,830 MiB and the planner
+    charges it 11,930 with the chain. The narrow margin there would let it
+    take c=16384 on ~12,080 MiB free, undoing the chain-aware step-down
+    certified 2026-09-05. The MoE build's 11,832 was measured WITH the chain,
+    so chain_mib is 0 there and its peak stays purely measured.
     """
     if has_measured_peak(info) and chain_mib == 0 and draft is None:
         return MEASURED_PEAK_MARGIN_MIB
     return VRAM_MARGIN_MIB
 
 
-# llama-server keeps up to 32 context checkpoints PER SLOT by default
-# (upstream PR #15293), and on this model each one is ~150 MiB. They are
-# allocated lazily, so the first one lands during the SECOND request -- after
-# the health check has already passed. The server therefore starts fine, serves
-# one request, and dies on the next with a cudaGraphInstantiate error that
-# names neither memory nor checkpoints. Any config running close to the ceiling
-# must turn them off. Measured: configs near the ceiling "required -ctxcp 0 to
-# survive at all".
+# llama-server keeps up to 32 context checkpoints PER SLOT (upstream PR
+# #15293), ~150 MiB each here, allocated lazily -- so the first lands during
+# the SECOND request, after the health check passed. Near the ceiling the
+# server starts, serves one request, and dies with a cudaGraphInstantiate
+# error naming neither memory nor checkpoints. BENCHMARKS.md s17.
 #
-# INTERACTION, for whoever wires up session save/restore later: the restore
-# patch depends on these checkpoints (its measured run used -ctxcp 8), so a
-# config that disables them cannot also offer restore. No conflict today
-# because revv v1.0 does not expose save/restore, but the two features are
-# mutually exclusive at the VRAM ceiling and something has to give.
+# INTERACTION: the session-restore patch depends on these checkpoints (its
+# measured run used -ctxcp 8), so a config that disables them cannot offer
+# restore. Moot while v1.0 does not expose save/restore, but the two are
+# mutually exclusive at the ceiling.
 CHECKPOINT_MIB_EACH = 150
 CHECKPOINT_HEADROOM_MIB = 500
 
@@ -219,10 +183,9 @@ CHECKPOINT_HEADROOM_MIB = 500
 def host_ram_mib() -> Tuple[Optional[int], Optional[int]]:
     """(total, available) host RAM in MiB, or (None, None) if unknown.
 
-    A new dimension for MoE tiers: --n-cpu-moe streams expert weights from host
-    RAM, so a config can fit VRAM perfectly and still thrash or get OOM-killed
-    on a machine with too little RAM. MemAvailable is the right field -- it
-    accounts for reclaimable page cache, which MemFree does not.
+    --n-cpu-moe streams expert weights from host RAM, so a config can fit VRAM
+    perfectly and still thrash or be OOM-killed. MemAvailable, not MemFree: it
+    counts reclaimable page cache.
     """
     try:
         with open("/proc/meminfo", "r") as fh:
@@ -250,15 +213,15 @@ def host_ram_mib() -> Tuple[Optional[int], Optional[int]]:
 def physical_core_count() -> int:
     """Physical (not logical/hyperthreaded) core count, clamped to [4, 8].
 
-    Measured on a 3060 + Ryzen 3600 (6 physical / 12 logical): -t 8 is +14.4%
-    over the server's default thread count, but the full logical count (12)
-    LOSES 5-15% -- llama.cpp oversubscribes the physical cores on a
-    bandwidth-bound decode, and SMT siblings just fight over the same memory
-    bus. Output was verified bit-identical across -t 3..12, so this is a pure
-    speed lever with no quality risk. /proc/cpuinfo's unique (physical id,
-    core id) pairs is the one field that survives SMT; os.cpu_count() // 2 is
-    the fallback when /proc is unavailable (e.g. macOS dev boxes), and 6 --
-    the value this was measured on -- is the last resort.
+    On a 3060 + Ryzen 3600 (6 physical / 12 logical), -t 8 is +14.4% over the
+    server default while the full logical count LOSES 5-15%: SMT siblings
+    fight over the same memory bus on a bandwidth-bound decode. Output is
+    bit-identical across -t 3..12, so this is a pure speed lever.
+    BENCHMARKS.md s18, EXPERIMENTS.md s4.
+
+    /proc/cpuinfo's unique (physical id, core id) pairs is the one field that
+    survives SMT; os.cpu_count() // 2 is the fallback off Linux, and 6 -- the
+    value this was measured on -- is the last resort.
     """
     try:
         pairs = set()
@@ -291,9 +254,8 @@ def plan_context(free_mib: int, kv: str, preferred_ctx: int
                  ) -> Optional[Tuple[int, int]]:
     """Largest ladder context <= preferred that fits, with margin.
 
-    None means even the smallest rung does not fit, i.e. this card cannot run
-    the model. Saying so up front is kinder than a CUDA OOM three minutes into
-    loading weights.
+    None means not even the smallest rung fits: this card cannot run the
+    model. Saying so up front beats a CUDA OOM three minutes into the load.
     """
     for ctx in CONTEXT_LADDER:
         if ctx > preferred_ctx:
@@ -333,11 +295,10 @@ def identify_build(info: "GGUFInfo") -> Optional[str]:
 def is_certified_file(info: "GGUFInfo") -> bool:
     """Is this the exact file the measured numbers came from?
 
-    Matched on size as well as name, because `revv adopt` registers ollama
-    blobs whose filename is a content hash. Name-only matching silently
-    demoted the certified model to the geometric KV estimate, which
-    over-estimates threefold on this hybrid architecture and cost the user
-    two-thirds of their context for no reason.
+    Size as well as name, because `revv adopt` registers ollama blobs whose
+    filename is a content hash. Name-only matching demoted the certified model
+    to the geometric KV estimate, which over-estimates threefold on this
+    hybrid architecture and cost two-thirds of the context.
     """
     if info.file_size == BUILDS[DEFAULT_BUILD]["size"]:
         return True
@@ -347,11 +308,10 @@ def is_certified_file(info: "GGUFInfo") -> bool:
 def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
     """KV cache cost per token, or None if the header does not say enough.
 
-    The certified model gets its MEASURED rate. Everything else is estimated
-    from attention geometry, which is exact for dense models and conservative
-    (an over-estimate) for hybrids like the certified one, where most layers
-    carry no KV at all. Over-estimating is the safe direction: it makes revv
-    reach for a smaller context rather than OOM.
+    The certified model gets its MEASURED rate; everything else is estimated
+    from attention geometry -- exact for dense models, an over-estimate for
+    hybrids where most layers carry no KV. Over-estimating is the safe
+    direction: a smaller context rather than an OOM.
     """
     if identify_build(info) == DEFAULT_BUILD:
         return KV_MIB_PER_TOKEN.get(kv)
@@ -365,13 +325,11 @@ def kv_mib_per_token(info: "GGUFInfo", kv: str) -> Optional[float]:
 def model_peak_mib(info: "GGUFInfo", ctx: int, kv: str) -> Optional[int]:
     """Estimated peak VRAM, anchored on a measurement when we have one.
 
-    The file-size term is only valid when the whole model is resident. A
-    mixture-of-experts build launched with --n-cpu-moe keeps most of its
-    weights in HOST RAM, so counting the file size as VRAM over-estimates it by
-    gigabytes -- enough to collapse the context to a quarter of the certified
-    value. For any build we have actually measured, anchor on that number and
-    move only the KV term, which is the part that genuinely scales with
-    context.
+    The file-size term only holds when the whole model is resident. An MoE
+    build launched with --n-cpu-moe keeps most weights in HOST RAM, so
+    charging the file size to VRAM over-estimates by gigabytes -- enough to
+    collapse the context to a quarter of the certified value. Where we have a
+    measurement, anchor on it and move only the KV term.
     """
     rate = kv_mib_per_token(info, kv)
     if rate is None:
@@ -412,11 +370,10 @@ HF_REPO = "unsloth/Qwen3.8-27B-GGUF"
 HF_REPO_35B = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 
 # Two certified lines, named for what they are. DENSE is the 27B dense model;
-# MOE is a 35B mixture-of-experts model whose experts stream from host RAM,
-# which is why it is faster despite being a bigger file: only ~3B parameters
-# are active per token. The old names (flagship / speed) survive as aliases,
-# but they were inverted: on our multi-file editing instrument the MoE build
-# scored 9/34 first-attempt against the dense build's 4/34 (p=0.039).
+# MOE is a 35B mixture-of-experts model whose experts stream from host RAM --
+# faster despite the bigger file since only ~3B params are active per token.
+# The old names (flagship / speed) survive as aliases but were inverted: on
+# our multi-file editing instrument MoE scored 9/34 vs dense's 4/34 (p=0.039).
 #
 # Sizes are exact bytes from the HuggingFace API. They are the download's
 # integrity check: a truncated or CDN-mangled file is caught before it ever
@@ -438,34 +395,28 @@ BUILDS: Dict[str, Dict[str, object]] = {
     "Q3_K_XL_35B": {
         "file": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         "repo": HF_REPO_35B,
-        # The MTP repo, NOT the plain one. Both publish a file with this exact
-        # name; the plain repo's build (16,845,511,648 bytes, 733 tensors, 40
-        # layers) has NO draft head, so speculation silently would not run and
-        # the 55.9 t/s figure would not be reachable. Verified by parsing both
-        # headers over a ranged HTTP fetch: this one has 41 layers, 753
-        # tensors, and blk.40.nextn.*.
+        # MTP repo, not the plain one: the plain repo's same-named file
+        # (16,845,511,648 bytes, 733 tensors, 40 layers) has no draft head, so
+        # speculation would silently not run. This one has 41 layers, 753
+        # tensors, blk.40.nextn.* -- verified via a ranged HTTP header fetch.
         "size": 17227569440,
         "line": "moe",
         "certified": True,
         "humaneval": 92.68,
-        # 55.9 t/s: certified 2026-09 with three flag changes over the
-        # original 48.5 t/s baseline -- -t 8 (CPU-MoE thread heuristic) and
-        # an n-gram+MTP drafter stack (ngram-simple,draft-mtp). Quality
-        # re-verified unchanged: HE-164 153/164 vs 152/164 (p=1.0),
-        # edit-compliance 34/34 vs 33/34 (p=1.0). See BENCHMARKS.md.
+        # 55.9 t/s: certified 2026-09, up from a 48.5 t/s baseline via -t 8
+        # (CPU-MoE thread heuristic) and an n-gram+MTP drafter stack. Quality
+        # re-verified: HE-164 153/164 vs 152/164, edit-compliance 34/34 vs
+        # 33/34 (both p=1.0). BENCHMARKS.md.
         "decode_ts": 55.9,
         "peak_mib": 11832,
         # MoE: experts live in host RAM and stream in, so this line has a
         # second requirement the dense build does not have.
         "n_cpu_moe": 16,
         "host_ram_mib": 8192,
-        # What STOCK means for THIS build. `-ngl 99` is not a stock config
-        # here, it is an impossible one: without --n-cpu-moe, all 41 layers
-        # go to VRAM and llama-server dies asking for 15,499 MiB on a 12 GiB
-        # card. A user meeting this model with llama.cpp defaults would lower
-        # -ngl until it fit, and this is that config -- the certified nominal
-        # baseline B2, measured at 22.17 t/s, which is exactly the comparator
-        # behind the published "2.52x stock".
+        # STOCK for this build: `-ngl 99` is impossible here (all 41 layers to
+        # VRAM needs 15,499 MiB on a 12 GiB card), so STOCK is the nominal
+        # baseline B2 a user would reach by lowering -ngl until it fit --
+        # measured 22.17 t/s, the comparator behind "2.52x stock".
         "stock": {
             "n_gpu_layers": 30,
             "ctx": 16384,
@@ -593,37 +544,28 @@ TIER_ORDER = ["24gb", "16gb", "12gb"]  # highest first, for detection
 SPEC_TYPE = "draft-mtp"
 SPEC_N_MAX = 2
 
-# The n-gram+MTP drafter chain. Originally shipped on the MoE build only,
-# then certified on the dense build too (2026-09-05): editing workloads 40.3 ->
-# 222.8 / 246.0 / 113.3 t/s (2.81-6.10x), pure generation 35.17 -> 35.16 t/s
-# (1.00x, inert -- the model isn't reusing anything there, so the n-gram
-# matcher just misses and falls through), outputs byte-identical to
-# plain-MTP on all 4 workloads. It now applies to EVERY build that
-# speculates through its own MTP head, not just the n_cpu_moe (host-RAM
-# offload) build -- see build_server_argv. llama.cpp runs speculation chains
-# first-success-wins: an n-gram hit skips the MTP pass for that token, so
-# this is a strict addition over MTP alone, not a substitute for it.
-# size-m=256 was verified byte-identical to MTP-only output; see
-# BENCHMARKS.md for the size-m sweep (rising through 256, so this is a
-# floor, not a ceiling) and the CRLF warning (0.83 -> 0.11 acceptance on
-# CRLF text; keep repos LF).
+# n-gram+MTP drafter chain: shipped on the MoE build, then certified on dense
+# too (2026-09-05). Editing workloads 40.3 -> 222.8/246.0/113.3 t/s
+# (2.81-6.10x); generation 35.17 -> 35.16 t/s (1.00x, inert: nothing to reuse,
+# so the n-gram matcher just misses), byte-identical to plain-MTP on all 4
+# workloads. Applies to any build speculating through its own MTP head (see
+# build_server_argv); llama.cpp runs chains first-success-wins, so an n-gram
+# hit skips MTP for that token -- an addition to MTP, not a substitute.
+# size-m=256 verified byte-identical to MTP-only; BENCHMARKS.md has the sweep
+# (256 is a floor) and the CRLF warning (0.83 -> 0.11 acceptance; keep repos LF).
 SPEC_TYPE_CHAIN = "ngram-simple,draft-mtp"
 SPEC_NGRAM_SIZE_M = 256
 
-# The chain's own VRAM cost. Small but real, and it has to be counted before
-# the context ladder picks a rung or a "certified" config can OOM once the
-# chain is actually running. Measured on the dense build: 11,956 MiB vs
-# 11,854 MiB at c=16384, both otherwise-identical launches -- a delta of
-# ~100 MiB. Only added for builds whose registered peak_mib does NOT already
-# bake the chain in: the n_cpu_moe MoE build was certified WITH the chain
-# from the start (11,832 MiB peak already includes it), so adding this again
-# there would double-count it and needlessly shrink its context.
+# Chain's own VRAM cost, counted before the context ladder picks a rung.
+# Measured on the dense build: 11,956 MiB vs 11,854 MiB at c=16384 (~100 MiB
+# delta). Skipped for builds whose registered peak_mib already bakes it in --
+# the n_cpu_moe MoE build was certified WITH the chain (11,832 MiB peak
+# already includes it), so adding it again would double-count and shrink
+# its context for no reason.
 SPEC_NGRAM_CHAIN_MIB = 100
 
 
-# ---------------------------------------------------------------------------
-# Terminal output
-# ---------------------------------------------------------------------------
+# --- Terminal output -------------------------------------------------------
 
 def _use_color() -> bool:
     return (sys.stdout.isatty()
@@ -692,9 +634,7 @@ def mib(n: int) -> str:
     return "{:,} MiB".format(n)
 
 
-# ---------------------------------------------------------------------------
-# GGUF header reader   [spliced: gguf unit]
-# ---------------------------------------------------------------------------
+# --- GGUF header reader   [spliced: gguf unit] -----------------------------
 
 GGUF_MAGIC = 0x46554747  # b"GGUF" read as a little-endian u32
 SUPPORTED_VERSIONS = (2, 3)
@@ -814,14 +754,6 @@ BLOCK_SIZES: Dict[str, Tuple[int, int]] = {
 class GGUFError(Exception):
     """Raised for anything wrong with a GGUF file: bad magic, unsupported
     version, truncation, or an unknown value/array-element type id."""
-
-
-@dataclasses.dataclass
-class TensorInfo:
-    name: str
-    dims: Tuple[int, ...]
-    type_name: str
-    n_bytes: Optional[int]
 
 
 @dataclasses.dataclass
@@ -969,18 +901,13 @@ def _read_value(r: _Reader, value_type: int) -> Any:
 
 def _is_mtp_tensor(name: str) -> bool:
     """MTP / multi-token-prediction draft-head tensors, e.g.
-    'blk.64.nextn.embed_tokens.weight'. Case-insensitive."""
-    lower = name.lower()
-    if lower.split(".").count("nextn") > 0:
-        # covers ".nextn." and a leading/trailing "nextn" component too,
-        # but we still check the explicit prefix case below for names
-        # with no dot separator at all (just "nextn").
-        return True
-    if ".nextn." in lower:
-        return True
-    if lower.startswith("nextn."):
-        return True
-    return lower == "nextn"
+    'blk.64.nextn.embed_tokens.weight'. Case-insensitive.
+
+    "nextn" as a whole dot-separated component, which covers the leading,
+    trailing and bare spellings alike -- and does not match a name that
+    merely contains the substring.
+    """
+    return "nextn" in name.lower().split(".")
 
 
 def read_gguf(path: str) -> GGUFInfo:
@@ -1012,7 +939,7 @@ def read_gguf(path: str) -> GGUFInfo:
             value_type = _read_u32(r)
             kv[key] = _read_value(r, value_type)
 
-        tensor_infos: List[TensorInfo] = []
+        tensor_data_bytes = 0
         type_counts: Dict[str, int] = {}
         type_bytes: Dict[str, int] = {}
         mtp_tensors: List[str] = []
@@ -1033,11 +960,10 @@ def read_gguf(path: str) -> GGUFInfo:
             else:
                 n_bytes = None
 
-            tensor_infos.append(TensorInfo(name=name, dims=dims, type_name=type_name, n_bytes=n_bytes))
-
             type_counts[type_name] = type_counts.get(type_name, 0) + 1
             if n_bytes is not None:
                 type_bytes[type_name] = type_bytes.get(type_name, 0) + n_bytes
+                tensor_data_bytes += n_bytes
 
             if _is_mtp_tensor(name):
                 mtp_tensors.append(name)
@@ -1115,8 +1041,6 @@ def read_gguf(path: str) -> GGUFInfo:
         else:
             dominant_quant = ""
 
-        tensor_data_bytes = sum(t.n_bytes for t in tensor_infos if t.n_bytes is not None)
-
         return GGUFInfo(
             path=path,
             file_size=file_size,
@@ -1143,9 +1067,7 @@ def read_gguf(path: str) -> GGUFInfo:
         )
 
 
-# ---------------------------------------------------------------------------
-# Resumable downloader   [spliced: download unit]
-# ---------------------------------------------------------------------------
+# --- Resumable downloader   [spliced: download unit] -----------------------
 
 USER_AGENT = "revv/1.0"
 CHUNK_SIZE = 1024 * 1024  # 1 MiB, per spec
@@ -1454,9 +1376,7 @@ def download(
 
 
 
-# ---------------------------------------------------------------------------
-# GPU detection
-# ---------------------------------------------------------------------------
+# --- GPU detection ---------------------------------------------------------
 
 class GPU:
     def __init__(self, name: str, total_mib: int, used_mib: int,
@@ -1524,9 +1444,7 @@ def tier_for(free_mib: int) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# llama-server discovery
-# ---------------------------------------------------------------------------
+# --- llama-server discovery ------------------------------------------------
 
 def find_llama_server() -> Optional[str]:
     """revv's own build wins over whatever is on PATH: we know its provenance."""
@@ -1575,9 +1493,7 @@ def read_build_manifest() -> Optional[Dict[str, object]]:
     return data if isinstance(data, dict) else None
 
 
-# ---------------------------------------------------------------------------
-# Local model inventory
-# ---------------------------------------------------------------------------
+# --- Local model inventory -------------------------------------------------
 
 def local_models() -> List[str]:
     if not os.path.isdir(MODELS_DIR):
@@ -1644,9 +1560,7 @@ def resolve_model(arg: Optional[str]) -> str:
     return ""   # unreachable
 
 
-# ---------------------------------------------------------------------------
-# doctor
-# ---------------------------------------------------------------------------
+# --- doctor ----------------------------------------------------------------
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     print(bold("revv %s  --  doctor" % __version__))
@@ -1806,9 +1720,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1
 
 
-# ---------------------------------------------------------------------------
-# inspect
-# ---------------------------------------------------------------------------
+# --- inspect ---------------------------------------------------------------
 
 def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
     """Return (verdict line, explanation).
@@ -1930,13 +1842,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# adopt: reuse GGUFs already downloaded by ollama or LM Studio
-# ---------------------------------------------------------------------------
+# --- adopt: reuse GGUFs already downloaded by ollama or LM Studio ----------
 
-# ---------------------------------------------------------------------------
-# Found record
-# ---------------------------------------------------------------------------
+# --- Found record ----------------------------------------------------------
 
 @dataclasses.dataclass
 class Found:
@@ -2050,9 +1958,7 @@ def scan_ollama(root: Optional[str] = None) -> List[Found]:
     return found
 
 
-# ---------------------------------------------------------------------------
-# LM Studio discovery
-# ---------------------------------------------------------------------------
+# --- LM Studio discovery ---------------------------------------------------
 
 _LMSTUDIO_MAX_DEPTH = 6
 _MIN_GGUF_BYTES = 1024 * 1024  # below this, LM Studio left a partial download
@@ -2111,9 +2017,7 @@ def scan_lmstudio(roots: Optional[List[str]] = None) -> List[Found]:
     return found
 
 
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
+# --- Registry --------------------------------------------------------------
 
 def registry_path() -> str:
     return os.path.join(REVV_HOME, "registry.json")
@@ -2161,9 +2065,7 @@ def registry_lookup(name: str) -> Optional[str]:
     return path
 
 
-# ---------------------------------------------------------------------------
-# adopt
-# ---------------------------------------------------------------------------
+# --- adopt -----------------------------------------------------------------
 
 def _slugify(label: str) -> str:
     """"qwen3:latest" -> "qwen3-latest"; runs of non-alphanumerics collapse
@@ -2272,9 +2174,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# get
-# ---------------------------------------------------------------------------
+# --- get -------------------------------------------------------------------
 
 def hf_url(filename: str, repo: Optional[str] = None) -> str:
     return "https://huggingface.co/%s/resolve/main/%s?download=true" % (
@@ -2428,13 +2328,11 @@ def mode_description(mode: str, plan: Optional["LaunchPlan"]) -> str:
 class LaunchPlan:
     """What revv will actually do to this model, and why.
 
-    revv's flag set was certified on one model. Applied blindly to a different
-    one it can be a net LOSS: a field report measured a Gemma-4-12B running
-    2.5% SLOWER in revv mode than stock, because none of the levers applied --
-    no draft head so no speculation, no thinking switch to disable, and
-    quantized KV, which is a compute tax that only pays for itself when VRAM is
-    tight. A 7 GB model on a 12 GB card is not tight. So each lever is decided
-    per model rather than assumed.
+    revv's flags were certified on one model; applied blindly elsewhere they
+    can be a net loss -- a field report measured a Gemma-4-12B running 2.5%
+    SLOWER in revv mode than stock (no draft head, no thinking switch, and
+    quantized KV paying a compute tax with no capacity benefit on a 7 GB
+    model on a 12 GB card). Each lever is decided per model, not assumed.
     """
 
     def __init__(self, ctx: int, kv: str, use_spec: bool, thinking_off: bool,
@@ -2550,12 +2448,10 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             notes.append("host RAM ok: %s available, ~%s needed"
                          % (mib(avail_ram), mib(need_ram)))
 
-    # CPU-MoE offload makes host RAM bandwidth the bottleneck for every
-    # token, and -t controls how many threads compete for it. Measured on a
-    # 3060 + Ryzen 3600: -t 8 is +14.4% over the server default, while the
-    # full logical count loses 5-15% to oversubscription. Only relevant when
-    # experts are actually on the CPU -- a GPU-resident build has no such
-    # bottleneck.
+    # CPU-MoE offload makes host RAM bandwidth the bottleneck, and -t controls
+    # how many threads compete for it; see physical_core_count() for the
+    # measured -t 8 vs. full-logical-count numbers. Only relevant when experts
+    # are actually on the CPU.
     n_threads = None    # type: Optional[int]
     if n_cpu_moe:
         n_threads = physical_core_count()
@@ -2602,6 +2498,19 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # and the drafter, which are the estimated terms. See vram_margin_for().
     margin = vram_margin_for(info, chain_mib, draft)
 
+    def total_peak(at_ctx: int, at_kv: str) -> Optional[int]:
+        """Everything that has to fit: the model, the drafter, the chain."""
+        base = model_peak_mib(info, at_ctx, at_kv)
+        if base is None:
+            return None
+        return base + draft_overhead_mib(draft, at_ctx, at_kv) + chain_mib
+
+    def fits(peak: Optional[int]) -> bool:
+        # An unknown peak, or an unknown free figure, counts as fitting: the
+        # estimator could not read this header, and refusing to serve on that
+        # basis would be worse than trying.
+        return free_mib is None or peak is None or peak + margin <= free_mib
+
     thinking_off = info.supports_thinking
     if not thinking_off:
         notes.append("this model's chat template has no thinking switch, so "
@@ -2614,36 +2523,24 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # OOM.
     ctx = preferred
     if explicit_ctx is not None:
-        peak = model_peak_mib(info, ctx, str(t["kv"]))
+        peak = total_peak(ctx, str(t["kv"]))
         if peak is not None and free_mib is not None:
-            peak += draft_overhead_mib(draft, ctx, str(t["kv"])) + chain_mib
             if peak + margin > free_mib:
                 notes.append("--ctx %s needs ~%s but only %s is free; expect a "
                              "CUDA OOM" % ("{:,}".format(ctx), mib(peak),
                                            mib(free_mib)))
     elif free_mib is not None:
-        chosen = None
-        for cand in CONTEXT_LADDER:
-            if cand > preferred:
-                continue
-            peak = model_peak_mib(info, cand, "q8_0")
-            if peak is not None:
-                peak += draft_overhead_mib(draft, cand, "q8_0") + chain_mib
-            if peak is None or peak + margin <= free_mib:
-                chosen = cand
-                break
+        def first_fitting_rung(at_kv: str) -> Optional[int]:
+            for cand in CONTEXT_LADDER:
+                if cand <= preferred and fits(total_peak(cand, at_kv)):
+                    return cand
+            return None
+
+        chosen = first_fitting_rung("q8_0")
         if chosen is None:
             # Nothing fits at q8_0. Retry at q4_0 before giving up context:
             # halving the cache is cheaper than an eighth of the context.
-            for cand in CONTEXT_LADDER:
-                if cand > preferred:
-                    continue
-                peak = model_peak_mib(info, cand, "q4_0")
-                if peak is not None:
-                    peak += draft_overhead_mib(draft, cand, "q4_0") + chain_mib
-                if peak is None or peak + margin <= free_mib:
-                    chosen = cand
-                    break
+            chosen = first_fitting_rung("q4_0")
         if chosen is None:
             chosen = CONTEXT_LADDER[-1]
         if chosen != preferred:
@@ -2658,9 +2555,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     if free_mib is None:
         pass                            # tier was forced; keep its setting
     else:
-        f16_peak = model_peak_mib(info, ctx, "f16")
-        if f16_peak is not None:
-            f16_peak += draft_overhead_mib(draft, ctx, "f16") + chain_mib
+        f16_peak = total_peak(ctx, "f16")
         if f16_peak is not None and f16_peak + margin <= free_mib:
             if kv != "f16":
                 notes.append("f16 KV fits (~%s of %s free) and is the faster "
@@ -2669,10 +2564,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             kv = "f16"
         else:
             for cand in ("q8_0", "q4_0"):
-                peak = model_peak_mib(info, ctx, cand)
-                if peak is not None:
-                    peak += draft_overhead_mib(draft, ctx, cand) + chain_mib
-                if peak is None or peak + margin <= free_mib:
+                if fits(total_peak(ctx, cand)):
                     kv = cand
                     break
             else:
@@ -2682,9 +2574,8 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                              "cache is %s to fit"
                              % (mib(f16_peak), mib(free_mib), kv))
 
-    peak = model_peak_mib(info, ctx, kv)
+    peak = total_peak(ctx, kv)
     if peak is not None:
-        peak += draft_overhead_mib(draft, ctx, kv) + chain_mib
         if free_mib is not None and peak + margin > free_mib:
             # Two distinct situations, and saying "exceeds" for both is simply
             # false: peak can be UNDER free and still trip this, because the
@@ -2708,15 +2599,12 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # the second request. Turn them off before that can happen.
     ctx_checkpoints = None      # type: Optional[int]
     if free_mib is None:
-        # Tier forced with --tier, so there is no VRAM reading and the ladder
-        # never ran: ctx is whatever the tier declares, which on the 12GB tier
-        # is 16384 -- the rung a real 12GB card cannot hold. Headroom here is
-        # not "large", it is UNKNOWN, and the failure mode of guessing wrong is
-        # the nasty one: the server passes its health check, serves one
-        # request, and dies on the next with a cudaGraphInstantiate error that
-        # names neither memory nor checkpoints. Disabling checkpoints costs
-        # ~2.7% on short prompts and gains at depth, so it is the cheap side of
-        # the bet. Always take it when we are flying blind.
+        # Tier forced with --tier: no VRAM reading, so ctx is the tier's
+        # declared value (16384 on the 12GB tier -- more than a real 12GB
+        # card holds). Headroom is UNKNOWN, not large, and guessing wrong
+        # fails at the ceiling (see CHECKPOINT_MIB_EACH). Disabling costs
+        # ~2.7% on short prompts and gains at depth -- cheap side of the bet
+        # when flying blind.
         ctx_checkpoints = 0
         notes.append("WARNING --tier was given, so revv did NOT read free "
                      "VRAM: the context above is the tier's declared %s, not a "
@@ -3474,9 +3362,7 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# toggle
-# ---------------------------------------------------------------------------
+# --- toggle ----------------------------------------------------------------
 
 def _control(url: str, action: str, payload: Optional[Dict[str, object]] = None,
              timeout: float = 900.0) -> Dict[str, object]:
@@ -4400,9 +4286,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# Self-update / uninstall
-# ---------------------------------------------------------------------------
+# --- Self-update / uninstall -----------------------------------------------
 
 def _run_git(git_args: List[str], cwd: str) -> "subprocess.CompletedProcess":
     return subprocess.run(["git"] + git_args, cwd=cwd, capture_output=True,
@@ -4692,9 +4576,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# --- CLI -------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
