@@ -92,15 +92,15 @@ CERT_TS = CERT_TS_PATCHED
 # These are NOT the same numbers as CERT_* above and must not be compared with
 # them. The certification harness and the bench harness use different prompts,
 # which changes MTP acceptance and therefore decode rate: on one box, in one
-# session, the same flagship build reads 37.86 t/s under this protocol and
+# session, the same dense build reads 37.86 t/s under this protocol and
 # 34.39 under the certification protocol. Bench compares your machine against
 # the figure measured with the protocol bench actually runs, otherwise every
 # result would read a few percent high.
-BENCH_REF_PATCHED = 37.86     # flagship + kernel patch, RTX 3060, revv bench
+BENCH_REF_PATCHED = 37.86     # 27B dense + kernel patch, 3060, revv bench
 BENCH_REF_NOSPEC = 22.5       # same weights, speculation off (revv compare, STOCK)
 BENCH_PEAK_MIB = 11830        # peak during requests for the flags revv launches
 
-# v1.1 candidate: the ASCII-vocab-pruned flagship on the same merged build.
+# v1.1 candidate: the ASCII-vocab-pruned dense build on the same merged build.
 # Faster and roomier, and byte-identical to the certified baseline on a 25-task
 # HumanEval spot-check -- but 25 tasks is not a certification, so it is not the
 # default and is not quoted as a quality result.
@@ -149,7 +149,7 @@ VRAM_MARGIN_MIB = 250
 # Applying the estimator's margin to a measured peak excluded the certified
 # configuration from its own planner. An RTX 3060 12GB reports 12,288 MiB total
 # but only 12,044 MiB free -- 244 MiB is reserved by the driver and appears in
-# neither `used` nor `free`. The speed tier's measured peak is 11,832 MiB at
+# neither `used` nor `free`. The MoE build's measured peak is 11,832 MiB at
 # c=16384, so 11,832 + 250 = 12,082 > 12,044 and the ladder stepped down to
 # c=12288 on every 12GB card in existence, while tests/test_planner.py asserted
 # the certified 16384 against a free_mib=12287 fixture that no such card can
@@ -184,12 +184,12 @@ def vram_margin_for(info: "GGUFInfo", chain_mib: int = 0,
     is part measurement, part estimate, and that estimate is exactly what the
     250 MiB exists to cover. So a mixed sum falls back to the wide margin.
 
-    This is not hypothetical. The flagship's measured peak is 11,830 MiB, and
-    with the chain running the planner charges it 11,930. Granting that sum the
-    narrow margin would let the flagship take c=16384 with as little as 150 MiB
+    This is not hypothetical. The dense build's measured peak is 11,830 MiB,
+    and with the chain running the planner charges it 11,930. Granting that sum
+    the narrow margin would let it take c=16384 with as little as 150 MiB
     of headroom on a card reporting ~12,080 MiB free, undoing the chain-aware
     step-down to c=12288 that was certified on 2026-09-05 for exactly this
-    reason. The speed tier is unaffected: its 11,832 MiB was measured WITH the
+    reason. The MoE build is unaffected: its 11,832 MiB was measured WITH the
     chain already running, so chain_mib is 0 there and its peak stays purely
     measured.
     """
@@ -580,14 +580,14 @@ TIER_ORDER = ["24gb", "16gb", "12gb"]  # highest first, for detection
 SPEC_TYPE = "draft-mtp"
 SPEC_N_MAX = 2
 
-# The n-gram+MTP drafter chain. Originally shipped speed-tier-only, then
-# certified on the flagship too (2026-09-05): editing workloads 40.3 ->
+# The n-gram+MTP drafter chain. Originally shipped on the MoE build only,
+# then certified on the dense build too (2026-09-05): editing workloads 40.3 ->
 # 222.8 / 246.0 / 113.3 t/s (2.81-6.10x), pure generation 35.17 -> 35.16 t/s
 # (1.00x, inert -- the model isn't reusing anything there, so the n-gram
 # matcher just misses and falls through), outputs byte-identical to
 # plain-MTP on all 4 workloads. It now applies to EVERY build that
 # speculates through its own MTP head, not just the n_cpu_moe (host-RAM
-# offload) tier -- see build_server_argv. llama.cpp runs speculation chains
+# offload) build -- see build_server_argv. llama.cpp runs speculation chains
 # first-success-wins: an n-gram hit skips the MTP pass for that token, so
 # this is a strict addition over MTP alone, not a substitute for it.
 # size-m=256 was verified byte-identical to MTP-only output; see
@@ -599,10 +599,10 @@ SPEC_NGRAM_SIZE_M = 256
 
 # The chain's own VRAM cost. Small but real, and it has to be counted before
 # the context ladder picks a rung or a "certified" config can OOM once the
-# chain is actually running. Measured on the flagship: 11,956 MiB vs
+# chain is actually running. Measured on the dense build: 11,956 MiB vs
 # 11,854 MiB at c=16384, both otherwise-identical launches -- a delta of
 # ~100 MiB. Only added for builds whose registered peak_mib does NOT already
-# bake the chain in: the n_cpu_moe speed tier was certified WITH the chain
+# bake the chain in: the n_cpu_moe MoE build was certified WITH the chain
 # from the start (11,832 MiB peak already includes it), so adding this again
 # there would double-count it and needlessly shrink its context.
 SPEC_NGRAM_CHAIN_MIB = 100
@@ -2568,7 +2568,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # runs whenever the file speculates on its own MTP head and there is no
     # external drafter overriding it. It costs real VRAM, so that cost has to
     # be in the budget before the context ladder picks a rung -- except for
-    # the n_cpu_moe speed tier, whose certified peak_mib already measures the
+    # the n_cpu_moe MoE build, whose certified peak_mib already measures the
     # chain running; counting it twice there would shrink its context for no
     # reason.
     chain_active = use_spec and draft is None and n_cpu_moe is None
@@ -2768,12 +2768,12 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
         elif plan.use_spec:
             # The certified drafter chain: stack an n-gram matcher in front
-            # of MTP. Certified 2026-09-05 on BOTH tiers -- originally
-            # speed-tier-only, now shipped on the flagship too (2.81-6.10x on
-            # editing workloads, inert and byte-identical on plain
-            # generation). Do not widen this further than "any build that
-            # speculates through its own MTP head" without re-measuring;
-            # acceptance is a property of the specific target model.
+            # of MTP. Certified 2026-09-05 on BOTH builds -- originally
+            # on the MoE build only, now shipped on the dense build too
+            # (2.81-6.10x on editing workloads, inert and byte-identical
+            # on plain generation). Do not widen this further than "any
+            # build that speculates through its own MTP head" without
+            # re-measuring; acceptance is a property of the target model.
             argv += ["--spec-type", SPEC_TYPE_CHAIN,
                      "--spec-draft-n-max", str(SPEC_N_MAX),
                      "--spec-ngram-simple-size-m", str(SPEC_NGRAM_SIZE_M)]
