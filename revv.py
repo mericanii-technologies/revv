@@ -1070,6 +1070,10 @@ def read_gguf(path: str) -> GGUFInfo:
 # --- Resumable downloader   [spliced: download unit] -----------------------
 
 USER_AGENT = "revv/1.0"
+
+# The headers on every JSON request revv sends to a llama-server or to its own
+# control endpoint. One dict, so the User-Agent cannot drift between them.
+JSON_HEADERS = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
 CHUNK_SIZE = 1024 * 1024  # 1 MiB, per spec
 BACKOFF_CAP_SECONDS = 30.0
 PROGRESS_WINDOW_SECONDS = 5.0  # moving-average window for the rate display
@@ -2627,6 +2631,10 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                       ctx_checkpoints, n_cpu_moe, build_name, n_threads)
 
 
+# What STOCK means for a build that has no registry `stock` entry.
+STOCK_DEFAULT_DESC = "llama-server defaults, all layers on the GPU"
+
+
 def stock_spec(build_name: Optional[str]) -> Optional[Dict[str, object]]:
     """The per-build definition of STOCK, or None for "the ordinary default".
 
@@ -2646,7 +2654,7 @@ def stock_description(build_name: Optional[str]) -> str:
     """One line naming which stock definition a comparison used."""
     stock = stock_spec(build_name)
     if stock is None:
-        return "llama-server defaults, all layers on the GPU"
+        return STOCK_DEFAULT_DESC
     return str(stock.get("why") or "llama-server defaults")
 
 
@@ -3369,7 +3377,7 @@ def _control(url: str, action: str, payload: Optional[Dict[str, object]] = None,
     data = json.dumps(payload).encode("utf-8") if payload is not None else b""
     req = urllib.request.Request(
         url.rstrip("/") + "/_revv/" + action, data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "revv/1.0"},
+        headers=JSON_HEADERS,
         method="POST" if payload is not None or action != "status" else "GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -3504,7 +3512,7 @@ def _timed_generation(base: str, max_tokens: int,
     req = urllib.request.Request(
         base.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "revv/1.0"})
+        headers=JSON_HEADERS)
     t0 = time.time()
     t_first = None      # type: Optional[float]
     body = bytearray()
@@ -3587,7 +3595,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     # so its stock arm is the config a user would actually reach for.
     print("  stock    %s"
           % (start_status.get("stock_description")
-             or "llama-server defaults, all layers on the GPU"))
+             or STOCK_DEFAULT_DESC))
     print("  warmup   one exchange per mode is run and discarded, so switching\n"
           "           cost never lands inside a timed window (same rule as\n"
           "           `revv bench`)\n")
@@ -3969,7 +3977,7 @@ def _post_json(url: str, payload: Dict[str, object],
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "revv/1.0"})
+        headers=JSON_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -4578,6 +4586,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 # --- CLI -------------------------------------------------------------------
 
+URL_HELP = "default: the running instance, else port %d" % DEFAULT_PORT
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="revv",
@@ -4652,18 +4663,18 @@ def build_parser() -> argparse.ArgumentParser:
                        help="switch between revv and STOCK without moving the port")
     t.add_argument("mode", nargs="?", choices=[MODE_REVV, MODE_STOCK],
                    help="switch to a specific mode (default: the other one)")
-    t.add_argument("--url", default=None, help="default: the running instance, else port %d" % DEFAULT_PORT)
+    t.add_argument("--url", default=None, help=URL_HELP)
 
     c = sub.add_parser("compare",
                        help="run the same prompt through both modes, side by side")
-    c.add_argument("--url", default=None, help="default: the running instance, else port %d" % DEFAULT_PORT)
+    c.add_argument("--url", default=None, help=URL_HELP)
     # STOCK thinks out loud and needs room to actually finish; capping it
     # turns the headline ratio into a lower bound instead of a measurement.
     c.add_argument("--max-tokens", type=int, default=2048)
     c.add_argument("--timeout", type=float, default=900.0)
 
     b = sub.add_parser("bench", help="time a running server against the reference")
-    b.add_argument("--url", default=None, help="default: the running instance, else port %d" % DEFAULT_PORT)
+    b.add_argument("--url", default=None, help=URL_HELP)
     b.add_argument("--timeout", type=float, default=300.0)
 
     up_ = sub.add_parser(
