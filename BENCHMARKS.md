@@ -725,6 +725,26 @@ what the model just generated. Use LF line endings in any repo an n-gram
 drafter is expected to help with; this is a property of the matcher, not of
 revv's config.
 
+## Editing instrument, both builds (2026-09-05)
+
+The 34-task multi-file editing instrument (aider-polyglot protocol, greedy,
+thinking off), both builds at their shipped configuration with the n-gram
+chain. Source: `results/flagship_polyglot/RESULTS.md` and
+`results/wave2_shippable/RESULTS.md` in the program ledger.
+
+| build | first-attempt solved | solved overall | edit-format compliance |
+|---|---:|---:|---:|
+| 35B-A3B (MoE), Q3_K_XL, chain | 9/34 | 16/34 | 34/34 |
+| 27B (dense), IQ3_XXS, chain | 4/34 | 8/34 | 34/34 |
+
+Paired on the same 34 tasks, McNemar p = 0.039. The 27B wins only one to
+three tasks the 35B misses, so this is a broad gap rather than a trade of
+strengths. Format compliance is perfect on both: the 27B produces well-formed
+but wrong edits, which is why a format check alone cannot see this. n = 34
+resolves only large differences; the 27B without the chain has not been run
+on this instrument. This is the measurement behind the `revv get` note that
+the MoE build scored higher on editing.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:
@@ -788,11 +808,11 @@ either — there is nothing to re-run.
 as 11,956 MiB vs 11,854 MiB at c=16384 (otherwise-identical launches). On a
 12GB reference card (12,288 MiB nominal):
 
-| context | peak VRAM (chain included) | headroom |
-|---|---:|---:|
-| 16384 | 11,956 MiB | 332 MiB |
-| **12288** | **11,822 MiB** | **466 MiB** |
-| 8192 | 11,666 MiB | 622 MiB |
+| context | peak VRAM (chain included) | headroom (nominal 12,288) | headroom (usable 12,044) |
+|---|---:|---:|---:|
+| 16384 | 11,956 MiB | 332 MiB | 88 MiB |
+| **12288** | **11,822 MiB** | **466 MiB** | **222 MiB** |
+| 8192 | 11,666 MiB | 622 MiB | 378 MiB |
 
 Headroom figures are against the 12,288 MiB nominal; the usable ceiling on a
 3060 is 12,044 (244 MiB driver-reserved), so real headroom is 244 MiB less --
