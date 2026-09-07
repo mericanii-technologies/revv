@@ -175,6 +175,43 @@ against the reference, and `revv toggle` switches modes without moving the
 port. `revv inspect <file>` explains any GGUF you already have, and
 `revv adopt` finds models pulled through ollama or LM Studio.
 
+## What revv touches, and how to remove it
+
+revv is experimental, and you are helping test it, so it is built to leave
+no trace. It writes to exactly two places:
+
+- **The clone directory** — the code you checked out. Nothing is written
+  there except `__pycache__`.
+- **`~/.revv`** (or `$REVV_HOME`) — its own llama-server under `bin/`, the
+  downloaded runtime, model files under `models/`, logs, and a small
+  registry. `revv doctor` prints the path.
+
+It does not: edit your shell profile, use sudo, install Python packages,
+write to `/usr/local`, or modify anything it finds. If you already have
+llama.cpp, ollama or LM Studio installed, they are left exactly as they were.
+`install.sh` installs its own `llama-server` copy even when one is on your
+PATH, because revv's numbers were measured on its patched build; pass
+`--system-llama-server` if you want yours used instead. `revv adopt` reads
+the ollama and LM Studio model directories and never writes to them. The
+server binds only to `127.0.0.1`, on 8080 or the next free port.
+
+To remove it:
+
+```
+./revv.py uninstall      # stops the server, shows what it will delete, asks
+rm -rf revv              # the clone
+```
+
+`uninstall` treats downloaded models as a separate question, so you can keep
+the 16 GB file and drop everything else. `revv uninstall --yes --models`
+removes all of it without asking. Deleting `~/.revv` by hand is equivalent.
+
+The pieces are independent. The two llama.cpp patches in `patches/` are plain
+diffs you can read or build without (`./install.sh --source --stock`), the
+model files are unmodified Unsloth GGUFs any llama.cpp can load, and
+`revv serve --print-command` prints the exact llama-server command line it
+would run, so you can run the same configuration by hand with no revv at all.
+
 ## Supported
 
 - **Models:** Qwen3.6-35B-A3B and Qwen3.8-27B in the GGUF builds above. Other

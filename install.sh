@@ -68,9 +68,16 @@ three ways ("rungs"), most convenient first:
   --stock         Synonym for --source with no patches applied. Older
                   flag name from before the three-rung install; still
                   works.
+  --system-llama-server
+                  Use an llama-server already on your PATH instead of
+                  installing revv's own. Off by default: revv's numbers
+                  were measured on its patched build, and an older or
+                  unpatched binary may lack the flags revv relies on
+                  (MTP, the n-gram chain, -ctxcp). Nothing about your
+                  existing binary is changed either way.
   --force-build, --force
                   Reinstall/rebuild even if an llama-server is already
-                  available in $REVV_HOME/bin or on PATH.
+                  installed in $REVV_HOME/bin.
   --help          Show this help and exit.
 
 Environment:
@@ -158,6 +165,7 @@ BUILD_MANIFEST="$REVV_HOME/build.json"
 RUNG=""
 SRC_MODE=""
 FORCE_BUILD=0
+USE_SYSTEM_SERVER=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -182,6 +190,9 @@ while [ $# -gt 0 ]; do
             ;;
         --force-build|--force)
             FORCE_BUILD=1
+            ;;
+        --system-llama-server)
+            USE_SYSTEM_SERVER=1
             ;;
         --help|-h)
             usage
@@ -232,19 +243,24 @@ Install the NVIDIA CUDA Toolkit (nvcc normally lives under
 /usr/local/cuda/bin, or is provided by your distro's 'cuda-toolkit' /
 'nvidia-cuda-toolkit' package), make sure it is on PATH, then re-run this
 script. If you already have a working llama-server on PATH from elsewhere,
-you don't need this: re-run without --force-build and this script will use
-it instead of building."
+re-run with --system-llama-server to use it instead of building (revv's
+published numbers were not measured on it)."
     fi
 }
 
 # --- Existing llama-server detection ---------------------------------------
 
+# revv's own install ($BIN_DIR) is always reused. A llama-server elsewhere
+# on PATH is used only with --system-llama-server: a tester who already runs
+# llama.cpp would otherwise get their own (possibly older, unpatched) binary
+# picked up silently, and none of revv's numbers would apply to it. revv
+# never modifies that binary; it just installs its own next to it.
 find_existing_llama_server() {
     if [ -x "$BIN_DIR/llama-server" ]; then
         printf '%s\n' "$BIN_DIR/llama-server"
         return 0
     fi
-    if command -v llama-server >/dev/null 2>&1; then
+    if [ "$USE_SYSTEM_SERVER" -eq 1 ] && command -v llama-server >/dev/null 2>&1; then
         command -v llama-server
         return 0
     fi
@@ -1183,6 +1199,12 @@ if [ "$FORCE_BUILD" -ne 1 ] && EXISTING=$(find_existing_llama_server); then
     echo "skipping install (pass --force-build to reinstall)."
     DID_INSTALL=1
 else
+    if [ "$USE_SYSTEM_SERVER" -ne 1 ] && command -v llama-server >/dev/null 2>&1; then
+        echo ""
+        echo "note: a llama-server is already on PATH ($(command -v llama-server))."
+        echo "      Leaving it alone; revv installs its own copy under $BIN_DIR."
+        echo "      Pass --system-llama-server to use yours instead."
+    fi
     if [ -z "$RUNG" ]; then
         echo ""
         echo "no install method given -- trying the default, --prebuilt, first."

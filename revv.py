@@ -4592,7 +4592,7 @@ URL_HELP = "default: the running instance, else port %d" % DEFAULT_PORT
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="revv",
-        description="revv, by Mericanii -- Qwen3.8-27B on consumer NVIDIA GPUs.",
+        description="revv, by Mericanii -- certified Qwen coding models on 12GB NVIDIA cards.",
         epilog="Start with: revv doctor")
     p.add_argument("--version", action="version",
                    version=version_string())
