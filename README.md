@@ -89,6 +89,41 @@ Reading that table honestly:
 - No head-to-head prefill number: the two figures we have (~500 t/s for the 27B,
   205 t/s for the 35B) were taken under different configs on different dates.
 
+## Tested on two systems
+
+Everything above is one headless Linux box. On 2026-09-08 we installed the
+prebuilt on a Windows 11 desktop running WSL2, monitor attached to the card, and
+ran both builds through the same five commands. Raw record:
+[TEST_WSL2_RESULTS.md](TEST_WSL2_RESULTS.md); tables in BENCHMARKS.md §19.
+
+| | Linux box | Windows PC, WSL2 |
+|---|---|---|
+| card, OS | RTX 3060 12GB, Ubuntu 24.04 headless | RTX 3060 12GB driving the display, WSL2 Ubuntu 26.04 |
+| host | 10-vCPU KVM guest of a Ryzen 5 3600, 47 GB RAM, `-t 8` | Ryzen 5 3600 (6c/12t), 32 GB RAM with 24 GB given to WSL2, `-t 6` |
+| free VRAM at launch | 12,044 MiB | 11,516–11,841 MiB, moving with the desktop |
+| dense: context, bench | 12,288, 37.9 t/s | 8,192, 36.25 t/s |
+| dense: compare, time to done | 22.5 → 38.4 t/s, 46.0 → 22.9 s | 21.9 → 34.6 t/s, 94.2 → 25.2 s |
+| MoE: context, bench | 16,384, 55.9 t/s | 12,288, 47.21 t/s |
+| MoE: compare, time to done | 22.2 → 55.9 t/s, not measured | 18.7 → 41.9 t/s, 110.1 → 24.5 s |
+
+Three caveats. The Linux MoE stock figure is a stock `llama-server` at
+`-ngl 30` from the same campaign, not a `revv compare` session. The PC's MoE
+compare ran at 4,096 context with q4_0 KV, before the planner fix that lifted
+that box to 12,288. And in both compare sessions the stock arm ran out its token
+budget without finishing (1,024 and 2,048), so those time-to-done figures are
+lower bounds, and not comparable across columns.
+
+The dense build lands 4.4% off the headless box (36.25 against 37.9) because it
+sits entirely on the GPU; all the desktop costs it is one context rung, 8,192
+instead of 12,288. The MoE build loses about 16% (47.21 against 55.9) because
+its 16 expert layers stream from host RAM, and here that path is worse in three
+ways at once: two fewer threads, Hyper-V between the process and RAM, and
+Windows running alongside. The stock arm dropped by the same fraction (18.7
+against 22.2 t/s), which is how we know the cause is the machine and not revv's
+configuration. Quality is identical by construction: same file, same flags, same
+binary; the n-gram chain is byte-identical, and MTP is quality-neutral by paired
+HumanEval.
+
 ## Install
 
 You need Linux and a working NVIDIA driver (`nvidia-smi` prints a table).
@@ -131,7 +166,8 @@ export PATH=/usr/local/cuda/bin:$PATH    # add to ~/.bashrc too
 Ubuntu's packaged CUDA and older 12.x toolkits fail against recent glibc/gcc,
 which is why the NVIDIA WSL repo is used above. Expect a smaller context:
 Windows reserves roughly 1–1.5 GB of the card, revv plans against free VRAM,
-and will pick 8192 or lower. `revv doctor` shows the reservation and the choice.
+and will drop a rung: on our WSL2 box that is 8,192 for the dense build and
+12,288 for the MoE one. `revv doctor` shows the reservation and the choice.
 
 **3. From source — the fallback.** `./install.sh --source` clones llama.cpp at
 the pinned commit, applies the two patches in `patches/` (or `--stock` for
@@ -142,6 +178,40 @@ exists. `./install.sh --upstream` fetches official llama.cpp binaries instead,
 but on Linux those are Vulkan, not CUDA: it runs, the kernel patch does not
 apply, and none of these numbers were measured on it. `revv doctor` reports
 which path built the binary you are running.
+
+## Install problems we hit, and what to do
+
+Everything below is from the WSL2 install on 2026-09-08. Items marked *fixed in
+revv* need only an update; the rest are on your side.
+
+- **`apt install` fails with 404s on a fresh WSL image.** The image ships a
+  stale package index. Run `sudo apt update` before anything else.
+- **`nvidia-smi: command not found` over SSH or in a script, though it works in
+  a terminal.** WSL2 puts it in `/usr/lib/wsl/lib`, and only login shells add
+  that to PATH. *Fixed in revv:* revv falls back to that path itself.
+- **Ubuntu shows half your RAM.** WSL2 caps the guest at 50% of the host by
+  default, which can hide enough to rule out the MoE build (it wants ~8–9 GB
+  free, on top of the VRAM). Put `memory=24GB` under `[wsl2]` in
+  `%UserProfile%\.wslconfig`, a Windows file you write from PowerShell or from
+  Linux at `/mnt/c/Users/<you>/.wslconfig`, then `wsl --shutdown` from
+  PowerShell. *Fixed in revv:* `revv doctor` now says this on WSL2.
+- **Linux starts throwing I/O errors or "Bus error" and the VM dies.** The WSL
+  virtual disk lives on `C:` and grows on demand, so when `C:` fills the guest's
+  disk fails under it. Free space on `C:`, or put models on another drive with
+  `REVV_HOME`. Interrupted model downloads resume.
+- **Closing the last Ubuntu window kills the VM**, and with it a running server
+  and any download in flight. Keep one open, or set `vmIdleTimeout=-1`.
+- **Windows desktop apps hold 0.5–1 GB of the card.** revv plans against what is
+  free at launch, so it will refuse or serve a smaller context. Close browsers
+  and the like before `revv up`; opening them mid-session can OOM the server.
+- **`revv up` refuses on a card that should fit, or plans the MoE build far too
+  small.** Both were ours, fixed on 2026-09-08 in `3f9542d` and `4d126fc`. If
+  you cloned before that date, `git pull` or `revv update`.
+- **The installer says to install `cuda-cudart`.** A false warning, fixed in
+  `3f9542d`; the CUDA runtime is inside the archive. Ignore it on an old clone.
+- **You already have an `llama-server` on PATH.** revv installs its own anyway
+  and says so, because its numbers were measured on the patched build. Pass
+  `--system-llama-server` to use yours instead.
 
 ## Usage
 
@@ -263,7 +333,7 @@ VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
 - **WSL2 gets less, and it moves.** If Windows holds more than ~830 MiB of
   the card, revv refuses outright; below that it serves a smaller context.
   Both are intended. Windows's share is not fixed: on our second 3060 it
-  read 1,022 MiB with a browser open and 568 MiB with the desktop cleared,
+  read 1,022 MiB with a browser open and 275 MiB with the desktop cleared,
   and revv plans against whatever is free at launch. Close GPU-using apps
   before `revv up`, and expect an OOM if you open them mid-session. With the
   desktop cleared (11.5–11.8 GB free) that box serves the MoE build at
@@ -282,9 +352,11 @@ VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
 - **The n-gram matcher needs LF line endings.** It is a literal byte match; a
   repo checked out with CRLF drops acceptance from 0.83 to 0.11.
 - **The prebuilt has been installed on exactly one machine other than the one
-  that built it**: a second RTX 3060 under WSL2, Ubuntu 26.04, where it
-  served the dense build at 4096 and 8192 context (BENCHMARKS.md §19). That
-  is the whole of the independent evidence so far.
+  that built it**: a second RTX 3060 under WSL2, Ubuntu 26.04, where it served
+  both builds, the dense one at 8,192 context and the MoE one at 12,288
+  (BENCHMARKS.md §19, raw record in
+  [TEST_WSL2_RESULTS.md](TEST_WSL2_RESULTS.md)). That is the whole of the
+  independent evidence so far.
 - Every number here is one card, one protocol, one workload type. Speculation
   speedup is a property of the content: +110% on code, −2% to −4% on prose.
 

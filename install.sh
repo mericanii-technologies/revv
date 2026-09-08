@@ -465,6 +465,23 @@ parse_compute_caps() {
     '
 }
 
+# nvidia-smi's location, or nothing with a nonzero exit. On WSL2 the binary
+# lives in /usr/lib/wsl/lib, which only login shells add to PATH via
+# /etc/profile.d -- this script is not always run from one (a piped `curl |
+# sh`, an SSH command, cron), so PATH alone misses a GPU that is right there
+# and working. Check the WSL2 path directly before giving up.
+find_nvidia_smi() {
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        command -v nvidia-smi
+        return 0
+    fi
+    if [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
+        printf '%s\n' /usr/lib/wsl/lib/nvidia-smi
+        return 0
+    fi
+    return 1
+}
+
 # Picks -DCMAKE_CUDA_ARCHITECTURES. cmake's default fan-out
 # (50/61/70/75/80/86/89/90...) is far slower to build and much larger than a
 # binary pinned to the card actually present, so detect rather than default.
@@ -476,13 +493,13 @@ detect_cuda_archs() {
         return 0
     fi
 
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
+    if ! nvidia_smi=$(find_nvidia_smi); then
         CUDA_ARCH_REASON="could not detect; letting CMake probe the local card"
         printf 'native\n'
         return 0
     fi
 
-    raw=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
+    raw=$("$nvidia_smi" --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
     caps=$(parse_compute_caps "$raw")
     if [ -z "$caps" ] || [ "$caps" = "BAD" ]; then
         CUDA_ARCH_REASON="could not detect; letting CMake probe the local card"
@@ -851,15 +868,16 @@ check_prebuilt_arch() {
     # e.g. "7.5 8.0 8.6 8.9 9.0" -> "75/80/86/89/90", for the messages below.
     sm_list=$(printf '%s' "$PREBUILT_CUDA_ARCHS" | tr -d '.' | tr ' ' '/')
 
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo "  warning: 'nvidia-smi' not found -- could not verify GPU architecture" >&2
-        echo "           against the prebuilt's sm_$sm_list targets. Proceeding anyway." >&2
+    if ! nvidia_smi=$(find_nvidia_smi); then
+        echo "  warning: 'nvidia-smi' not found on PATH or at the WSL2 fallback" >&2
+        echo "           location -- could not verify GPU architecture against" >&2
+        echo "           the prebuilt's sm_$sm_list targets. Proceeding anyway." >&2
         return 0
     fi
 
     # A partial or garbage nvidia-smi output degrades to "could not verify",
     # never to a false mismatch report.
-    raw=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
+    raw=$("$nvidia_smi" --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || raw=""
     caps=$(parse_compute_caps "$raw")
 
     if [ -z "$caps" ] || [ "$caps" = "BAD" ]; then

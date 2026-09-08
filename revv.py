@@ -210,6 +210,28 @@ def host_ram_mib() -> Tuple[Optional[int], Optional[int]]:
     return None, None
 
 
+# Overridable in tests, mirroring install.sh's REVV_PROC_VERSION_FILE.
+PROC_VERSION_FILE = "/proc/version"
+
+
+def is_wsl2() -> bool:
+    """True under WSL2. doctor uses this to say things that are only true
+    when Linux is a guest under Windows -- host-reserved VRAM, half-of-the-
+    PC's-RAM-by-default -- rather than guessing from symptoms.
+
+    WSL_DISTRO_NAME is set by the WSL2 shell integration; /proc/version
+    naming "microsoft" is the kernel-level tell and works even when that
+    variable was scrubbed (e.g. by su, or an unrelated shell).
+    """
+    if "WSL_DISTRO_NAME" in os.environ:
+        return True
+    try:
+        with open(PROC_VERSION_FILE, "r") as fh:
+            return "microsoft" in fh.read().lower()
+    except OSError:
+        return False
+
+
 def physical_core_count() -> int:
     """Physical (not logical/hyperthreaded) core count, clamped to [4, 8].
 
@@ -1438,11 +1460,35 @@ class GPU:
         return max(0, self.total_mib - self.used_mib - self.free_mib)
 
 
+# On WSL2, nvidia-smi lives here rather than anywhere shutil.which() would
+# find it on a non-interactive shell's PATH; see nvidia_smi_path() below.
+NVIDIA_SMI_WSL_PATH = "/usr/lib/wsl/lib/nvidia-smi"
+
+
+def nvidia_smi_path() -> Optional[str]:
+    """Where nvidia-smi is, or None if it cannot be found anywhere revv knows
+    to look.
+
+    On WSL2, /usr/lib/wsl/lib is added to PATH by /etc/profile.d, which only
+    login shells source. An SSH command, a cron job, or anything else that is
+    not a login shell never sees it there, so shutil.which() alone reports
+    "not found" even though the GPU is right there and working. Fall back to
+    the known WSL2 path before giving up.
+    """
+    exe = shutil.which("nvidia-smi")
+    if exe is not None:
+        return exe
+    if os.path.exists(NVIDIA_SMI_WSL_PATH) and os.access(NVIDIA_SMI_WSL_PATH, os.X_OK):
+        return NVIDIA_SMI_WSL_PATH
+    return None
+
+
 def detect_gpus() -> Tuple[List[GPU], Optional[str]]:
     """Return (gpus, error). error is a human-readable reason if detection failed."""
-    exe = shutil.which("nvidia-smi")
+    exe = nvidia_smi_path()
     if exe is None:
-        return [], "nvidia-smi not found on PATH"
+        return [], ("nvidia-smi not found on PATH (also checked the WSL2 "
+                     "location, %s)" % NVIDIA_SMI_WSL_PATH)
     query = ("name,memory.total,memory.used,memory.free,driver_version,"
              "compute_cap")
     try:
@@ -1626,6 +1672,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if g.reserved_mib > 0:
                 detail += ("\n%s reserved by the host (WSL2/desktop) and not "
                            "available to CUDA" % mib(g.reserved_mib))
+            if is_wsl2() and g.used_mib > 0:
+                # "used" here is very often the Windows desktop itself --
+                # its compositor, browser tabs, whatever else is on screen --
+                # which is invisible to Linux as a process, so there is
+                # nothing revv could show under "what's using the GPU" even
+                # if it tried. It can only plan against what is free right
+                # now, so say that plainly and point at the fix.
+                detail += ("\n%s of this card is in use; under WSL2 that is "
+                           "often the Windows desktop itself (its share does "
+                           "not show up as a Linux process). revv plans "
+                           "against what is free at launch -- close browsers "
+                           "and other GPU apps before `revv up` for a larger "
+                           "context." % mib(g.used_mib))
             status(OK if g.free_mib >= VRAM_MIN_FREE_MIB else FAIL,
                    "GPU %d: %s" % (i, g.name), detail)
             if g.cc is not None and g.cc < MIN_COMPUTE_CAPABILITY:
@@ -1751,6 +1810,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                           mib(plan.estimated_peak)))
             if any(n.startswith("WARNING") for n in plan.notes):
                 detail += "  (with a warning; see revv serve)"
+            # plan_launch already warns generically when host RAM is short
+            # for a MoE build's expert streaming. Under WSL2 that shortfall
+            # is very often just the default 50% RAM split, which is a
+            # Windows-side setting a user can fix in five minutes -- name
+            # that explicitly instead of leaving the generic warning to
+            # speak for a cause it does not know about.
+            build_name = identify_build(info)
+            spec = BUILDS.get(build_name) if build_name else None
+            need_ram = int(spec.get("host_ram_mib") or 0) if spec else 0
+            if need_ram and is_wsl2():
+                total_ram, _avail_ram = host_ram_mib()
+                if total_ram is not None and total_ram < need_ram + 4096:
+                    suggested_gb = (need_ram + 4096 + 1023) // 1024
+                    detail += ("\nWSL2 gives Linux half of the PC's RAM by "
+                               "default; this Linux sees %s. Put "
+                               "memory=%dGB under [wsl2] in "
+                               "%%UserProfile%%\\.wslconfig on the Windows "
+                               "side, then run `wsl --shutdown` in "
+                               "PowerShell."
+                               % (mib(total_ram), suggested_gb))
         status(tag, "%s  %s  %s" % (name, gib(info.file_size),
                                     info.dominant_quant), detail)
 

@@ -50,6 +50,17 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from the nominal figure; `compare` STOCK arm could OOM on the MoE build.
 - WSL2: driver reservation is read and the context ladder steps down instead
   of OOMing; the CUDA toolchain is preflighted before a source build.
+- WSL2 keeps `nvidia-smi` at `/usr/lib/wsl/lib`, which only a login shell adds
+  to PATH; a non-interactive shell (SSH command, cron, script) saw a working
+  GPU report "nvidia-smi not found on PATH". `revv.py` and `install.sh` now
+  fall back to that path when PATH has nothing, in both the planner's GPU
+  detection and the installer's compute-capability probe.
+- `revv doctor` now names two more WSL2 conditions instead of leaving them
+  for the user to puzzle out: when Windows itself is holding part of the
+  card (invisible to Linux as a process, but it eats into what revv can
+  plan against), and when host RAM is short for the MoE build specifically
+  because of WSL2's default 50% RAM split -- with the `.wslconfig` fix and
+  the `wsl --shutdown` needed to apply it.
 - The free-VRAM floor was a generic constant (11,528 MiB) and refused a WSL2
   3060 with 11,516 free that then ran with 276 MiB to spare. The dense
   build's 4096 and 8192 rungs now carry measured peaks and the floor is

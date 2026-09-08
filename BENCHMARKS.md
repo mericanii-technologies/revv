@@ -747,10 +747,15 @@ the MoE build scored higher on editing.
 
 ## 19. Second machine: WSL2 3060, prebuilt install and small-context peaks (2026-09-08)
 
+Raw record of this run, phase by phase and with the defects it found:
+`TEST_WSL2_RESULTS.md`.
+
 The first install of the prebuilt on a machine that did not build it. Windows
 11, WSL2 Ubuntu 26.04 (glibc 2.43), driver 610.74, RTX 3060 12GB with the
-display attached, Ryzen 5 3600, 15 GB RAM. Dense build only (host RAM rules
-out the MoE build). Model file already on disk from an earlier field test.
+display attached, Ryzen 5 3600, 32 GB RAM (WSL2 capped the guest at 15 GB
+until we raised it, which is why the MoE build is a separate pass below).
+Both builds. The dense model file was already on disk from an earlier field
+test.
 
 Install: `./install.sh` took the prebuilt path, verified the sha256, and
 `revv doctor` reported the patched CUDA build. Two installer defects found and
@@ -799,14 +804,15 @@ Unforced runs on this box, both builds, with the desktop cleared:
 | build | `revv up` plan | `bench` | `compare` STOCK → REVV | time to done |
 |---|---|---|---|---|
 | dense | 8192, q8_0 | 36.25 t/s (within 5% of 37.9) | 21.9 → 34.6 t/s | 94.2 s → 25.2 s, 3.74× |
-| MoE | 4096, q4_0 (pre-fix) | 47.0 t/s (84% of 55.9) | 18.7 → 41.9 t/s | 110.1 s → 24.5 s, 4.49× |
+| MoE, before the fix | 4096, q4_0 | 47.0 t/s (84% of 55.9) | 18.7 → 41.9 t/s | 110.1 s → 24.5 s, 4.49× |
+| MoE, after the fix | 12288, q8_0 | 47.2 t/s (84% of 55.9); 49.3 t/s on a short request; 292 MiB free at load | not re-run | not re-run |
 
 The MoE shortfall against the box is expected: `-t 6` on six physical cores
 against `-t 8` on the box's eight vCPUs, host RAM bandwidth through the
 Hyper-V guest, and 4096/q4_0 rather than 16384/q8_0. Same Ryzen 5 3600
 family on both machines.
 
-Windows's share of the card moved between 1,022 and 568 MiB during the
+Windows's share of the card moved between 1,022 and 275 MiB during the
 session depending on what was open on the desktop. Every number here is
 against free VRAM at the moment of launch.
 

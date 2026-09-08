@@ -59,6 +59,42 @@ def section(title):
     print("\n" + title)
 
 
+class fake_nvidia_smi(object):
+    """Pin shutil.which() and the WSL2 fallback path's existence for the
+    duration of a block, then restore both.
+
+    nvidia_smi_path() only ever probes revv.NVIDIA_SMI_WSL_PATH, so patching
+    os.path.exists/os.access to answer for that one path and delegate
+    everything else is safe for the duration of a single call.
+    """
+
+    def __init__(self, which_result, wsl_path_exists):
+        self.which_result = which_result
+        self.wsl_path_exists = wsl_path_exists
+        self.saved_which = None
+        self.saved_exists = None
+        self.saved_access = None
+
+    def __enter__(self):
+        self.saved_which = revv.shutil.which
+        self.saved_exists = revv.os.path.exists
+        self.saved_access = revv.os.access
+        revv.shutil.which = lambda name: self.which_result
+        revv.os.path.exists = lambda path: (
+            self.wsl_path_exists if path == revv.NVIDIA_SMI_WSL_PATH
+            else self.saved_exists(path))
+        revv.os.access = lambda path, mode: (
+            self.wsl_path_exists if path == revv.NVIDIA_SMI_WSL_PATH
+            else self.saved_access(path, mode))
+        return self
+
+    def __exit__(self, *exc):
+        revv.shutil.which = self.saved_which
+        revv.os.path.exists = self.saved_exists
+        revv.os.access = self.saved_access
+        return False
+
+
 class fake_host_ram(object):
     """Pin host_ram_mib() for the duration of a block, then restore it.
 
@@ -788,6 +824,53 @@ def test_failed_start_does_not_move_the_mode():
     check("...and alive() reports the truth", backend.alive(), False)
 
 
+def test_wsl2_detection():
+    """The two WSL2-specific tells doctor and detect_gpus rely on: the
+    nvidia-smi fallback path (/usr/lib/wsl/lib is only on PATH for a login
+    shell) and is_wsl2() itself (/proc/version naming "microsoft", or
+    WSL_DISTRO_NAME). Both were invisible until the WSL2 run that hit them:
+    revv reported "nvidia-smi not found on PATH" over SSH with a working GPU
+    right there."""
+    section("WSL2 detection")
+
+    with fake_nvidia_smi("/usr/bin/nvidia-smi", wsl_path_exists=False):
+        check("PATH hit wins over the WSL2 fallback",
+              revv.nvidia_smi_path(), "/usr/bin/nvidia-smi")
+    with fake_nvidia_smi(None, wsl_path_exists=True):
+        check("falls back to the WSL2 path when PATH has nothing",
+              revv.nvidia_smi_path(), revv.NVIDIA_SMI_WSL_PATH)
+    with fake_nvidia_smi(None, wsl_path_exists=False):
+        check("neither PATH nor the WSL2 path -> None",
+              revv.nvidia_smi_path(), None)
+
+    saved_env = dict(os.environ)
+    os.environ.pop("WSL_DISTRO_NAME", None)
+    wsl_proc_version = tempfile.mktemp(prefix="revv-qa-proc-version-")
+    native_proc_version = tempfile.mktemp(prefix="revv-qa-proc-version-")
+    with open(wsl_proc_version, "w") as fh:
+        fh.write("Linux version 6.6.36.6-microsoft-standard-WSL2\n")
+    with open(native_proc_version, "w") as fh:
+        fh.write("Linux version 6.8.0-generic\n")
+    saved_proc = revv.PROC_VERSION_FILE
+    try:
+        revv.PROC_VERSION_FILE = wsl_proc_version
+        check("microsoft in /proc/version -> WSL2", revv.is_wsl2(), True)
+        revv.PROC_VERSION_FILE = native_proc_version
+        check("no microsoft marker -> not WSL2", revv.is_wsl2(), False)
+        revv.PROC_VERSION_FILE = "/does/not/exist/revv-qa"
+        check("unreadable /proc/version -> not WSL2 (fails closed)",
+              revv.is_wsl2(), False)
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        check("WSL_DISTRO_NAME alone is enough, even with no /proc/version",
+              revv.is_wsl2(), True)
+    finally:
+        revv.PROC_VERSION_FILE = saved_proc
+        os.environ.clear()
+        os.environ.update(saved_env)
+        os.unlink(wsl_proc_version)
+        os.unlink(native_proc_version)
+
+
 def main():
     if not os.path.isdir(FIXTURES):
         print("fixtures missing: run python3 tests/make_fixtures.py first")
@@ -811,6 +894,7 @@ def main():
     test_modes_are_not_identical()
     test_bench_reference()
     test_failed_start_does_not_move_the_mode()
+    test_wsl2_detection()
     print("\n%s" % ("ALL PASSED" if not _failures
                     else "%d FAILED: %s" % (len(_failures), ", ".join(_failures))))
     return 1 if _failures else 0
