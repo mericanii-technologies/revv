@@ -256,11 +256,16 @@ VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
 ## Limits and known issues
 
 - **12GB is the real floor, and it is tight.** revv refuses to start below
-  11,528 MiB of free VRAM. A 12GB 3060 reports 12,288 MiB and offers about
+  11,457 MiB of free VRAM, the least the dense build has been measured to
+  run in (4096 context, 276 MiB to spare) plus a 150 MiB reserve. A 12GB 3060 reports 12,288 MiB and offers about
   12,044; the rest is driver-reserved. Certified configs land with 212–222 MiB
   of real headroom, so a desktop session on the same card can cause an OOM.
-- **WSL2 gets less.** If the host reserves more than ~760 MiB, revv refuses
-  outright; below that it serves a smaller context. Both are intended.
+- **WSL2 gets less, and it moves.** If Windows holds more than ~830 MiB of
+  the card, revv refuses outright; below that it serves a smaller context.
+  Both are intended. Windows's share is not fixed: on our second 3060 it
+  read 1,022 MiB with a browser open and 568 MiB with the desktop cleared,
+  and revv plans against whatever is free at launch. Close GPU-using apps
+  before `revv up`, and expect an OOM if you open them mid-session.
 - **The planner's headroom figure is an upper bound that drifts.** It anchors on
   a measured peak and scales only the KV term, so it is optimistic by ~26 MiB at
   the anchor context and ~104 MiB three rungs down the ladder. Shipped configs
@@ -271,8 +276,10 @@ VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
   speculation off.
 - **The n-gram matcher needs LF line endings.** It is a literal byte match; a
   repo checked out with CRLF drops acceptance from 0.83 to 0.11.
-- **The prebuilt has never been installed on a machine other than the one that
-  built it**, and revv has not been run end to end on a second GPU.
+- **The prebuilt has been installed on exactly one machine other than the one
+  that built it**: a second RTX 3060 under WSL2, Ubuntu 26.04, where it
+  served the dense build at 4096 and 8192 context (BENCHMARKS.md §19). That
+  is the whole of the independent evidence so far.
 - Every number here is one card, one protocol, one workload type. Speculation
   speedup is a property of the content: +110% on code, −2% to −4% on prose.
 

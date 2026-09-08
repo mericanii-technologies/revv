@@ -745,6 +745,42 @@ resolves only large differences; the 27B without the chain has not been run
 on this instrument. This is the measurement behind the `revv get` note that
 the MoE build scored higher on editing.
 
+## 19. Second machine: WSL2 3060, prebuilt install and small-context peaks (2026-09-08)
+
+The first install of the prebuilt on a machine that did not build it. Windows
+11, WSL2 Ubuntu 26.04 (glibc 2.43), driver 610.74, RTX 3060 12GB with the
+display attached, Ryzen 5 3600, 15 GB RAM. Dense build only (host RAM rules
+out the MoE build). Model file already on disk from an earlier field test.
+
+Install: `./install.sh` took the prebuilt path, verified the sha256, and
+`revv doctor` reported the patched CUDA build. Two installer defects found and
+fixed the same day: a variable clobber that left the archive under its
+temporary name, and a library check that ran `ldd` without the bundled lib
+path and wrongly told the user to install a CUDA runtime.
+
+Planner: at launch the card had 11,516 MiB free (Windows holding 600 MiB plus
+172 MiB driver reserve). The floor was a generic 11,528, so `revv up`
+refused by 12 MiB. Forced runs then measured the whole-process peak with
+`nvidia-smi` sampled every second, two consecutive requests filling the
+context, q8_0 KV, the n-gram+MTP chain on, `-ctxcp 0`:
+
+| ctx | free before | min free during | process peak | headroom | notes |
+|---|---|---|---|---|---|
+| 4096 | 11,583 | 276 | 11,307 | 276 | 4,056-token prompts, 40-token completions; 34.9 t/s |
+| 8192 | 11,583 | 330 | 11,253 | 330 | 6,927-token prompts, 900-token completions; 19.2 t/s |
+
+The two peaks are within the host's own share noise of each other, so the
+larger stands for both rungs. The planner's anchor arithmetic charged 11,378
+for these rungs (71 MiB pessimistic) with a 250 MiB margin; they now carry
+the measured figure with the 150 MiB margin, and the floor is derived from
+the smallest measured rung: 11,457 MiB. Both runs clear the ≥200 MiB
+standard. A short unforced request at 4096 ran at 36.3 t/s with chain
+acceptance 0.95, mean draft length 2.9.
+
+Windows's share of the card moved between 1,022 and 568 MiB during the
+session depending on what was open on the desktop. Every number here is
+against free VRAM at the moment of launch.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:

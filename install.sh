@@ -765,7 +765,7 @@ download_with_progress() {
 # calls fail(): this rung soft-fails so the caller can fall back.
 download_prebuilt() {
     url="$1"
-    dest="$2"
+    dl_dest="$2"
     DOWNLOAD_HTTP_CODE="000"
 
     if command -v curl >/dev/null 2>&1; then
@@ -773,7 +773,7 @@ download_prebuilt() {
         # code on a 404 along with it. Plain -sS -w gets us the code either
         # way, and a 404's response body is a tiny HTML page we're about to
         # rm -f regardless.
-        code=$(curl -sS -L -o "$dest" -w '%{http_code}' "$url" 2>/dev/null)
+        code=$(curl -sS -L -o "$dl_dest" -w '%{http_code}' "$url" 2>/dev/null)
         curl_status=$?
         is_int "$code" && DOWNLOAD_HTTP_CODE="$code"
         [ "$curl_status" -eq 0 ] && [ "$DOWNLOAD_HTTP_CODE" = "200" ] && return 0
@@ -781,8 +781,8 @@ download_prebuilt() {
     fi
 
     if command -v wget >/dev/null 2>&1; then
-        wget_log="$dest.wgetlog.$$"
-        if wget -o "$wget_log" -O "$dest" "$url"; then
+        wget_log="$dl_dest.wgetlog.$$"
+        if wget -o "$wget_log" -O "$dl_dest" "$url"; then
             rm -f "$wget_log"
             DOWNLOAD_HTTP_CODE="200"
             return 0
@@ -965,11 +965,15 @@ llama.cpp from source instead."
 # needs? Never fails hard: reports, and lets the user fix it.
 check_cuda_runtime_libs() {
     bin_path="$1"
+    lib_dir="$2"
     if ! command -v ldd >/dev/null 2>&1; then
         echo "note: 'ldd' not found -- skipping the CUDA runtime library check"
         return 0
     fi
-    ldd_out=$(ldd "$bin_path" 2>/dev/null) || ldd_out=""
+    # The launcher script sets LD_LIBRARY_PATH to the bundled lib/ before
+    # exec; ldd has to see the same path or it reports the bundle's own
+    # libraries as missing and blames the CUDA runtime for it.
+    ldd_out=$(LD_LIBRARY_PATH="$lib_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$bin_path" 2>/dev/null) || ldd_out=""
     missing_count=$(printf '%s\n' "$ldd_out" | grep -c "not found" || true)
     if is_int "$missing_count" && [ "$missing_count" -gt 0 ]; then
         echo ""
@@ -1072,7 +1076,7 @@ fetch it fresh:
     link_runtime_server "$runtime_dir"
 
     if [ -x "$runtime_dir/llama-server.bin" ]; then
-        check_cuda_runtime_libs "$runtime_dir/llama-server.bin"
+        check_cuda_runtime_libs "$runtime_dir/llama-server.bin" "$runtime_dir/lib"
     fi
 
     write_manifest "prebuilt" \

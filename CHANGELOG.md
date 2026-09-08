@@ -50,6 +50,16 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from the nominal figure; `compare` STOCK arm could OOM on the MoE build.
 - WSL2: driver reservation is read and the context ladder steps down instead
   of OOMing; the CUDA toolchain is preflighted before a source build.
+- The free-VRAM floor was a generic constant (11,528 MiB) and refused a WSL2
+  3060 with 11,516 free that then ran with 276 MiB to spare. The dense
+  build's 4096 and 8192 rungs now carry measured peaks and the floor is
+  derived from them (11,457 MiB). BENCHMARKS.md §19.
+- `install.sh`: a helper overwrote the caller's destination variable, so the
+  downloaded archive stayed under its temporary name; the runtime library
+  check ran `ldd` without the bundled lib path and told users to install a
+  CUDA runtime that was already inside the archive.
+- `revv up` on a failed start showed the previous session's log under the
+  new error.
 
 ## [1.0.0] - 2026-09-02
 

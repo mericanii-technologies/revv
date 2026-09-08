@@ -246,12 +246,24 @@ def test_kv_and_context():
           revv.model_peak_mib(info, 12288, "q8_0") + revv.SPEC_NGRAM_CHAIN_MIB)
 
     # A WSL2-sized card forces a lower rung than the reference card above.
-    # This value is unchanged by MEASURED_PEAK_MARGIN_MIB: the flagship runs
-    # the n-gram chain, so its peak carries an estimated term and keeps the
-    # wide 250 MiB margin (see vram_margin_for).
+    # 8192 is a MEASURED rung for this build (11,307 MiB whole-process, chain
+    # included, on a second 3060 under WSL2), so it fits with the narrow
+    # margin: 11,307 + 150 <= 11,744. Before that measurement the estimator
+    # charged it 11,378 + 250 and stepped down to 6144.
     p = revv.plan_launch(info, "12gb", None, 11744)
-    check("WSL2-style 11744 free -> ctx reduced to 6144 (chain counted)",
-          p.ctx, 6144)
+    check("WSL2-style 11744 free -> ctx 8192 (measured rung)", p.ctx, 8192)
+
+    # The actual WSL2 box, 2026-09-08: 11,516 MiB free. The old generic floor
+    # (11,528) refused it; it then ran at 4096 with 276 MiB to spare.
+    check("floor is derived from the measured rungs",
+          revv.VRAM_MIN_FREE_MIB, 11307 + revv.MEASURED_PEAK_MARGIN_MIB)
+    check("11516 free is above the floor", revv.tier_for(11516), "12gb")
+    p = revv.plan_launch(info, "12gb", None, 11516)
+    # 8192 is measured at the same peak, so it fits too and is preferred.
+    check("11516 free -> ctx 8192, q8_0 KV", (p.ctx, p.kv), (8192, "q8_0"))
+    check("11516 free -> no OOM warning",
+          any("WARNING" in n for n in p.notes), False)
+    check("11400 free is below the floor", revv.tier_for(11400), None)
 
     p = revv.plan_launch(info, "12gb", None, 24476)
     check("24GB -> f16 KV (the faster kernel, and it fits)", p.kv, "f16")

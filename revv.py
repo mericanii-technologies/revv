@@ -348,9 +348,11 @@ def model_peak_mib(info: "GGUFInfo", ctx: int, kv: str) -> Optional[int]:
     return int(round(weights + COMPUTE_OVERHEAD_MIB + ctx * rate))
 
 
-# The least free VRAM that can run anything at all: the smallest ladder rung.
-VRAM_MIN_FREE_MIB = (estimated_peak_mib(CONTEXT_LADDER[-1], "q8_0")
-                     + VRAM_MARGIN_MIB)
+# The least free VRAM that can run anything at all, by the generic estimator:
+# the smallest ladder rung plus the wide margin. Refined below, once BUILDS is
+# defined, by any rung that has actually been measured.
+_ESTIMATED_MIN_FREE_MIB = (estimated_peak_mib(CONTEXT_LADDER[-1], "q8_0")
+                           + VRAM_MARGIN_MIB)
 
 # Turing (7.5) is the floor: the i-quant kernels revv relies on take a code
 # path that does not exist on older architectures.
@@ -388,6 +390,14 @@ BUILDS: Dict[str, Dict[str, object]] = {
         "humaneval": 92.7,
         "decode_ts": 37.9,
         "peak_mib": 11830,
+        # Whole-process peaks measured at small contexts on a second RTX 3060
+        # under WSL2 (Ubuntu 26.04, driver 610.74, 2026-09-08): q8_0 KV, the
+        # n-gram+MTP chain running, -ctxcp 0, two consecutive requests that
+        # filled the context. 4096 read 11,307 MiB and 8192 read 11,253; the
+        # two are within the host's own share noise, so the larger stands for
+        # both. These include the chain, unlike peak_mib's anchor arithmetic,
+        # which is why plan_launch uses them directly with the narrow margin.
+        "measured_peaks": {4096: 11307, 8192: 11307},
         "note": "27B dense. Needs no host RAM beyond the VRAM. Slower than "
                 "the MoE build, and scored 4/34 against its 9/34 on our "
                 "multi-file editing instrument (p=0.039).",
@@ -524,6 +534,24 @@ def default_build_for_host() -> Tuple[str, str]:
 # Tier -> runtime configuration. Only the 12GB tier is certified; the others
 # are the same certified weights with the extra VRAM spent on context, which
 # is a derived setting, not a measured one.
+def _measured_min_free_mib() -> int:
+    """The floor: the least free VRAM any certified build has been MEASURED to
+    run in, plus the narrow margin -- or the estimator's figure if nothing
+    smaller was measured. A generic constant here turned away a WSL2 3060
+    with 11,516 MiB free that then ran the dense build at 4096 with 276 MiB
+    to spare (BENCHMARKS.md §19)."""
+    floor = _ESTIMATED_MIN_FREE_MIB
+    for spec in BUILDS.values():
+        if not spec.get("certified"):
+            continue
+        table = spec.get("measured_peaks") or {}
+        for peak in table.values():
+            floor = min(floor, int(peak) + MEASURED_PEAK_MARGIN_MIB)
+    return floor
+
+
+VRAM_MIN_FREE_MIB = _measured_min_free_mib()
+
 TIERS: Dict[str, Dict[str, object]] = {
     "12gb": {"min_mib": VRAM_MIN_FREE_MIB, "ctx": 16384, "kv": "q8_0",
              "certified": True,
@@ -2502,18 +2530,40 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # and the drafter, which are the estimated terms. See vram_margin_for().
     margin = vram_margin_for(info, chain_mib, draft)
 
+    def measured_total(at_ctx: int, at_kv: str) -> Optional[int]:
+        """A whole-process peak measured at exactly this rung, chain included,
+        if the build has one. Only for the q8_0 ladder with no external
+        drafter, which is the configuration the measurements were taken in."""
+        if draft is not None or at_kv != "q8_0" or spec is None:
+            return None
+        table = spec.get("measured_peaks") or {}
+        value = table.get(at_ctx)
+        return int(value) if value is not None else None
+
     def total_peak(at_ctx: int, at_kv: str) -> Optional[int]:
         """Everything that has to fit: the model, the drafter, the chain."""
+        measured = measured_total(at_ctx, at_kv)
+        if measured is not None:
+            return measured
         base = model_peak_mib(info, at_ctx, at_kv)
         if base is None:
             return None
         return base + draft_overhead_mib(draft, at_ctx, at_kv) + chain_mib
 
-    def fits(peak: Optional[int]) -> bool:
+    def margin_for(at_ctx: int, at_kv: str) -> int:
+        # A rung that was measured whole earns the narrow margin even when
+        # the build's anchor arithmetic would not.
+        if measured_total(at_ctx, at_kv) is not None:
+            return MEASURED_PEAK_MARGIN_MIB
+        return margin
+
+    def fits(at_ctx: int, at_kv: str) -> bool:
         # An unknown peak, or an unknown free figure, counts as fitting: the
         # estimator could not read this header, and refusing to serve on that
         # basis would be worse than trying.
-        return free_mib is None or peak is None or peak + margin <= free_mib
+        peak = total_peak(at_ctx, at_kv)
+        return (free_mib is None or peak is None
+                or peak + margin_for(at_ctx, at_kv) <= free_mib)
 
     thinking_off = info.supports_thinking
     if not thinking_off:
@@ -2529,14 +2579,14 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     if explicit_ctx is not None:
         peak = total_peak(ctx, str(t["kv"]))
         if peak is not None and free_mib is not None:
-            if peak + margin > free_mib:
+            if peak + margin_for(ctx, str(t["kv"])) > free_mib:
                 notes.append("--ctx %s needs ~%s but only %s is free; expect a "
                              "CUDA OOM" % ("{:,}".format(ctx), mib(peak),
                                            mib(free_mib)))
     elif free_mib is not None:
         def first_fitting_rung(at_kv: str) -> Optional[int]:
             for cand in CONTEXT_LADDER:
-                if cand <= preferred and fits(total_peak(cand, at_kv)):
+                if cand <= preferred and fits(cand, at_kv):
                     return cand
             return None
 
@@ -2568,7 +2618,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             kv = "f16"
         else:
             for cand in ("q8_0", "q4_0"):
-                if fits(total_peak(ctx, cand)):
+                if fits(ctx, cand):
                     kv = cand
                     break
             else:
@@ -2579,6 +2629,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                              % (mib(f16_peak), mib(free_mib), kv))
 
     peak = total_peak(ctx, kv)
+    margin = margin_for(ctx, kv)
     if peak is not None:
         if free_mib is not None and peak + margin > free_mib:
             # Two distinct situations, and saying "exceeds" for both is simply
@@ -2906,12 +2957,17 @@ class Backend:
         return self.proc is not None and self.proc.poll() is None
 
 
-def _tail(path: str, n: int = 15) -> str:
+def _tail(path: str, n: int = 15, since: Optional[str] = None) -> str:
+    """Last n lines of a log. With `since`, only lines after the LAST line
+    equal to it: revv.log accumulates across sessions, and showing a previous
+    run's banner under this run's error blames the wrong launch."""
     try:
         with open(path, "rb") as fh:
             lines = fh.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return "(no log)"
+    if since is not None and since in lines:
+        lines = lines[len(lines) - lines[::-1].index(since):]
     return "\n".join("  " + ln for ln in lines[-n:])
 
 
@@ -3779,7 +3835,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     while time.time() < deadline:
         if proc.poll() is not None:
             print("%s revv failed to start. Last log lines:\n%s"
-                  % (red("error:"), _tail(log_path, 20)), file=sys.stderr)
+                  % (red("error:"), _tail(log_path, 20, since="=== revv up ===")),
+                  file=sys.stderr)
             return 1
         try:
             st = _control(base, "status", timeout=3)
@@ -3796,7 +3853,8 @@ def cmd_up(args: argparse.Namespace) -> int:
         return 0
     proc.terminate()
     print("%s revv did not come up within %ds. Last log lines:\n%s"
-          % (red("error:"), int(args.timeout), _tail(log_path, 20)),
+          % (red("error:"), int(args.timeout),
+             _tail(log_path, 20, since="=== revv up ===")),
           file=sys.stderr)
     return 1
 
