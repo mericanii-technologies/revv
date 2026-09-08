@@ -13,8 +13,9 @@ PINNED_BUILD="b10712"
 REVV_VERSION="1.1.0"
 LLAMA_REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 
-# revv's own patched, CUDA-enabled prebuilt (rung 1). Not published at the
-# time this script was written -- the 404 case below is expected, not a bug.
+# revv's own patched, CUDA-enabled prebuilt (rung 1), published 2026-09-08
+# as GitHub release v1.1.0-binaries. A 404 here now means the asset moved or
+# the network is filtering GitHub, not that the release is pending.
 PREBUILT_URL="https://github.com/mericanii-technologies/revv/releases/download/v1.1.0-binaries/revv-llama-server-1.1.0-linux-x86_64-cuda12.tar.gz"
 PREBUILT_SHA256="c4af4f1f62955498c43008b50243d0fd8ab102b6380eb84a715301bf3bac32c6"
 # Multi-arch build, space-separated: Turing, Ampere (datacenter and
@@ -949,10 +950,12 @@ ensure_prebuilt_downloaded() {
         rm -f "$tmp"
         case "$DOWNLOAD_HTTP_CODE" in
             404)
-                PREBUILT_FAIL_REASON="the prebuilt release is not published yet (HTTP 404) -- this is expected until the first binary release is published"
-                PREBUILT_FAIL_DETAIL="This is expected right now: the revv prebuilt release hasn't been
-published yet. Use --source to build llama.cpp from source in the
-meantime, or --upstream for the official (Vulkan) prebuilt."
+                PREBUILT_FAIL_REASON="the prebuilt asset was not found at $PREBUILT_URL (HTTP 404)"
+                PREBUILT_FAIL_DETAIL="The release asset is published (v1.1.0-binaries, 2026-09-08), so a 404
+usually means this clone is old and points at a URL that has since moved
+(git pull and retry), or something between you and GitHub is rewriting
+the request. Use --source to build llama.cpp from source instead, or
+--upstream for the official (Vulkan) prebuilt."
                 ;;
             000)
                 PREBUILT_FAIL_REASON="could not reach $PREBUILT_URL (network error -- check connectivity, DNS, or a proxy)"
