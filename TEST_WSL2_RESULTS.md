@@ -1,6 +1,6 @@
 # TEST_WSL2_RESULTS.md: results of the end-to-end smoke test on the second machine (WSL2, RTX 3060)
 
-Run: 2026-09-08, a Windows 11 desktop running WSL2 with Ubuntu 26.04 LTS
+Run: 2026-09-08, a Windows 10 desktop running WSL2 with Ubuntu 26.04 LTS
 (glibc 2.43, Python 3.14.4, git 2.53). NVIDIA driver 610.74 installed on
 Windows, CUDA passed through to the guest. RTX 3060 12GB with the monitor
 attached to it. AMD Ryzen 5 3600, 6 cores / 12 threads, no integrated GPU.

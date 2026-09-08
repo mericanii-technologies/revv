@@ -453,7 +453,7 @@ that only ever gets tested on the author's box is worth very little.
 
 | machine | OS | config reached | `revv bench` decode | outcome |
 |---|---|---|---|---|
-| RTX 3060 12GB (second unit) | Windows 11 + WSL2 (Ubuntu) | ctx 8192, q8_0 KV, MTP n=2 | **revv 34.31 t/s** (91% of the 37.9 reference), **STOCK 22.09 t/s** (98% of the 22.5 reference), spread 0.3-0.4% | working, chat verified end to end |
+| RTX 3060 12GB (second unit) | Windows 10 + WSL2 (Ubuntu) | ctx 8192, q8_0 KV, MTP n=2 | **revv 34.31 t/s** (91% of the 37.9 reference), **STOCK 22.09 t/s** (98% of the 22.5 reference), spread 0.3-0.4% | working, chat verified end to end |
 
 Those are raw figures from that user's box, quoted as reported. We have not
 set an "expected band" for WSL2 — one machine is not a band.

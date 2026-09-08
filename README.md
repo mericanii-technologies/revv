@@ -39,7 +39,7 @@ Every command, and where the speed comes from: [COMMANDS.md](COMMANDS.md).
 ## Results
 
 RTX 3060 12GB. Linux box: Proxmox VM, Ubuntu 24.04 headless, 10 vCPU of a
-Ryzen 5 3600, 47 GB RAM, GPU by passthrough. Windows PC: Windows 11, WSL2
+Ryzen 5 3600, 47 GB RAM, GPU by passthrough. Windows PC: Windows 10, WSL2
 Ubuntu 26.04, Ryzen 5 3600, 24 GB of 32 GB given to WSL2, same 3060 driving
 the display.
 
