@@ -224,6 +224,21 @@ The planner's rules are general — read free VRAM not total, size context to
 fit, disable checkpoints near the ceiling, don't quantize KV for speed. Only
 these two builds are certified. Certification takes days per model.
 
+**Other cards.** Every number above is from one RTX 3060. On a bigger card
+revv runs the same two files and the speed levers still apply, because they
+are properties of the model, not the card: thinking off, the MTP head, and
+the n-gram chain all come with the file. What changes is the context: a 16 GB
+card gets 32K, a 24 GB card gets 64K with f16 KV, neither separately
+measured. Two things to know. The stock baseline is better on a big card,
+since a 4-bit file already fits, so expect the *ratio* to shrink even as the
+absolute number rises. And the MoE build keeps 16 expert layers on the CPU
+regardless of VRAM, because that is the certified config; on a 24 GB card
+the whole model fits on the GPU and `revv serve moe --n-cpu-moe 0` (flags
+after the model name go straight to llama-server) will likely be much
+faster. Nobody has measured it. Larger quants of the same two models, such as
+Unsloth's Q4_K_XL files, run the same way, uncertified. Below 12 GB of free
+VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
+
 ## Not supported
 
 - Under 12GB free VRAM, AMD, Apple Silicon, native Windows, CPU-only,

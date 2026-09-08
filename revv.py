@@ -29,7 +29,7 @@ from typing import (Any, BinaryIO, Callable, Dict, List, NamedTuple, Optional,
                     Sequence, Tuple)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def _git_sha() -> Optional[str]:

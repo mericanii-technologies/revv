@@ -10,7 +10,7 @@ set -e
 
 PINNED_COMMIT="daef7b6874397a5a7c3d7e38b55e2ee0adf7da38"
 PINNED_BUILD="b10712"
-REVV_VERSION="1.0.0"
+REVV_VERSION="1.1.0"
 LLAMA_REPO_URL="https://github.com/ggml-org/llama.cpp.git"
 
 # revv's own patched, CUDA-enabled prebuilt (rung 1). Not published at the

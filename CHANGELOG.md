@@ -4,6 +4,53 @@ All notable changes to revv are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-08
+
+### Added
+
+- **A second certified build.** Qwen3.6-35B-A3B UD-Q3_K_XL, 16 expert
+  layers on the CPU, `-t` at the physical core count: 55.9 t/s generation on
+  the RTX 3060, byte-identical across the thread sweep. Needs ~8 GiB of host
+  RAM free. Builds are named `moe` and `dense`; `revv get` with no argument
+  picks by host RAM.
+- **n-gram drafter chained in front of MTP.** `ngram-simple,draft-mtp` with a
+  256-entry table: 2.8–6.1× on editing work, byte-identical output, no effect
+  on generation. Both builds.
+- **Prebuilt binary, multi-arch.** `install.sh` downloads a patched
+  llama-server built for sm_75/80/86/89/90 with the CUDA runtime inside, and
+  checks its sha256. No compiler or toolkit needed. Falls back to `--source`
+  with an explanation when the prebuilt does not apply.
+- `revv update`, `revv uninstall` (models are a separate decision),
+  `revv adopt` for ollama and LM Studio stores, external `--draft` files,
+  automatic port fallback from 8080.
+- EXPERIMENTS.md: what was tried, what failed, and why. BENCHMARKS.md: an
+  editing instrument (34 multi-file tasks) run on both builds.
+
+### Changed
+
+- Context is sized to free VRAM read from the driver, not total. The usable
+  ceiling on a 12GB 3060 is 12,044 MiB, and headroom is reported against it.
+- The planner picks flags per model from the file header: no MTP head means
+  no speculation, no thinking switch means no thinking-off, and it says so.
+- `compare` runs a per-build stock arm and `bench` compares against a
+  per-build reference with a two-sided band, so both can fail honestly.
+- `install.sh` no longer reuses an llama-server found on PATH; it installs
+  its own under `~/.revv/bin` and leaves yours alone. `--system-llama-server`
+  opts back in.
+- The MTP claim: quality-neutral by a paired HumanEval-164 run, not
+  bit-identical. The earlier wording was wrong.
+
+### Fixed
+
+- Context checkpoints disabled (`-ctxcp 0`) whenever the planned peak leaves
+  under 500 MiB, which stops the die-on-second-request failure near the
+  ceiling; forced `--tier` always sets it.
+- `revv get speed` never worked (the build was overwritten unconditionally);
+  `revv up moe` did not accept the new names; `status` computed free VRAM
+  from the nominal figure; `compare` STOCK arm could OOM on the MoE build.
+- WSL2: driver reservation is read and the context ladder steps down instead
+  of OOMing; the CUDA toolchain is preflighted before a source build.
+
 ## [1.0.0] - 2026-09-02
 
 ### Fixed
