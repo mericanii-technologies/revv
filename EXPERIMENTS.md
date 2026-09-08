@@ -103,7 +103,7 @@ pilots overstate low-rank capture by roughly the hidden-dimension ratio. $3.10.
 
 **Vocabulary pruning.** Strip 120K non-ASCII tokens to reclaim 555 MB. First
 measured at −4.9 HumanEval points (p=0.0215) and killed; re-measured under the
-corrected protocol at 93.29% vs 93.90% (p=1.0) and exonerated. It buys real
+corrected protocol at 93.29% vs 92.68% for the unpruned file on the same 3060 (p=1.0) and exonerated. It buys real
 context: 57,344 vs 40,960 max with speculation on. The original damage was
 mostly thinking-bug truncations — our clearest case for why every pre-09-02
 verdict had to be re-audited. Still unshipped: it is an English-and-code
