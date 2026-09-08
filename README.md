@@ -265,7 +265,12 @@ VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
   Both are intended. Windows's share is not fixed: on our second 3060 it
   read 1,022 MiB with a browser open and 568 MiB with the desktop cleared,
   and revv plans against whatever is free at launch. Close GPU-using apps
-  before `revv up`, and expect an OOM if you open them mid-session.
+  before `revv up`, and expect an OOM if you open them mid-session. With the
+  desktop cleared (11.5–11.8 GB free) that box serves the MoE build at
+  8,192–12,288 context and the dense build at 8,192; both measured in
+  BENCHMARKS.md §19. WSL2 also caps Linux at half the PC's RAM by default,
+  which can hide enough of it to rule out the MoE build; `memory=24GB` in
+  `%UserProfile%\.wslconfig` fixes that on a 32 GB machine.
 - **The planner's headroom figure is an upper bound that drifts.** It anchors on
   a measured peak and scales only the KV term, so it is optimistic by ~26 MiB at
   the anchor context and ~104 MiB three rungs down the ladder. Shipped configs

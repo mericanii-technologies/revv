@@ -53,7 +53,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The free-VRAM floor was a generic constant (11,528 MiB) and refused a WSL2
   3060 with 11,516 free that then ran with 276 MiB to spare. The dense
   build's 4096 and 8192 rungs now carry measured peaks and the floor is
-  derived from them (11,457 MiB). BENCHMARKS.md §19.
+  derived from them (11,457 MiB). The MoE build's 4096, 8192 and 12288
+  rungs are measured on the same box; it now serves 12,288/q8_0 there
+  instead of 4096/q4_0. A monotonic guard keeps any estimate from
+  undercutting a measured smaller configuration. BENCHMARKS.md §19.
+- `revv doctor` now plans each certified file it finds and prints the
+  context and KV type `revv up` would use for it; the tier line planned a
+  generic file and disagreed with `up`. `revv bench` shows the MoE build's
+  own no-speculation reference instead of the dense one.
 - `install.sh`: a helper overwrote the caller's destination variable, so the
   downloaded archive stayed under its temporary name; the runtime library
   check ran `ldd` without the bundled lib path and told users to install a

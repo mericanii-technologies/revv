@@ -422,6 +422,15 @@ BUILDS: Dict[str, Dict[str, object]] = {
         # MoE: experts live in host RAM and stream in, so this line has a
         # second requirement the dense build does not have.
         "n_cpu_moe": 16,
+        # Whole-process peaks on the WSL2 3060 (BENCHMARKS.md §19), q8_0 KV,
+        # chain on, -ctxcp 0, two consecutive context-filling requests. The
+        # KV term here is small (hybrid attention), so these sit well under
+        # the anchor arithmetic from peak_mib: without them the planner
+        # dropped this build to 4096/q4_0 on 11,555 MiB free. 16384 measured
+        # 11,659 there with 161 MiB spare, under the 200 MiB standard, so the
+        # box's certified 11,832 stands for that rung.
+        "measured_peaks": {4096: 11407, 8192: 11487, 12288: 11521},
+        "nospec_ts": 22.2,
         "host_ram_mib": 8192,
         # STOCK for this build: `-ngl 99` is impossible here (all 41 layers to
         # VRAM needs 15,499 MiB on a 12 GiB card), so STOCK is the nominal
@@ -1732,8 +1741,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             continue
         verdict, _ = classify(info, name)
         tag = OK if verdict.startswith("CERTIFIED") else WARN
+        detail = verdict
+        if tier is not None and verdict.startswith("CERTIFIED"):
+            # The tier line above plans a generic file; this plans THIS one,
+            # which is what `revv up` will actually do with it.
+            plan = plan_launch(info, tier, None, best.free_mib)
+            detail += ("\nwould run at context %s, %s KV, ~%s peak"
+                       % ("{:,}".format(plan.ctx), plan.kv,
+                          mib(plan.estimated_peak)))
+            if any(n.startswith("WARNING") for n in plan.notes):
+                detail += "  (with a warning; see revv serve)"
         status(tag, "%s  %s  %s" % (name, gib(info.file_size),
-                                    info.dominant_quant), verdict)
+                                    info.dominant_quant), detail)
 
     print("\n" + bold("Verdict"))
     if problems == 0 and tier is not None and exe is not None:
@@ -2540,6 +2559,18 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         value = table.get(at_ctx)
         return int(value) if value is not None else None
 
+    def measured_floor(at_ctx: int) -> int:
+        """The largest measured peak at any rung no bigger than at_ctx. A
+        bigger context, or a wider KV type, cannot need less than a smaller
+        configuration that was measured whole -- but the anchor arithmetic
+        can say so (it put f16 at 6144 under the measured q8_0 at 4096 for
+        the MoE build), and that estimate would have launched into an OOM."""
+        if spec is None:
+            return 0
+        table = spec.get("measured_peaks") or {}
+        return max([int(v) for c, v in table.items() if int(c) <= at_ctx]
+                   or [0])
+
     def total_peak(at_ctx: int, at_kv: str) -> Optional[int]:
         """Everything that has to fit: the model, the drafter, the chain."""
         measured = measured_total(at_ctx, at_kv)
@@ -2548,7 +2579,10 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         base = model_peak_mib(info, at_ctx, at_kv)
         if base is None:
             return None
-        return base + draft_overhead_mib(draft, at_ctx, at_kv) + chain_mib
+        total = base + draft_overhead_mib(draft, at_ctx, at_kv) + chain_mib
+        if draft is None:
+            total = max(total, measured_floor(at_ctx))
+        return total
 
     def margin_for(at_ctx: int, at_kv: str) -> int:
         # A rung that was measured whole earns the narrow margin even when
@@ -4305,14 +4339,17 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
     print("\n  " + bold("reference (RTX 3060 12GB, sm_86, this same protocol)"))
     print("    %-44s %6.1f t/s" % (ref_name, ref_ts))
+    nospec = float((BUILDS.get(build_name or "") or {}).get("nospec_ts")
+                   or BENCH_REF_NOSPEC)
     print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
-                                   BENCH_REF_NOSPEC))
+                                   nospec))
     print("    comparing against the %s (%.1f t/s)" % (target_label, target))
     if build_name is None:
         print(dim("    This model is not a registered build, so the dense"))
         print(dim("    reference is used as a stand-in. Treat it loosely."))
-    print(dim("    Certification used a different prompt and reads 34.4-36.7"))
-    print(dim("    t/s for the dense build; see BENCHMARKS.md. Do not mix them."))
+    if build_name in (None, "IQ3_XXS"):
+        print(dim("    Certification used a different prompt and reads 34.4-36.7"))
+        print(dim("    t/s for the dense build; see BENCHMARKS.md. Do not mix them."))
 
     print("\n  " + bold("reading"))
     ratio = mean / target

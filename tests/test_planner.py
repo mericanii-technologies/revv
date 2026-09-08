@@ -265,6 +265,26 @@ def test_kv_and_context():
           any("WARNING" in n for n in p.notes), False)
     check("11400 free is below the floor", revv.tier_for(11400), None)
 
+    # The MoE build on the same WSL2 box (BENCHMARKS.md §19): measured 4096,
+    # 8192 and 12288 rungs. Before them the planner dropped it to 4096/q4_0
+    # on 11,555 free; the card then ran 12288/q8_0 with 299 MiB to spare.
+    speed = speed_like()
+    p = revv.plan_launch(speed, "12gb", None, 11785)
+    check("MoE 11785 free -> ctx 12288 q8_0 (measured rung)",
+          (p.ctx, p.kv, p.estimated_peak), (12288, "q8_0", 11521))
+    p = revv.plan_launch(speed, "12gb", None, 11640)
+    check("MoE 11640 free -> ctx 8192 q8_0", (p.ctx, p.kv), (8192, "q8_0"))
+    # No estimate may undercut a measured smaller configuration: f16 at
+    # 6144 must cost at least the measured q8_0 at 4096.
+    p = revv.plan_launch(speed, "12gb", None, 11555)
+    check("MoE 11555 free never upgrades to f16 below a measured rung",
+          p.kv != "f16", True)
+    check("MoE 11555 free -> estimated peak >= measured 4096 floor",
+          p.estimated_peak >= 11407, True)
+    p = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB)
+    check("MoE reference 3060 still reaches certified 16384 / 11832",
+          (p.ctx, p.estimated_peak), (16384, 11832))
+
     p = revv.plan_launch(info, "12gb", None, 24476)
     check("24GB -> f16 KV (the faster kernel, and it fits)", p.kv, "f16")
 

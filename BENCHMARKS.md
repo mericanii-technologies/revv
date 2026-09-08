@@ -777,6 +777,35 @@ the smallest measured rung: 11,457 MiB. Both runs clear the ≥200 MiB
 standard. A short unforced request at 4096 ran at 36.3 t/s with chain
 acceptance 0.95, mean draft length 2.9.
 
+**MoE build, same box, same protocol** (WSL2 memory raised to 24 GB first;
+the default 50% cap left 15 GB, under this build's host-RAM need):
+
+| ctx | free before | min free during | process peak | headroom | notes |
+|---|---|---|---|---|---|
+| 4096 | 11,841 | 434 | 11,407 | 434 | 3,008-token prompts, 600-token completions |
+| 8192 | 11,841 | 354 | 11,487 | 354 | 6,927-token prompts, 900-token completions |
+| 12288 | 11,820 | 299 | 11,521 | 299 | 11,154-token prompts, 900-token completions |
+| 16384 | 11,820 | 161 | 11,659 | 161 | under the 200 MiB standard; the box's certified 11,832 stands |
+
+The KV term is small on this hybrid-attention model, so the anchor arithmetic
+from the certified 16384 peak over-charged the small rungs by 200–400 MiB
+and dropped the build to 4096 with q4_0 KV on 11,555 MiB free. The three
+measured rungs now carry their figures, and a monotonic guard stops any
+estimate (for a larger context or a wider KV type) from undercutting a
+measured smaller configuration.
+
+Unforced runs on this box, both builds, with the desktop cleared:
+
+| build | `revv up` plan | `bench` | `compare` STOCK → REVV | time to done |
+|---|---|---|---|---|
+| dense | 8192, q8_0 | 36.25 t/s (within 5% of 37.9) | 21.9 → 34.6 t/s | 94.2 s → 25.2 s, 3.74× |
+| MoE | 4096, q4_0 (pre-fix) | 47.0 t/s (84% of 55.9) | 18.7 → 41.9 t/s | 110.1 s → 24.5 s, 4.49× |
+
+The MoE shortfall against the box is expected: `-t 6` on six physical cores
+against `-t 8` on the box's eight vCPUs, host RAM bandwidth through the
+Hyper-V guest, and 4096/q4_0 rather than 16384/q8_0. Same Ryzen 5 3600
+family on both machines.
+
 Windows's share of the card moved between 1,022 and 568 MiB during the
 session depending on what was open on the desktop. Every number here is
 against free VRAM at the moment of launch.
