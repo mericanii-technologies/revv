@@ -96,6 +96,10 @@ through WSL2; the two models above. Not: under 12 GB free, AMD, Apple Silicon,
 native Windows, CPU-only, multi-GPU. Details, other cards, known issues:
 [LIMITS.md](LIMITS.md).
 
+## Paper
+
+[Cheaper intelligence on P.O.S. hardware: what one RTX 3060 can be pushed to infer](paper/cheaper-intelligence.pdf) (PDF, 11 pages). The argument, the numbers, the 22 failed ideas, and what it means for the consumer installed base.
+
 ## More
 
 [COMMANDS.md](COMMANDS.md) every command and the levers ·
