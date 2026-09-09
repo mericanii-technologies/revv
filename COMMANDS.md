@@ -26,6 +26,11 @@ here is measured; the protocols are in [BENCHMARKS.md](BENCHMARKS.md).
   still carries a draft head; **`update`** and **`uninstall`** are one command.
 - **`serve --print-command`** prints the exact llama-server command line revv
   would run, so you can run the same configuration by hand with no revv at all.
+- **`up`/`serve --long`** switches the `moe` build to its certified
+  128K-context profile: 22 expert blocks on the CPU, 46.8 t/s at short context (bench protocol), 43.1 at empty
+  context, ~17.0 t/s with the context full, against 55.9 t/s on the default
+  16,384-context profile. One measured configuration, not a ladder -- it
+  refuses outright rather than stepping down if VRAM is short.
 - **A prebuilt binary with the CUDA runtime bundled**, so a first install needs
   no compiler and no CUDA toolkit.
 - **Context sized to the VRAM that is actually free**, not the total, with a

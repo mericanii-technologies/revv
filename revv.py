@@ -29,7 +29,7 @@ from typing import (Any, BinaryIO, Callable, Dict, List, NamedTuple, Optional,
                     Sequence, Tuple)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 
 def _git_sha() -> Optional[str]:
@@ -468,6 +468,30 @@ BUILDS: Dict[str, Dict[str, object]] = {
                 "against the dense build's 4/34 on our multi-file editing "
                 "instrument (p=0.039). Needs ~8 GiB of free host RAM on top "
                 "of the VRAM, because the experts stream from it.",
+        # One measured long-context point, not a ladder: 131,072 context on
+        # the reference RTX 3060 12GB (BENCHMARKS.md s20), q8_0 KV, 22 expert
+        # blocks on the CPU (up from the default profile's 16 -- more experts
+        # on the CPU buys the room for the bigger KV cache), -t 8, the usual
+        # chain (ngram-simple,draft-mtp, draft 2, size_m 256), -ctxcp 0.
+        # Whole-process peak 11,611 MiB (12,043 free before, minimum 432 free
+        # during, across two consecutive requests that filled 128,517
+        # tokens). 20 blocks on the CPU OOM'd at load, so this is the
+        # narrowest offload that fits -- there is no smaller rung to fall
+        # back to. Decode 46.8 t/s on the bench protocol (43.1 on a code prompt, spread 0.9%), 17.0 t/s
+        # with 128,517 tokens in context; prefill 456 t/s.
+        "long": {
+            "ctx": 131072,
+            "kv": "q8_0",
+            "n_cpu_moe": 22,
+            "peak_mib": 11611,
+            "decode_ts": 46.8,
+            "deep_decode_ts": 17.0,
+            "note": "128K context on the MoE build: 22 expert blocks on the "
+                    "CPU (vs 16 for the default 16K profile), 46.8 t/s at "
+                    "empty context, ~17.0 t/s with the context full. One "
+                    "measured point, not a ladder -- 20 CPU blocks OOM'd at "
+                    "load, so there is no smaller rung to step down to.",
+        },
     },
     "Q2_K_XL": {
         "file": "Qwen3.8-27B-UD-Q2_K_XL.gguf",
@@ -2472,7 +2496,8 @@ class LaunchPlan:
                  ctx_checkpoints: Optional[int] = None,
                  n_cpu_moe: Optional[int] = None,
                  build_name: Optional[str] = None,
-                 n_threads: Optional[int] = None) -> None:
+                 n_threads: Optional[int] = None,
+                 profile: Optional[str] = None) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2497,6 +2522,13 @@ class LaunchPlan:
         # just a load-time one. None = leave llama-server's default; only set
         # when n_cpu_moe is also set.
         self.n_threads = n_threads
+        # None = the tier's ordinary profile. "long" = a build's named,
+        # separately-measured sub-spec (e.g. the MoE build's 128K profile) is
+        # in effect instead of the tier's own ctx/kv/n_cpu_moe. Carried onto
+        # the status endpoint so `revv bench` grades against the right
+        # reference, and into the status line so a user does not mistake a
+        # 17 t/s decode for a regression.
+        self.profile = profile
 
     @property
     def levers(self) -> List[str]:
@@ -2546,7 +2578,13 @@ def draft_overhead_mib(draft: Optional["GGUFInfo"], ctx: int,
 
 def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                 free_mib: Optional[int],
-                draft: Optional["GGUFInfo"] = None) -> LaunchPlan:
+                draft: Optional["GGUFInfo"] = None,
+                long_spec: Optional[Dict[str, object]] = None) -> LaunchPlan:
+    """long_spec is the build's "long" registry sub-spec, or None for the
+    ordinary tier profile. It is resolved by the CLI (resolve_long_profile),
+    which is also where an unsupported build or insufficient VRAM is refused
+    -- this function trusts long_spec once given and never steps it down,
+    because it is one measured point, not a ladder rung."""
     t = TIERS[tier]
     preferred = explicit_ctx if explicit_ctx is not None else int(t["ctx"])
     notes = []      # type: List[str]
@@ -2557,9 +2595,12 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     build_name = identify_build(info)
     spec = BUILDS.get(build_name) if build_name else None
     n_cpu_moe = None    # type: Optional[int]
-    if spec is not None and spec.get("n_cpu_moe") is not None:
+    if long_spec is not None:
+        n_cpu_moe = int(long_spec["n_cpu_moe"])
+    elif spec is not None and spec.get("n_cpu_moe") is not None:
         n_cpu_moe = int(spec["n_cpu_moe"])
-        need_ram = int(spec.get("host_ram_mib") or 0)
+    if n_cpu_moe is not None:
+        need_ram = int((spec or {}).get("host_ram_mib") or 0)
         total_ram, avail_ram = host_ram_mib()
         notes.append("mixture-of-experts build: %d expert layers stay on the "
                      "CPU and stream from host RAM, which is where the speed "
@@ -2683,66 +2724,95 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         notes.append("this model's chat template has no thinking switch, so "
                      "there is nothing to disable")
 
-    # Context: the largest rung that fits, measured at q8_0 so the choice is
-    # about capacity rather than precision. An EXPLICIT --ctx is honoured
-    # exactly and never snapped to the ladder -- silently handing a user more
-    # context than they asked for is how you turn a deliberate choice into an
-    # OOM.
-    ctx = preferred
-    if explicit_ctx is not None:
-        peak = total_peak(ctx, str(t["kv"]))
-        if peak is not None and free_mib is not None:
-            if peak + margin_for(ctx, str(t["kv"])) > free_mib:
-                notes.append("--ctx %s needs ~%s but only %s is free; expect a "
-                             "CUDA OOM" % ("{:,}".format(ctx), mib(peak),
-                                           mib(free_mib)))
-    elif free_mib is not None:
-        def first_fitting_rung(at_kv: str) -> Optional[int]:
-            for cand in CONTEXT_LADDER:
-                if cand <= preferred and fits(cand, at_kv):
-                    return cand
-            return None
-
-        chosen = first_fitting_rung("q8_0")
-        if chosen is None:
-            # Nothing fits at q8_0. Retry at q4_0 before giving up context:
-            # halving the cache is cheaper than an eighth of the context.
-            chosen = first_fitting_rung("q4_0")
-        if chosen is None:
-            chosen = CONTEXT_LADDER[-1]
-        if chosen != preferred:
-            notes.append("context reduced %s -> %s to fit %s free"
-                         % ("{:,}".format(preferred), "{:,}".format(chosen),
-                            mib(free_mib)))
-        ctx = chosen
-
-    # KV precision by need, not by habit. f16 is the faster kernel; quantizing
-    # is a compute tax paid only to buy capacity we would not otherwise have.
-    kv = str(t["kv"])
-    if free_mib is None:
-        pass                            # tier was forced; keep its setting
+    if long_spec is not None:
+        # One measured point, not a ladder: the CLI (resolve_long_profile)
+        # already refused this launch if it does not fit, so there is
+        # nothing here to step down. explicit_ctx cannot coexist with
+        # long_spec -- the CLI refuses that combination before this runs.
+        ctx = int(long_spec["ctx"])
+        kv = str(long_spec["kv"])
     else:
-        f16_peak = total_peak(ctx, "f16")
-        if f16_peak is not None and f16_peak + margin <= free_mib:
-            if kv != "f16":
-                notes.append("f16 KV fits (~%s of %s free) and is the faster "
-                             "kernel, so revv is not quantizing the cache"
-                             % (mib(f16_peak), mib(free_mib)))
-            kv = "f16"
-        else:
-            for cand in ("q8_0", "q4_0"):
-                if fits(ctx, cand):
-                    kv = cand
-                    break
-            else:
-                kv = "q4_0"
-            if f16_peak is not None:
-                notes.append("f16 KV would need ~%s, over the %s free, so the "
-                             "cache is %s to fit"
-                             % (mib(f16_peak), mib(free_mib), kv))
+        # Context: the largest rung that fits, measured at q8_0 so the choice
+        # is about capacity rather than precision. An EXPLICIT --ctx is
+        # honoured exactly and never snapped to the ladder -- silently
+        # handing a user more context than they asked for is how you turn a
+        # deliberate choice into an OOM.
+        ctx = preferred
+        if explicit_ctx is not None:
+            peak = total_peak(ctx, str(t["kv"]))
+            if peak is not None and free_mib is not None:
+                if peak + margin_for(ctx, str(t["kv"])) > free_mib:
+                    notes.append("--ctx %s needs ~%s but only %s is free; "
+                                 "expect a CUDA OOM"
+                                 % ("{:,}".format(ctx), mib(peak),
+                                    mib(free_mib)))
+        elif free_mib is not None:
+            def first_fitting_rung(at_kv: str) -> Optional[int]:
+                for cand in CONTEXT_LADDER:
+                    if cand <= preferred and fits(cand, at_kv):
+                        return cand
+                return None
 
-    peak = total_peak(ctx, kv)
-    margin = margin_for(ctx, kv)
+            chosen = first_fitting_rung("q8_0")
+            if chosen is None:
+                # Nothing fits at q8_0. Retry at q4_0 before giving up
+                # context: halving the cache is cheaper than an eighth of
+                # the context.
+                chosen = first_fitting_rung("q4_0")
+            if chosen is None:
+                chosen = CONTEXT_LADDER[-1]
+            if chosen != preferred:
+                notes.append("context reduced %s -> %s to fit %s free"
+                             % ("{:,}".format(preferred),
+                                "{:,}".format(chosen), mib(free_mib)))
+            ctx = chosen
+
+        # KV precision by need, not by habit. f16 is the faster kernel;
+        # quantizing is a compute tax paid only to buy capacity we would not
+        # otherwise have.
+        kv = str(t["kv"])
+        if free_mib is None:
+            pass                        # tier was forced; keep its setting
+        else:
+            f16_peak = total_peak(ctx, "f16")
+            if f16_peak is not None and f16_peak + margin <= free_mib:
+                if kv != "f16":
+                    notes.append("f16 KV fits (~%s of %s free) and is the "
+                                 "faster kernel, so revv is not quantizing "
+                                 "the cache" % (mib(f16_peak), mib(free_mib)))
+                kv = "f16"
+            else:
+                for cand in ("q8_0", "q4_0"):
+                    if fits(ctx, cand):
+                        kv = cand
+                        break
+                else:
+                    kv = "q4_0"
+                if f16_peak is not None:
+                    notes.append("f16 KV would need ~%s, over the %s free, "
+                                 "so the cache is %s to fit"
+                                 % (mib(f16_peak), mib(free_mib), kv))
+
+    if long_spec is not None:
+        # The registry's measured whole-process peak for this profile, not
+        # the generic anchor arithmetic (which has no idea 131,072 tokens of
+        # hybrid-attention KV costs far less than the estimator would guess,
+        # and no measured_peaks rung anywhere near this context to fall back
+        # on). Narrow margin: this is purely a measurement, like the tier's
+        # own peak_mib.
+        peak = int(long_spec["peak_mib"])
+        margin = MEASURED_PEAK_MARGIN_MIB
+        base = spec.get("decode_ts") if spec else None
+        notes.append(
+            "long profile: %s context, %d expert blocks on the CPU; decode "
+            "%.1f t/s at empty context and about %.0f t/s with the context "
+            "full, against %.1f t/s on the default %s profile"
+            % ("{:,}".format(ctx), n_cpu_moe or 0,
+               float(long_spec["decode_ts"]), float(long_spec["deep_decode_ts"]),
+               float(base) if base else 0.0, "{:,}".format(int(t["ctx"]))))
+    else:
+        peak = total_peak(ctx, kv)
+        margin = margin_for(ctx, kv)
     if peak is not None:
         if free_mib is not None and peak + margin > free_mib:
             # Two distinct situations, and saying "exceeds" for both is simply
@@ -2766,7 +2836,12 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # ceiling produces a server that passes its health check and then dies on
     # the second request. Turn them off before that can happen.
     ctx_checkpoints = None      # type: Optional[int]
-    if free_mib is None:
+    if long_spec is not None:
+        # Certified with checkpoints off (-ctxcp 0): this profile runs at
+        # 432 MiB minimum free during a context-filling request, nowhere
+        # near CHECKPOINT_HEADROOM_MIB, so this is not a computed guess.
+        ctx_checkpoints = 0
+    elif free_mib is None:
         # Tier forced with --tier: no VRAM reading, so ctx is the tier's
         # declared value (16384 on the 12GB tier -- more than a real 12GB
         # card holds). Headroom is UNKNOWN, not large, and guessing wrong
@@ -2792,7 +2867,38 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
 
     return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
                       draft.path if draft else None, draft_spec_type,
-                      ctx_checkpoints, n_cpu_moe, build_name, n_threads)
+                      ctx_checkpoints, n_cpu_moe, build_name, n_threads,
+                      "long" if long_spec is not None else None)
+
+
+def resolve_long_profile(build_name: Optional[str],
+                         free_mib: Optional[int]
+                         ) -> Dict[str, object]:
+    """The registry's "long" sub-spec for this build, or die trying.
+
+    Called by the CLI before plan_launch, because a long profile is one
+    measured point, not a ladder rung: there is no smaller context to step
+    down to if it does not fit, so the right answer is to refuse with the
+    numbers, not to warn and launch anyway.
+    """
+    spec = BUILDS.get(build_name) if build_name else None
+    long_spec = spec.get("long") if spec else None
+    if not isinstance(long_spec, dict):
+        die("no long-context profile has been certified for %s; only the "
+            "MoE build has one" % (build_name or "this model"),
+            "revv up moe --long")
+        return {}       # unreachable
+    peak = int(long_spec["peak_mib"])
+    need = peak + MEASURED_PEAK_MARGIN_MIB
+    if free_mib is not None and free_mib < need:
+        die("the long profile needs ~%s free (%s measured peak + %s margin) "
+            "but only %s is free"
+            % (mib(need), mib(peak), mib(MEASURED_PEAK_MARGIN_MIB),
+               mib(free_mib)),
+            "This is one measured configuration, not a ladder revv can step "
+            "down -- free up VRAM, or drop --long for the default profile.")
+        return {}       # unreachable
+    return long_spec
 
 
 # What STOCK means for a build that has no registry `stock` entry.
@@ -3192,6 +3298,12 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
                     "tier": backend.tier,
                     "context": plan.ctx,
                     "kv": plan.kv,
+                    # None for the tier's ordinary profile, "long" for a
+                    # build's named sub-spec -- so `revv status` can show it
+                    # and `revv bench` can pick the matching reference
+                    # instead of grading a 128K-context run against the
+                    # default profile's number.
+                    "profile": plan.profile,
                     "line": (BUILDS[plan.build_name].get("line")
                              if plan.build_name in BUILDS else None),
                     # Which levers this model can actually use, so toggle and
@@ -3431,7 +3543,16 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
         except GGUFError as exc:
             die("cannot read the draft model: %s" % exc)
             return 1
-    plan = plan_launch(info, tier, args.ctx, free_mib, draft_info)
+
+    long_spec = None     # type: Optional[Dict[str, object]]
+    if args.long:
+        if args.ctx is not None:
+            die("--ctx and --long conflict: the long profile is a fixed, "
+                "measured context, not something --ctx can override",
+                "Drop --ctx, or drop --long and size --ctx yourself.")
+            return 1
+        long_spec = resolve_long_profile(identify_build(info), free_mib)
+    plan = plan_launch(info, tier, args.ctx, free_mib, draft_info, long_spec)
 
     # Resolved before anything binds or prints, so --print-command shows the
     # port the server would actually use.
@@ -3447,8 +3568,9 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     if args.port is None and port != DEFAULT_PORT:
         print("  %s port %d was busy, using %d instead"
               % (yellow("note:"), DEFAULT_PORT, port))
-    print("  tier     %s   context %s   KV %s"
-          % (tier.upper(), "{:,}".format(plan.ctx), plan.kv))
+    print("  tier     %s   context %s   KV %s%s"
+          % (tier.upper(), "{:,}".format(plan.ctx), plan.kv,
+             "   profile long" if plan.profile else ""))
     if plan.estimated_peak:
         print("  vram     ~%s estimated peak%s"
               % (mib(plan.estimated_peak),
@@ -3932,6 +4054,8 @@ def cmd_up(args: argparse.Namespace) -> int:
             argv += [flag, str(value)]
     if args.stock:
         argv.append("--stock")
+    if args.long:
+        argv.append("--long")
 
     print("Starting revv in the background...")
     print("  log  %s" % log_path)
@@ -4084,9 +4208,10 @@ def cmd_status(args: argparse.Namespace) -> int:
           % (st["model"], MODEL_ALIAS))
     if st.get("line"):
         print("  line     %s" % str(st["line"]).upper())
-    print("  tier     %s   context %s   KV %s"
+    print("  tier     %s   context %s   KV %s%s"
           % (str(st["tier"]).upper(),
-             "{:,}".format(int(st.get("context") or 0)), st.get("kv", "?")))
+             "{:,}".format(int(st.get("context") or 0)), st.get("kv", "?"),
+             "   profile long" if st.get("profile") else ""))
     if st.get("tuning_is_noop"):
         print("  tuning   %s"
               % yellow("no lever applies to this model; serving stock config"))
@@ -4297,8 +4422,8 @@ def thinking_check(base: str, timeout: float) -> Tuple[bool, str]:
     return True, "\n".join(lines)
 
 
-def bench_reference(build_name: Optional[str],
-                    patched: bool) -> Tuple[float, float, str]:
+def bench_reference(build_name: Optional[str], patched: bool,
+                    profile: Optional[str] = None) -> Tuple[float, float, str]:
     """(target, reference t/s, human name) for the build actually loaded.
 
     Grading every build against the dense build's number made the instrument
@@ -4306,9 +4431,20 @@ def bench_reference(build_name: Optional[str],
     that is a 51% overshoot which the old one-sided `ratio >= 0.95` test
     reported as "on target". A MoE regression all the way down to 40 t/s would
     still have passed.
+
+    profile carries the same idea one step further: a server running the
+    MoE build's --long profile decodes at ~17-47 t/s by design (128K context,
+    22 expert blocks on the CPU), and grading that against the default
+    profile's 55.9 would report a real, working long-context server as a
+    two-thirds regression.
     """
     spec = BUILDS.get(build_name) if build_name else None
-    if build_name == DEFAULT_BUILD:
+    long_spec = spec.get("long") if spec else None
+    if profile == "long" and isinstance(long_spec, dict):
+        ref_ts = float(long_spec["decode_ts"])
+        name = "%s long profile, %s context" % (
+            build_name, "{:,}".format(int(long_spec["ctx"])))
+    elif build_name == DEFAULT_BUILD:
         # The dense build has a figure measured under THIS protocol, which is
         # not the same as its registry decode_ts (37.86 vs the certification
         # protocol's 34.39). Prefer the protocol-matched one.
@@ -4331,12 +4467,16 @@ def cmd_bench(args: argparse.Namespace) -> int:
     print("  protocol %d requests, %d new tokens, greedy, thinking off"
           % (BENCH_REQUESTS, BENCH_N_PREDICT))
 
-    # Which build is loaded decides which reference applies. Best-effort: a
-    # plain llama-server behind --url has no revv control endpoint, and that is
-    # fine -- bench_reference falls back to the dense stand-in and says so.
+    # Which build is loaded, and which profile, decides which reference
+    # applies. Best-effort: a plain llama-server behind --url has no revv
+    # control endpoint, and that is fine -- bench_reference falls back to the
+    # dense stand-in and says so.
     build_name = None       # type: Optional[str]
+    profile = None          # type: Optional[str]
     try:
-        build_name = _control(base, "status", timeout=5).get("build")
+        st0 = _control(base, "status", timeout=5)
+        build_name = st0.get("build")
+        profile = st0.get("profile")
     except (urllib.error.URLError, OSError, ValueError):
         pass
 
@@ -4411,17 +4551,25 @@ def cmd_bench(args: argparse.Namespace) -> int:
     manifest = read_build_manifest()
     patched = bool(manifest and "mmvq_iquant_decode.patch"
                    in (manifest.get("patches") or []))
-    target, ref_ts, ref_name = bench_reference(build_name, patched)
+    target, ref_ts, ref_name = bench_reference(build_name, patched, profile)
     target_label = ("kernel-patched build" if patched else
                     "stock build" if manifest else
                     "stock build (assumed: unknown provenance)")
 
     print("\n  " + bold("reference (RTX 3060 12GB, sm_86, this same protocol)"))
     print("    %-44s %6.1f t/s" % (ref_name, ref_ts))
-    nospec = float((BUILDS.get(build_name or "") or {}).get("nospec_ts")
-                   or BENCH_REF_NOSPEC)
-    print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
-                                   nospec))
+    if profile == "long":
+        # Not measured: the long profile's certification ran the usual
+        # protocol with speculation ON only. Printing the default profile's
+        # no-speculation figure here would compare a 128K-context run
+        # against a number from a different context entirely.
+        print("    %-44s %6s" % ("speculation off (what MTP buys you)",
+                                 "not measured"))
+    else:
+        nospec = float((BUILDS.get(build_name or "") or {}).get("nospec_ts")
+                       or BENCH_REF_NOSPEC)
+        print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
+                                       nospec))
     print("    comparing against the %s (%.1f t/s)" % (target_label, target))
     if build_name is None:
         print(dim("    This model is not a registered build, so the dense"))
@@ -4810,6 +4958,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="external draft model for speculative decoding, "
                              "for targets with no built-in head "
                              "(experimental, uncertified)")
+        sp.add_argument("--long", action="store_true",
+                        help="a build's certified long-context profile "
+                             "(currently: the MoE build, 131,072 context, "
+                             "22 expert blocks on the CPU; slower decode in "
+                             "exchange for the context). Conflicts with "
+                             "--ctx")
 
     s = sub.add_parser(
         "serve", help="run the stack in the foreground (verbose; for debugging)",

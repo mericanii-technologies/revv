@@ -89,6 +89,10 @@ Point your tool at that. `./revv.py status` shows what is running,
 `./revv.py down` stops it, `./revv.py uninstall` removes revv and asks
 separately about the downloaded models.
 
+`revv up moe --long` serves 128K context on the MoE build: 47 t/s at short
+context, about 17 t/s with the context full, 22 expert blocks on the CPU.
+The default 16K profile is 56 t/s. Both measured; BENCHMARKS.md §20.
+
 ## Supported
 
 NVIDIA with 12 GB or more of free VRAM, Turing or newer; Linux, or Windows

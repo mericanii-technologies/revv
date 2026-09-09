@@ -816,6 +816,21 @@ Windows's share of the card moved between 1,022 and 275 MiB during the
 session depending on what was open on the desktop. Every number here is
 against free VRAM at the moment of launch.
 
+## 20. MoE build, 128K context profile (2026-09-09)
+
+Question raised by a reader: the MoE build serves 16,384 context by default, but its KV cache is small (a cache in 10 of 40 layers), so context can be bought by moving expert blocks off the card. Measured on the reference box (RTX 3060 12GB, 12,043 MiB free at launch, certified v11 binary), Qwen3.6-35B-A3B UD-Q3_K_XL, `-c 131072`, q8_0 KV, `-t 8`, the shipped chain (`ngram-simple,draft-mtp`, draft 2, size_m 256), `-ctxcp 0`, `nvidia-smi` sampled every second. Raw logs: `ollama:/data/scratch/longctx/`.
+
+| expert blocks on CPU | load | free after load | decode, empty context (4 × 400 tok) | decode at 128,517 tokens in context | prefill | min free during |
+|---|---|---|---|---|---|---|
+| 20 | out of memory at load | | | | | |
+| **22** | ok | 642 MiB | **43.1 t/s** code prompt (spread 0.9%); **46.8 t/s** on the `revv bench` protocol; 50.4 on one short request | **17.0 t/s** (2 consecutive requests, 600 tok each) | 456 t/s | **432 MiB** |
+
+Against the default profile (16 blocks on the CPU, 16,384 context, 55.9 t/s, 212 MiB): the long profile costs 23 percent of decode at short context and buys eight times the context. With the context full, decode drops to 17 t/s: attention over 128K tokens costs GPU time on every step, and the n-gram matcher landed little on that workload (acceptance 0.09 on the rewrite task, 0.60 on short code). Filling 128K from cold takes about 280 s at 456 t/s prefill.
+
+The profile was then reproduced through the shipped tool on the same box (`revv up moe --long`: 642 MiB free after load, `revv bench` 46.82 t/s, `status` shows `profile long`). The reference figure the tool compares against is the bench-protocol 46.8. Shipped as `revv up moe --long`, not as the default: most requests never fill 16K, and the default stays the fastest certified point. The KV cache stays q8_0; q4_0 would let 20 blocks fit but was not measured here.
+
+Host note from the same day: the reference box measures 25.7 GB/s on STREAM Triad with two 32 GB DDR4-3200 modules on separate channels (dual channel, confirmed by `dmidecode` on the Proxmox host). That is roughly what a Ryzen 5 3600 delivers on this test; the Zen 2 chiplet writes to memory at about half its read rate and Triad writes one array for every two it reads. A host with faster memory pays less per offloaded block.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:

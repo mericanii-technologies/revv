@@ -4,6 +4,19 @@ All notable changes to revv are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-09-09
+
+### Added
+
+- **`--long` on `revv up`/`revv serve`.** A measured long-context profile for
+  the MoE build: 131,072 context, q8_0 KV, 22 expert blocks on the CPU, the
+  usual chain, `-ctxcp 0`. 11,611 MiB whole-process peak; 46.8 t/s on the bench protocol, 43.1 t/s on a code prompt at empty
+  context, ~17.0 t/s with the context full (BENCHMARKS.md §20). One measured
+  configuration, not a ladder rung: refuses outright, with the numbers, if
+  VRAM is short, rather than stepping down. `revv status` and the serve
+  banner show `profile long`; `revv bench` grades a long-profile server
+  against 46.8 t/s, not the default profile's 55.9.
+
 ## [1.1.0] - 2026-09-08
 
 ### Added

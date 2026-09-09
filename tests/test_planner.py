@@ -535,6 +535,95 @@ def test_speed_tier_drafter_stack():
           "--spec-ngram-simple-size-m" in argv_df, False)
 
 
+def test_long_profile():
+    """The MoE build's --long profile (BENCHMARKS.md s20): 131,072 context,
+    22 expert blocks on the CPU, one measured whole-process peak of 11,611
+    MiB. It is a single measured point, not a ladder rung -- 20 CPU blocks
+    OOM'd at load, so there is nothing to step down to. resolve_long_profile
+    is the CLI-facing gate: refuse outright rather than warn-and-launch when
+    it does not fit, and refuse a build with no certified long spec at all."""
+    section("long-context profile (--long)")
+
+    long_spec = revv.BUILDS["Q3_K_XL_35B"]["long"]
+    check("registry: long ctx", long_spec["ctx"], 131072)
+    check("registry: long kv", long_spec["kv"], "q8_0")
+    check("registry: long n_cpu_moe", long_spec["n_cpu_moe"], 22)
+    check("registry: long peak_mib", long_spec["peak_mib"], 11611)
+    check("registry: long decode_ts", long_spec["decode_ts"], 46.8)
+    check("registry: long deep_decode_ts", long_spec["deep_decode_ts"], 17.0)
+
+    speed = speed_like()
+    with fake_host_ram(32768, 16384):   # plenty of host RAM: isolate the
+                                        # VRAM assertions below from whatever
+                                        # RAM the machine running this suite
+                                        # happens to have
+        p = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB, None,
+                             long_spec)
+    check("long profile: ctx 131072", p.ctx, 131072)
+    check("long profile: kv q8_0", p.kv, "q8_0")
+    check("long profile: n_cpu_moe 22", p.n_cpu_moe, 22)
+    check("long profile: estimated_peak 11611", p.estimated_peak, 11611)
+    check("long profile: ctx_checkpoints 0", p.ctx_checkpoints, 0)
+    check("long profile: plan.profile is 'long'", p.profile, "long")
+    check("long profile: no WARNING note at 12,044 free",
+          any(n.upper().startswith("WARNING") for n in p.notes), False)
+    check("long profile: notes state the trade-off",
+          any("long profile" in n and "131,072" in n and "17" in n
+              for n in p.notes), True)
+
+    p_tight = revv.plan_launch(speed, "12gb", None, 11700, None, long_spec)
+    check("long profile at 11,700 free still reports its own numbers "
+          "(the CLI helper is what refuses, not plan_launch)",
+          p_tight.ctx, 131072)
+
+    argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("long profile argv carries -c 131072",
+          "-c" in argv and argv[argv.index("-c") + 1] == "131072", True)
+    check("long profile argv carries --n-cpu-moe 22",
+          "--n-cpu-moe" in argv and
+          argv[argv.index("--n-cpu-moe") + 1] == "22", True)
+    check("long profile argv carries -ctxcp 0",
+          "-ctxcp" in argv and argv[argv.index("-ctxcp") + 1] == "0", True)
+    check("long profile argv still carries the usual chain",
+          "--spec-type" in argv and
+          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE_CHAIN, True)
+
+    # resolve_long_profile: the CLI-facing gate. Free VRAM comfortably above
+    # peak + margin passes; short of it refuses (SystemExit via die()); a
+    # build with no "long" sub-spec at all refuses too.
+    got = revv.resolve_long_profile("Q3_K_XL_35B", REF_3060_FREE_MIB)
+    check("resolve_long_profile returns the registry spec at 12,044 free",
+          got is long_spec, True)
+
+    try:
+        revv.resolve_long_profile("Q3_K_XL_35B", 11700)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("resolve_long_profile refuses at 11,700 free", refused, True)
+
+    try:
+        revv.resolve_long_profile("IQ3_XXS", REF_3060_FREE_MIB)
+        refused_dense = False
+    except SystemExit:
+        refused_dense = True
+    check("resolve_long_profile refuses the dense build (no long spec)",
+          refused_dense, True)
+
+    # bench_reference: a server running the long profile must be graded
+    # against 46.8, not the default profile's 55.9, and its no-speculation
+    # figure is not a number bench has -- see cmd_bench's "not measured" line.
+    ref_long = revv.bench_reference("Q3_K_XL_35B", True, "long")
+    check("bench_reference (long profile) reads 46.8",
+          ref_long[1], 46.8)
+    check("bench_reference (long profile) names it distinctly",
+          ref_long[2], "Q3_K_XL_35B long profile, 131,072 context")
+    ref_default = revv.bench_reference("Q3_K_XL_35B", True, None)
+    check("bench_reference with no profile is unchanged (55.9)",
+          ref_default[1], 55.9)
+
+
 def test_flagship_ngram_chain():
     """Certified 2026-09-05: the n-gram+MTP chain, previously speed-tier
     only, now ships on the flagship. Editing workloads 40.3 -> 222.8 / 246.0
@@ -886,6 +975,7 @@ def main():
     test_speed_tier_is_the_mtp_build()
     test_thread_heuristic()
     test_speed_tier_drafter_stack()
+    test_long_profile()
     test_flagship_ngram_chain()
     test_real_hardware_fixtures()
     test_forced_tier_guard()
