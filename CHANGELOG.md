@@ -7,6 +7,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.1.1] - 2026-09-09
 
 ### Added
+- A measured 128K profile for the abliterated 35B-A3B (20 blocks on the CPU,
+  212 MiB free under full-context requests, 51.3 t/s short). BENCHMARKS.md §21.
 - The planner keeps q8_0 KV on MoE-line builds even when f16 fits: on the
   hybrid MoE, q8_0 decodes 1.7x faster than f16 at 15K depth (BENCHMARKS.md
   §21). The f16-is-faster rule was measured on the dense 27B and still

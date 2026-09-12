@@ -851,6 +851,8 @@ Faster and roomier than the certified UD-Q3_K_XL file (55.9 t/s, 212 MiB), consi
 | f16 | 67.6 / 67.9 t/s | 29.9 / 30.3 t/s |
 | q8_0 | 67.4 / 66.7 t/s | **52.2 / 52.3 t/s** |
 
+**128K profile on this file** (same protocol as §20): 20 blocks on the CPU load with 422 MiB free; two requests filling 128,517 tokens leave **212 MiB** minimum (peak 11,831), passing the 200 MiB standard; 51.3 t/s at short context (spread 17%, one slow request in four), 18.5 t/s with the context full, prefill 453 t/s. Exposed as `revv up <file> --long`.
+
 §17's finding that quantized KV is slower than f16 was measured on the dense 27B and does not carry to this hybrid MoE: at depth the q8_0 cache is 1.7× faster, at short context they tie. The planner no longer upgrades MoE-line builds to f16 when it fits; the dense rule stands for the dense build. The 25 t/s deep figure recorded through the endpoint before this A/B was the f16 configuration.
 
 ## Appendix: exact artifacts

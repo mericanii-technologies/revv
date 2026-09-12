@@ -443,6 +443,14 @@ BUILDS: Dict[str, Dict[str, object]] = {
         "host_ram_mib": 8192,
         "note": "Abliterated 35B-A3B (Huihui), plain Q3_K, MTP head present. "
                 "Speed measured, quality not.",
+        # 128K profile, measured 2026-09-12 on the reference box: 20 blocks on
+        # the CPU (two fewer than the certified file needs), q8_0 KV, whole-
+        # process peak 11,831 MiB with 212 MiB free under two requests that
+        # filled 128,517 tokens; 51.3 t/s at short context (spread 17%, one
+        # slow request), 18.5 t/s with the context full, prefill 453 t/s.
+        "long": {"ctx": 131072, "kv": "q8_0", "n_cpu_moe": 20, "peak_mib": 11831,
+                 "decode_ts": 51.3, "deep_decode_ts": 18.5,
+                 "note": "128K context on the abliterated MoE; uncertified"},
     },
     "Q3_K_XL_35B": {
         "file": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
