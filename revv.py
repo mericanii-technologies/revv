@@ -424,6 +424,26 @@ BUILDS: Dict[str, Dict[str, object]] = {
                 "the MoE build, and scored 4/34 against its 9/34 on our "
                 "multi-file editing instrument (p=0.039).",
     },
+    "Q3_K_35B_ABLITERATED": {
+        # Huihui's abliterated Qwen3.6-35B-A3B, plain Q3_K with the MTP head
+        # kept. Not certified: no quality battery. Measured once on the
+        # reference box (2026-09-12) with the MoE build's flags: 57.7 t/s at
+        # short context, 41.4 t/s with 15.3K tokens in context, 11,434 MiB
+        # whole-process peak (502 MiB free) at 16,384 / q8_0 / 16 blocks on
+        # the CPU. Registered so the planner offloads experts and anchors on
+        # that peak instead of charging the whole file to VRAM.
+        "file": "Huihui-Qwen3.6-35B-A3B-abliterated-ggml-model-Q3_K.gguf",
+        "repo": "huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF",
+        "size": 17165606112,
+        "line": "moe",
+        "certified": False,
+        "decode_ts": 57.7,
+        "peak_mib": 11434,
+        "n_cpu_moe": 16,
+        "host_ram_mib": 8192,
+        "note": "Abliterated 35B-A3B (Huihui), plain Q3_K, MTP head present. "
+                "Speed measured, quality not.",
+    },
     "Q3_K_XL_35B": {
         "file": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
         "repo": HF_REPO_35B,

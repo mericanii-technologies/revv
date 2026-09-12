@@ -831,6 +831,19 @@ The profile was then reproduced through the shipped tool on the same box (`revv 
 
 Host note from the same day: the reference box measures 25.7 GB/s on STREAM Triad with two 32 GB DDR4-3200 modules on separate channels (dual channel, confirmed by `dmidecode` on the Proxmox host). That is roughly what a Ryzen 5 3600 delivers on this test; the Zen 2 chiplet writes to memory at about half its read rate and Triad writes one array for every two it reads. A host with faster memory pays less per offloaded block.
 
+## 21. Compatible, uncertified: abliterated Qwen3.6-35B-A3B (2026-09-12)
+
+`huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF`, file `...-ggml-model-Q3_K.gguf`, 17,165,606,112 bytes, plain Q3_K with the MTP head. Run once on the reference box with the MoE build's flags (16 blocks on the CPU, `-t 8`, 16,384 context, q8_0 KV, the chain, `-ctxcp 0`), `nvidia-smi` sampled every second:
+
+| | |
+|---|---|
+| decode, short context, 4 × 400 tokens | 57.7 t/s (spread 1.4%) |
+| decode with 15,300 tokens in context, 2 consecutive requests | 41.2 / 41.6 t/s |
+| free VRAM after load / minimum during | 1,568 / 502 MiB (peak 11,434) |
+| draft acceptance, short code | 0.74 |
+
+Faster and roomier than the certified UD-Q3_K_XL file (55.9 t/s, 212 MiB), consistent with §18: the plain Q3_K mix puts slightly less on the card. No quality battery was run; it is registered in revv as a compatible build so the planner treats it as an MoE, and nothing about it is certified.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:

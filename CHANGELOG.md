@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.1.1] - 2026-09-09
 
 ### Added
+- Registered Huihui's abliterated Qwen3.6-35B-A3B (plain Q3_K, MTP head
+  kept) as a compatible, uncertified MoE build: the planner offloads 16
+  expert blocks and anchors on its measured 11,434 MiB peak. 57.7 t/s at
+  short context on the reference box; quality not measured. BENCHMARKS.md §21.
 
 - **`--long` on `revv up`/`revv serve`.** A measured long-context profile for
   the MoE build: 131,072 context, q8_0 KV, 22 expert blocks on the CPU, the
