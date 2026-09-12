@@ -2793,6 +2793,13 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
         kv = str(t["kv"])
         if free_mib is None:
             pass                        # tier was forced; keep its setting
+        elif n_cpu_moe is not None:
+            # The f16-is-faster rule was measured on the dense 27B. On the
+            # hybrid MoE it inverts at depth: same file, same 15.3K prompt,
+            # f16 30 t/s against q8_0 52 t/s (BENCHMARKS.md §21), equal at
+            # short context. MoE-line builds keep q8_0 even when f16 fits.
+            notes.append("q8_0 KV kept on the MoE line: measured 1.7x faster "
+                         "than f16 at 15K depth on this architecture")
         else:
             f16_peak = total_peak(ctx, "f16")
             if f16_peak is not None and f16_peak + margin <= free_mib:

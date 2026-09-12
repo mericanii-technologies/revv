@@ -301,6 +301,13 @@ def test_kv_and_context():
           any("WARNING" in n for n in p.notes), False)
     check("11400 free is below the floor", revv.tier_for(11400), None)
 
+    # KV format on the MoE line: q8_0 stays even when f16 would fit, because
+    # f16 is 1.7x slower at depth on the hybrid architecture (BENCHMARKS §21).
+    p = revv.plan_launch(speed_like(), "12gb", None, 13000)
+    check("MoE at 13000 free keeps q8_0 KV", p.kv, "q8_0")
+    check("MoE notes say why q8_0 is kept",
+          any("q8_0 KV kept on the MoE line" in n for n in p.notes), True)
+
     # The MoE build on the same WSL2 box (BENCHMARKS.md §19): measured 4096,
     # 8192 and 12288 rungs. Before them the planner dropped it to 4096/q4_0
     # on 11,555 free; the card then ran 12288/q8_0 with 299 MiB to spare.

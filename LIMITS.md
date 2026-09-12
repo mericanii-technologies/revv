@@ -34,10 +34,13 @@ Seven things, each measured separately on the rig in BENCHMARKS.md §2.
   loads, passes its health check, serves one request, then dies on the second
   with an error mentioning neither memory nor checkpoints. revv sets `-ctxcp 0`
   whenever the planned peak leaves under 500 MiB free.
-- **q8_0 KV cache.** Not a speed win — quantized KV is measurably *slower* than
-  f16 at every depth we tested, because it moves attention onto a compute-bound
-  kernel. It is a capacity trade, and f16 does not fit this model on 12GB. We
-  measured it both ways rather than assuming.
+- **q8_0 KV cache.** On the dense 27B it is not a speed win — quantized KV is
+  measurably *slower* than f16 at every depth we tested there, because it moves
+  attention onto a compute-bound kernel; it ships because f16 does not fit that
+  model on 12GB. On the hybrid MoE the opposite holds at depth: q8_0 decodes
+  1.7× faster than f16 at 15K tokens in context (BENCHMARKS.md §21), so the
+  planner keeps q8_0 on the MoE line even when f16 fits. Measured both ways
+  on both builds rather than assumed.
 
 ## Reading the results table honestly
 
