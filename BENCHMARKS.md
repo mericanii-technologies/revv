@@ -844,6 +844,15 @@ Host note from the same day: the reference box measures 25.7 GB/s on STREAM Tria
 
 Faster and roomier than the certified UD-Q3_K_XL file (55.9 t/s, 212 MiB), consistent with §18: the plain Q3_K mix puts slightly less on the card. No quality battery was run; it is registered in revv as a compatible build so the planner treats it as an MoE, and nothing about it is certified.
 
+**KV cache format, A/B on this file** (same flags, same prompts, 2 requests each):
+
+| KV | short context | 15.3K tokens in context |
+|---|---|---|
+| f16 | 67.6 / 67.9 t/s | 29.9 / 30.3 t/s |
+| q8_0 | 67.4 / 66.7 t/s | **52.2 / 52.3 t/s** |
+
+§17's finding that quantized KV is slower than f16 was measured on the dense 27B and does not carry to this hybrid MoE: at depth the q8_0 cache is 1.7× faster, at short context they tie. The planner no longer upgrades MoE-line builds to f16 when it fits; the dense rule stands for the dense build. The 25 t/s deep figure recorded through the endpoint before this A/B was the f16 configuration.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:

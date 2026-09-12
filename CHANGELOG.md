@@ -7,6 +7,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.1.1] - 2026-09-09
 
 ### Added
+- The planner keeps q8_0 KV on MoE-line builds even when f16 fits: on the
+  hybrid MoE, q8_0 decodes 1.7x faster than f16 at 15K depth (BENCHMARKS.md
+  §21). The f16-is-faster rule was measured on the dense 27B and still
+  applies there.
 - Registered Huihui's abliterated Qwen3.6-35B-A3B (plain Q3_K, MTP head
   kept) as a compatible, uncertified MoE build: the planner offloads 16
   expert blocks and anchors on its measured 11,434 MiB peak. 57.7 t/s at
