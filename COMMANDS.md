@@ -3,9 +3,11 @@
 The README keeps one line per thing. This is the longer account. Every claim
 here is measured; the protocols are in [BENCHMARKS.md](BENCHMARKS.md).
 
-- **Two certified builds.** `moe` is Qwen3.6-35B-A3B, UD-Q3_K_XL, 16.0 GiB to
+- **Three certified builds.** `moe` is Qwen3.6-35B-A3B, UD-Q3_K_XL, 16.0 GiB to
   download, **55.9 t/s** generation. `dense` is Qwen3.8-27B, UD-IQ3_XXS, 10.2
-  GiB, **37.9 t/s**. Both on an RTX 3060 12GB.
+  GiB, **37.9 t/s**. `gemma` is Google Gemma 4 26B-A4B, bartowski IQ3_XXS plus
+  a 0.3 GiB sidecar draft head, **70.7 t/s** -- the fastest of the three, and
+  the weakest on our editing instrument. All three on an RTX 3060 12GB.
 - **Any harness that speaks the OpenAI API** — opencode, aider, Continue, your own
   script — points at it and works. revv does not touch the harness, send your
   prompts anywhere, or train anything.
@@ -24,6 +26,15 @@ here is measured; the protocols are in [BENCHMARKS.md](BENCHMARKS.md).
 - **`adopt`** reuses GGUFs already pulled through ollama or LM Studio,
   read-only; **`inspect`** explains any GGUF you have, including whether it
   still carries a draft head; **`update`** and **`uninstall`** are one command.
+- **Gemma 4's draft head ships as a separate sidecar file**, not tensors
+  inside the main GGUF, so `revv get gemma` downloads both (each resumable
+  and size-checked). `revv serve` finds the sidecar in `~/.revv/models`
+  automatically and runs it through the same certified n-gram+MTP chain as a
+  build with an embedded head, no `--draft` needed; if the sidecar is not
+  there, it serves without speculation and says so, rather than guessing or
+  fetching one on its own. `revv inspect` on the main file (or any gemma4
+  GGUF) says the head is published separately instead of just "no draft
+  head."
 - **`serve --print-command`** prints the exact llama-server command line revv
   would run, so you can run the same configuration by hand with no revv at all.
 - **`up`/`serve --long`** switches the `moe` build to its certified

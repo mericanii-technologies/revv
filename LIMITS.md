@@ -135,6 +135,18 @@ HumanEval.
   speculation off.
 - **The n-gram matcher needs LF line endings.** It is a literal byte match; a
   repo checked out with CRLF drops acceptance from 0.83 to 0.11.
+- **`gemma`'s draft head is a separate file, and its headroom is the
+  narrowest of the three lines.** Google ships the MTP head for Gemma 4
+  26B-A4B as a sidecar GGUF in the same HF repo rather than as tensors in the
+  main file, so `revv get gemma` fetches two files and `revv serve` attaches
+  the sidecar automatically from `~/.revv/models`; without it on disk, this
+  build serves with no speculation at all rather than guessing at a
+  replacement. Certified at 16,384 context with only 4 of 30 expert blocks on
+  the CPU (~4 GiB of host RAM, well under the MoE build's ~8 GiB), it peaks at
+  11,580 MiB against 12,044 usable -- 464 MiB of headroom, and stock (no
+  offload) does not fit at all on this card. `--long` is not certified for
+  this build and refuses outright, and no `--streams` aggregates have been
+  measured for it either.
 - **The prebuilt has been installed on exactly one machine other than the one
   that built it**: a second RTX 3060 under WSL2, Ubuntu 26.04, where it served
   both builds, the dense one at 8,192 context and the MoE one at 12,288
@@ -148,28 +160,30 @@ HumanEval.
 
 The planner's rules are general — read free VRAM not total, size context to
 fit, disable checkpoints near the ceiling, don't quantize KV for speed. Only
-these two builds are certified. Certification takes days per model.
+these three builds are certified. Certification takes days per model.
 
 **Other cards.** Every number above is from one RTX 3060. On a bigger card
-revv runs the same two files and the speed levers still apply, because they
-are properties of the model, not the card: thinking off, the MTP head, and
-the n-gram chain all come with the file. What changes is the context: a 16 GB
-card gets 32K, a 24 GB card gets 64K with f16 KV, neither separately
-measured. Two things to know. The stock baseline is better on a big card,
-since a 4-bit file already fits, so expect the *ratio* to shrink even as the
-absolute number rises. And the MoE build keeps 16 expert layers on the CPU
-regardless of VRAM, because that is the certified config; on a 24 GB card
-the whole model fits on the GPU and `revv serve moe --n-cpu-moe 0` (flags
-after the model name go straight to llama-server) will likely be much
-faster. Nobody has measured it. Larger quants of the same two models, such as
+revv runs the same three files and the speed levers still apply, because they
+are properties of the model, not the card: thinking off, the draft head
+(embedded or sidecar), and the n-gram chain all come with the file. What
+changes is the context: a 16 GB card gets 32K, a 24 GB card gets 64K with f16
+KV, neither separately measured. Two things to know. The stock baseline is
+better on a big card, since a 4-bit file already fits, so expect the *ratio*
+to shrink even as the absolute number rises. And the MoE and `gemma` builds
+keep their expert layers on the CPU (16 of 41 and 4 of 30 respectively)
+regardless of VRAM, because that is the certified config; on a 24 GB card the
+whole model fits on the GPU and `revv serve moe --n-cpu-moe 0` (flags after
+the model name go straight to llama-server) will likely be much faster.
+Nobody has measured it. Larger quants of the same two Qwen models, such as
 Unsloth's Q4_K_XL files, run the same way, uncertified. Below 12 GB of free
 VRAM revv refuses to start. RTX 50-series needs `./install.sh --source`.
 
 ## Supported, in detail
 
-- **Models:** Qwen3.6-35B-A3B and Qwen3.8-27B in the GGUF builds above. Other
-  quants of the same two models run; `revv inspect` tells you what a file
-  supports, since some third-party conversions strip the draft head.
+- **Models:** Qwen3.6-35B-A3B, Qwen3.8-27B, and Google Gemma 4 26B-A4B in the
+  GGUF builds above. Other quants of the same models run; `revv inspect`
+  tells you what a file supports, since some third-party conversions strip
+  the draft head.
 - **Hardware:** NVIDIA, 12GB or more of *free* VRAM, Turing or newer, Linux
   (WSL2 works).
 

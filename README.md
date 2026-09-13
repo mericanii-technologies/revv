@@ -2,10 +2,10 @@
 
 by [Mericanii](https://github.com/mericanii-technologies). Apache-2.0.
 
-revv runs two Qwen coding models fast on a 12GB NVIDIA card. It is a small
-terminal program that launches llama.cpp with a configuration we measured,
-and serves an OpenAI-compatible endpoint on localhost. llama.cpp does the
-work; revv picks the flags. Not a new engine, not a fine-tune.
+revv runs three certified coding models fast on a 12GB NVIDIA card. It is a
+small terminal program that launches llama.cpp with a configuration we
+measured, and serves an OpenAI-compatible endpoint on localhost. llama.cpp
+does the work; revv picks the flags. Not a new engine, not a fine-tune.
 
 ## The models
 
@@ -13,12 +13,16 @@ work; revv picks the flags. Not a new engine, not a fine-tune.
 |---|---|---|---|---|
 | `moe` | Qwen3.6-35B-A3B | Unsloth UD-Q3_K_XL (MTP build) | 16.0 GiB | RTX 3060 12GB, Linux and WSL2 |
 | `dense` | Qwen3.8-27B | Unsloth UD-IQ3_XXS | 10.2 GiB | RTX 3060 12GB, Linux and WSL2 |
+| `gemma` | Google Gemma 4 26B-A4B | bartowski IQ3_XXS + sidecar MTP head | 11.3 + 0.3 GiB | RTX 3060 12GB, Linux |
 
-These two files, on this card, are the whole of what is certified. Other quants
-of the same two models run, uncertified. Other model families run but may gain
-nothing, because the speed comes from the model file, not the server. `moe`
-needs about 24 GB of system RAM; `dense` does not. If you have the RAM, start
-with `moe`: it is faster and scored better on our editing instrument.
+These three files, on this card, are the whole of what is certified. Other
+quants of the same models run, uncertified. Other model families run but may
+gain nothing, because the speed comes from the model file, not the server.
+`moe` needs about 24 GB of system RAM; `gemma` needs about 4 GB; `dense` needs
+none beyond the VRAM. Pick `moe` for editing and agent work -- it is the
+strongest line on our editing instrument. Pick `gemma` for raw speed or a
+16 GB-RAM machine -- it is the fastest line measured, but the weakest editor.
+Pick `dense` when RAM is the constraint and `gemma`'s speed is not needed.
 
 ## What it does
 
@@ -49,12 +53,18 @@ the display.
 | `moe` editing | 63 t/s | ~188 t/s mean, 243 peak | not run |
 | `dense` generation | 22.5 t/s | **37.9 t/s**, 12K context | 36.3 t/s, 8K context |
 | `dense` editing | 40 t/s | 113–246 t/s | not run |
+| `gemma` generation | not shippable (OOM, 116 MiB headroom) | **70.7 t/s**, 16K context | not run |
+| `gemma` editing | not shippable (OOM) | 287 t/s | not run |
 
-Quality: both builds tie their uncompressed anchor on HumanEval-164 (153/164
-and 152/164). On a 34-task multi-file editing instrument `moe` solved 9/34
-first try against `dense` 4/34 (p=0.039). The Windows PC gets less context
-because the desktop holds part of the card, and `moe` runs at 84% of the box
-because its expert layers stream from system RAM through the WSL2 layer.
+Quality: `moe` and `dense` tie their uncompressed anchor on HumanEval-164
+(153/164 and 152/164); `gemma` scores 157/164, tied with both within noise. On
+a 34-task multi-file editing instrument `moe` solved 9/34 first try against
+`dense` 4/34 (p=0.039); `gemma` solved 7/34 overall against `moe`'s 16/34
+(p=0.012) and 1/34 first try against `moe`'s 9/34 (p=0.008) on the same 34
+tasks, which is why it is the speed line, not the editor. The Windows PC gets
+less context because the desktop holds part of the card, and `moe` runs at
+84% of the box because its expert layers stream from system RAM through the
+WSL2 layer.
 
 Protocols and every number: [BENCHMARKS.md](BENCHMARKS.md). Second machine:
 [TEST_WSL2_RESULTS.md](TEST_WSL2_RESULTS.md).
@@ -69,7 +79,7 @@ runtime.
 git clone https://github.com/mericanii-technologies/revv && cd revv
 ./install.sh
 ./revv.py doctor        # what this machine can run
-./revv.py get moe       # or: get dense
+./revv.py get moe       # or: get dense / get gemma
 ./revv.py up
 ```
 
@@ -102,9 +112,9 @@ parallel agents; use the default for one chat.
 ## Supported
 
 NVIDIA with 12 GB or more of free VRAM, Turing or newer; Linux, or Windows
-through WSL2; the two models above. Not: under 12 GB free, AMD, Apple Silicon,
-native Windows, CPU-only, multi-GPU. Details, other cards, known issues:
-[LIMITS.md](LIMITS.md).
+through WSL2; the three models above. Not: under 12 GB free, AMD, Apple
+Silicon, native Windows, CPU-only, multi-GPU. Details, other cards, known
+issues: [LIMITS.md](LIMITS.md).
 
 ## Paper
 

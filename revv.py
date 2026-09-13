@@ -29,7 +29,7 @@ from typing import (Any, BinaryIO, Callable, Dict, List, NamedTuple, Optional,
                     Sequence, Tuple)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 
 
 def _git_sha() -> Optional[str]:
@@ -314,6 +314,27 @@ def identify_build(info: "GGUFInfo") -> Optional[str]:
     return None
 
 
+def sidecar_for_arch(arch: Optional[str]
+                     ) -> Optional[Tuple[str, Dict[str, object]]]:
+    """(build name, sidecar sub-spec) if some registered build ships a
+    first-party draft head for this architecture as a separate file, else
+    None.
+
+    Gemma 4's own GGUF has no `blk.N.nextn.*` tensors -- the draft head is a
+    sidecar in the same HF repo (BENCHMARKS.md s22). Without this, `revv
+    inspect` on the main file (or any other gemma4 quant) headlines "no draft
+    head", which is technically true of the file in isolation and misleading
+    about the model.
+    """
+    if not arch:
+        return None
+    for name, spec in BUILDS.items():
+        sidecar = spec.get("sidecar")
+        if sidecar and str(spec.get("arch") or "").lower() == arch.lower():
+            return name, sidecar
+    return None
+
+
 def is_certified_file(info: "GGUFInfo") -> bool:
     """Is this the exact file the measured numbers came from?
 
@@ -392,6 +413,7 @@ MIN_COMPUTE_CAPABILITY = (7, 5)
 
 HF_REPO = "unsloth/Qwen3.8-27B-GGUF"
 HF_REPO_35B = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+HF_REPO_GEMMA4 = "bartowski/google_gemma-4-26B-A4B-it-GGUF"
 
 # Two certified lines, named for what they are. DENSE is the 27B dense model;
 # MOE is a 35B mixture-of-experts model whose experts stream from host RAM --
@@ -555,10 +577,59 @@ BUILDS: Dict[str, Dict[str, object]] = {
                 "so ~20 t/s not ~37, and 15 points of HumanEval gone. "
                 "Small is doubly penalised. Not recommended.",
     },
+    "GEMMA4_26B_A4B": {
+        # Third certified line, certified 2026-09-13 (results/gemma4_26b_cert.md,
+        # BENCHMARKS.md s22). Google Gemma 4 26B-A4B, a 128-expert/8-active MoE,
+        # IQ3_XXS. Size is exact bytes from the HuggingFace API (LFS oid
+        # 61a9be08df2dd3ee5e98b23f1f548530c05ec89e02647a650f2ad447fcc83998),
+        # the same integrity check the other builds use.
+        "file": "google_gemma-4-26B-A4B-it-IQ3_XXS.gguf",
+        "repo": HF_REPO_GEMMA4,
+        "size": 12160200320,
+        "line": "gemma",
+        # Used by sidecar_for_arch() so `revv inspect` on any gemma4 GGUF --
+        # not only this exact file -- points at the sidecar instead of just
+        # saying "no draft head".
+        "arch": "gemma4",
+        "certified": True,
+        "humaneval": 95.7,
+        "decode_ts": 70.7,
+        "peak_mib": 11580,
+        "n_cpu_moe": 4,
+        # One measured whole-process peak, at the certified 16K rung, WITH
+        # the sidecar and the n-gram+MTP chain both running -- see
+        # plan_launch()'s is_cert_sidecar handling, which is the only case
+        # that reads this table with a drafter attached.
+        "measured_peaks": {16384: 11580},
+        # Unlike the Qwen MoE (experts stream from host RAM in ~8-9 GiB), only
+        # 4 of 30 expert blocks are offloaded here, so host RAM pressure is
+        # far lower -- ~2 GiB was observed free; stated as ~4 GiB to be safe.
+        "host_ram_mib": 4096,
+        # The draft head Google ships is a separate sidecar file in the same
+        # repository, not tensors inside the main GGUF -- loaded with
+        # --spec-draft-model (-md). identify_build() only ever matches the
+        # main file; plan_launch() looks for this sidecar in MODELS_DIR and
+        # attaches it automatically as the certified drafter, chain included.
+        "sidecar": {
+            "file": "mtp-google_gemma-4-26B-A4B-it-Q4_0.gguf",
+            "repo": HF_REPO_GEMMA4,
+            "size": 321145344,
+            # LFS oid 06c138f179f4bf91a9780a7ca7024da1459c8b4b99ae61e5fd7663ec1b07656e
+        },
+        "note": "The fastest configuration measured on this card: 70.7 t/s "
+                "decode, +26% over the MoE build, on 4 of 30 expert blocks "
+                "offloaded and ~4 GiB of host RAM. But on the multi-file "
+                "editing instrument it scored 7/34 against the MoE build's "
+                "16/34 (paired p=0.012 overall, p=0.008 first-attempt), so "
+                "it is the speed line, not the editor.",
+        # No --streams N aggregates measured for this build (BENCHMARKS.md
+        # s22 did not run that protocol); resolve_streams's default note
+        # ("not measured at this N") applies untouched.
+    },
 }
 
-# The two lines a user can ask for by name.
-MODEL_LINES = {"moe": "Q3_K_XL_35B", "dense": "IQ3_XXS"}
+# The three lines a user can ask for by name.
+MODEL_LINES = {"moe": "Q3_K_XL_35B", "dense": "IQ3_XXS", "gemma": "GEMMA4_26B_A4B"}
 
 # Deprecated names, kept working so existing scripts and docs do not break.
 # They are deprecated because they were misleading, not merely old: the
@@ -1947,6 +2018,24 @@ def classify(info: "GGUFInfo", filename: str) -> Tuple[str, str]:
                     "It has a draft head, so speculative decoding will work.\n"
                     "Measure it yourself with revv bench."
                     % (info.arch or "unknown"))
+        # Gemma 4 ships its draft head as a separate sidecar file, not
+        # tensors inside this GGUF -- "no draft head" is true of the file in
+        # isolation and misleading about the model. See sidecar_for_arch().
+        sidecar_build = sidecar_for_arch(info.arch)
+        if sidecar_build is not None:
+            build_name, sidecar = sidecar_build
+            line = str(BUILDS[build_name].get("line") or build_name)
+            return ("COMPATIBLE (draft head published separately -- sidecar; "
+                    "revv get %s fetches it)" % line,
+                    "This is not the model revv was certified on (arch: %s),\n"
+                    "unless it is the exact file `revv get %s` downloads.\n"
+                    "\n"
+                    "draft head published separately (sidecar); revv get %s\n"
+                    "fetches it: %s. Once it is present next to this file in\n"
+                    "%s, `revv serve` attaches it automatically and runs the\n"
+                    "certified n-gram+MTP chain through it."
+                    % (info.arch or "unknown", line, line, sidecar["file"],
+                       MODELS_DIR))
         return ("COMPATIBLE (no draft head -- revv's levers may not apply)",
                 "This is not the model revv was certified on (arch: %s), and\n"
                 "it has no MTP draft head, so speculative decoding cannot run.\n"
@@ -2025,7 +2114,15 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         if len(info.mtp_tensors) > 6:
             print("      ... and %d more" % (len(info.mtp_tensors) - 6))
     else:
-        print("    %s" % red("absent"))
+        sidecar_build = sidecar_for_arch(info.arch)
+        if sidecar_build is not None:
+            build_name, sidecar = sidecar_build
+            line = str(BUILDS[build_name].get("line") or build_name)
+            print("    %s -- draft head published separately (sidecar); "
+                  "revv get %s fetches it" % (yellow("none in this file"), line))
+            print("      sidecar file: %s" % sidecar["file"])
+        else:
+            print("    %s" % red("absent"))
 
     verdict, why = classify(info, path)
     print("\n  " + bold("verdict"))
@@ -2396,6 +2493,40 @@ def get_build_choice(tier_arg: Optional[str]) -> Tuple[str, Optional[str]]:
     return default_build_for_host()
 
 
+def _fetch_gguf(filename: str, repo: Optional[str], dest: str,
+                label: str, force: bool) -> Optional[str]:
+    """Download one GGUF (resumable, size-checked against the HF API), or
+    confirm it is already present. Returns the download error message on
+    failure, or None on success -- the caller decides whether that failure
+    is fatal (the main file) or a note (a sidecar, since serving without it
+    just means serving without speculation).
+    """
+    if os.path.isfile(dest) and not force:
+        print("Already present: %s" % dest)
+        return None
+
+    url = hf_url(filename, repo or HF_REPO)
+    print("Downloading %s" % label)
+    print("  from  %s" % url.split("?")[0])
+    print("  to    %s" % dest)
+    size = head_size(url)
+    if size:
+        print("  size  %s" % gib(size))
+        free = shutil.disk_usage(os.path.dirname(dest) or ".").free \
+            if os.path.isdir(MODELS_DIR) else shutil.disk_usage(
+                os.path.expanduser("~")).free
+        if free < size * 1.05:
+            return ("not enough disk space: %s free, need %s"
+                    % (gib(free), gib(size * 1.05)))
+    print()
+    try:
+        final = download(url, dest, expected_size=size)
+    except DownloadError as exc:
+        return str(exc)
+    print("\nDownloaded %s" % gib(final))
+    return None
+
+
 def cmd_get(args: argparse.Namespace) -> int:
     build = args.build
     if build is None:
@@ -2416,6 +2547,19 @@ def cmd_get(args: argparse.Namespace) -> int:
         build, why = get_build_choice(args.tier)
         if why:
             print("%s %s." % (yellow("note:"), why))
+        if not args.tier:
+            # A third, uncertified-by-default line exists: fast, light on
+            # host RAM, weaker on the editing instrument. Only surfaced on
+            # the bare `revv get` (no tier/line argument at all) -- once a
+            # user names a line explicitly there is nothing left to suggest.
+            gemma = BUILDS[MODEL_LINES["gemma"]]
+            print("%s a third line, `%s`, trades editing strength for raw "
+                  "speed: %.1f t/s (+26%% over the moe build) on ~%s of host "
+                  "RAM -- good on 16 GB-RAM machines or when decode speed "
+                  "matters more than agent/editing accuracy. `revv get %s` "
+                  "fetches it."
+                  % (yellow("note:"), gemma["line"], float(gemma["decode_ts"]),
+                     mib(int(gemma["host_ram_mib"])), gemma["line"]))
 
     if build not in BUILDS:
         die("unknown build: %s" % build,
@@ -2424,44 +2568,45 @@ def cmd_get(args: argparse.Namespace) -> int:
     spec = BUILDS[build]
     filename = str(spec["file"])
     dest = os.path.join(MODELS_DIR, filename)
-    if os.path.isfile(dest) and not args.force:
-        print("Already present: %s" % dest)
-        print("Run %s to verify it." % bold("revv inspect %s" % filename))
-        return 0
+    repo = str(spec.get("repo") or HF_REPO)
+    line = str(spec.get("line") or "")
 
     if not spec["certified"]:
         print("%s %s is not the certified build." % (yellow("note:"), build))
         print("       %s" % spec["note"])
 
-    url = hf_url(filename, str(spec.get("repo") or HF_REPO))
-    line = str(spec.get("line") or "")
-    print("Downloading %s%s" % (build, " (%s line)" % line if line else ""))
-    if spec.get("decode_ts"):
-        print("  measured %.1f t/s, %.1f%% HumanEval-164 on an RTX 3060"
-              % (float(spec["decode_ts"]), float(spec["humaneval"])))
-    if spec.get("host_ram_mib"):
-        print("  needs ~%s of free host RAM as well as the VRAM"
-              % mib(int(spec["host_ram_mib"])))
-    print("  from  %s" % url.split("?")[0])
-    print("  to    %s" % dest)
-    size = head_size(url)
-    if size:
-        print("  size  %s" % gib(size))
-        free = shutil.disk_usage(os.path.dirname(dest) or ".").free \
-            if os.path.isdir(MODELS_DIR) else shutil.disk_usage(
-                os.path.expanduser("~")).free
-        if free < size * 1.05:
-            die("not enough disk space: %s free, need %s"
-                % (gib(free), gib(size * 1.05)),
-                "Free up space, or set REVV_HOME to a bigger volume:\n"
-                "REVV_HOME=/mnt/big/.revv revv get")
-    print()
-    try:
-        final = download(url, dest, expected_size=size)
-    except DownloadError as exc:
-        die(str(exc))
-        return 1
-    print("\nDownloaded %s" % gib(final))
+    already_present = os.path.isfile(dest) and not args.force
+    if already_present:
+        print("Already present: %s" % dest)
+        print("Run %s to verify it." % bold("revv inspect %s" % filename))
+    else:
+        label = "%s%s" % (build, " (%s line)" % line if line else "")
+        if spec.get("decode_ts"):
+            label += ("\n  measured %.1f t/s, %.1f%% HumanEval-164 on an "
+                      "RTX 3060" % (float(spec["decode_ts"]),
+                                    float(spec["humaneval"])))
+        if spec.get("host_ram_mib"):
+            label += ("\n  needs ~%s of free host RAM as well as the VRAM"
+                      % mib(int(spec["host_ram_mib"])))
+        err = _fetch_gguf(filename, repo, dest, label, args.force)
+        if err is not None:
+            die(err, "Free up space, or set REVV_HOME to a bigger volume:\n"
+                     "REVV_HOME=/mnt/big/.revv revv get %s" % build)
+            return 1
+
+    sidecar = spec.get("sidecar")
+    if sidecar is not None:
+        sidecar_file = str(sidecar["file"])
+        sidecar_dest = os.path.join(MODELS_DIR, sidecar_file)
+        sidecar_repo = str(sidecar.get("repo") or repo)
+        print()
+        err = _fetch_gguf(sidecar_file, sidecar_repo, sidecar_dest,
+                          "%s draft head (sidecar)" % build, args.force)
+        if err is not None:
+            print("%s could not fetch the sidecar draft head: %s"
+                  % (yellow("note:"), err))
+            print("       `revv serve` will run %s without speculation "
+                    "until it is present." % build)
 
     try:
         info = read_gguf(dest)
@@ -2470,11 +2615,17 @@ def cmd_get(args: argparse.Namespace) -> int:
             "Delete it and retry:\n  rm %s\n  revv get %s" % (dest, build))
         return 1
     verdict, _ = classify(info, dest)
-    print("Verified: %s, %s vocab, draft head %s"
+    print("\nVerified: %s, %s vocab, draft head %s"
           % (info.dominant_quant,
              "{:,}".format(info.n_vocab) if info.n_vocab else "?",
              "present" if info.has_mtp_head else "ABSENT"))
     print("Status:   %s" % verdict)
+    # Already shown above for an uncertified build; a certified build with a
+    # sidecar (currently just `gemma`) gets it here instead, since its note
+    # is the "speed line, not the editor" caveat a user should see even
+    # though the build itself is certified.
+    if spec.get("certified") and spec.get("sidecar") and spec.get("note"):
+        print("\n%s" % spec["note"])
     print("\nNext:  %s" % bold("revv serve"))
     return 0
 
@@ -2538,7 +2689,8 @@ class LaunchPlan:
                  build_name: Optional[str] = None,
                  n_threads: Optional[int] = None,
                  profile: Optional[str] = None,
-                 streams: int = 1) -> None:
+                 streams: int = 1,
+                 draft_is_sidecar: bool = False) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2548,9 +2700,14 @@ class LaunchPlan:
         # An external drafter: a second, smaller GGUF that proposes tokens the
         # target model verifies. Experimental and uncertified -- acceptance is
         # a property of the PAIR, so a drafter that works well for one target
-        # can be worthless for a finetune of it.
+        # can be worthless for a finetune of it. UNLESS draft_is_sidecar is
+        # True: then this is a build's own first-party draft head, published
+        # as a separate file (Gemma 4: BENCHMARKS.md s22), attached
+        # automatically, and running the same certified chain as a build with
+        # an embedded head -- not an experimental user-supplied pairing.
         self.draft_path = draft_path
         self.draft_spec_type = draft_spec_type
+        self.draft_is_sidecar = draft_is_sidecar
         # None = leave llama-server's default. 0 = disable, because the
         # checkpoint allocation would not fit and would kill request two.
         self.ctx_checkpoints = ctx_checkpoints
@@ -2579,7 +2736,11 @@ class LaunchPlan:
     @property
     def levers(self) -> List[str]:
         active = []
-        if self.draft_path:
+        if self.draft_path and self.draft_is_sidecar:
+            active.append("speculation via certified sidecar %s "
+                          "(n-gram + MTP chain)"
+                          % os.path.basename(self.draft_path))
+        elif self.draft_path:
             active.append("speculation via external drafter %s [experimental]"
                           % os.path.basename(self.draft_path))
         elif self.use_spec:
@@ -2682,17 +2843,57 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                      "CPU-MoE decode where host RAM bandwidth is the "
                      "bottleneck" % n_threads)
 
-    # An external drafter takes precedence: the user asked for it explicitly,
-    # and it is the only way to speculate on a file with no built-in head.
+    # A build whose draft head ships as a separate sidecar file (Gemma 4:
+    # BENCHMARKS.md s22) rather than tensors inside the GGUF gets it attached
+    # automatically, no --draft needed, PROVIDED the sidecar is actually on
+    # disk in MODELS_DIR -- revv never downloads a drafter for a user, and
+    # this is no exception, so a missing sidecar means "serve without
+    # speculation and say how to get it", not a silent skip. An explicit
+    # --draft always wins over this and is never overridden here. Gated on
+    # streams <= 1 for the same reason as the file's own MTP head below: the
+    # shipped build cannot run any draft head, sidecar included, once
+    # --parallel > 1.
+    sidecar_spec = spec.get("sidecar") if spec else None
+    is_cert_sidecar = False
+    if draft is None and sidecar_spec is not None and streams <= 1:
+        sidecar_path = os.path.join(MODELS_DIR, str(sidecar_spec["file"]))
+        if os.path.isfile(sidecar_path):
+            try:
+                draft = read_gguf(sidecar_path)
+                is_cert_sidecar = True
+            except GGUFError:
+                draft = None
+        if draft is None:
+            notes.append(
+                "draft head published separately (sidecar): %s not found in "
+                "%s -- serving without speculation; `revv get %s` fetches it"
+                % (sidecar_spec["file"], MODELS_DIR,
+                   spec.get("line") or build_name))
+    elif draft is not None and sidecar_spec is not None:
+        is_cert_sidecar = (os.path.basename(draft.path)
+                          == str(sidecar_spec["file"]))
+
+    # An external drafter takes precedence over the file's own head: the user
+    # asked for it explicitly (or, for a sidecar build, revv found the
+    # certified one on disk above), and it is the only way to speculate on a
+    # file with no built-in head.
     draft_spec_type = None      # type: Optional[str]
     if draft is not None:
-        draft_spec_type = (SPEC_TYPE if draft.has_mtp_head
-                           else "draft-simple")
-        notes.append("external drafter %s (%s, %s) -- speculation is "
-                     "EXPERIMENTAL and uncertified; acceptance depends on the "
-                     "target/drafter pair, so check it with revv bench"
-                     % (os.path.basename(draft.path), draft.dominant_quant,
-                        gib(draft.file_size)))
+        if is_cert_sidecar:
+            # The certified pairing, not a guess: same chain as a build that
+            # speculates through its own embedded head (BENCHMARKS.md s22).
+            draft_spec_type = SPEC_TYPE_CHAIN
+            notes.append("draft head via the certified sidecar %s -- the "
+                         "n-gram+MTP chain runs exactly as certified"
+                         % os.path.basename(draft.path))
+        else:
+            draft_spec_type = (SPEC_TYPE if draft.has_mtp_head
+                               else "draft-simple")
+            notes.append("external drafter %s (%s, %s) -- speculation is "
+                         "EXPERIMENTAL and uncertified; acceptance depends on the "
+                         "target/drafter pair, so check it with revv bench"
+                         % (os.path.basename(draft.path), draft.dominant_quant,
+                            gib(draft.file_size)))
         if draft.n_vocab and info.n_vocab and draft.n_vocab != info.n_vocab:
             notes.append("WARNING vocab mismatch: target %s vs drafter %s. "
                          "llama-server will usually refuse this pair"
@@ -2706,7 +2907,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     # of memory. Keyed on the file's own head, not on the forced-off value,
     # so a genuinely headless file still gets its usual note below.
     use_spec = info.has_mtp_head and streams <= 1
-    if not info.has_mtp_head and draft is None:
+    if not info.has_mtp_head and draft is None and sidecar_spec is None:
         notes.append("no MTP draft head in this file, so speculative decoding "
                      "is off (that is where most of revv's speed comes from); "
                      "an external drafter can supply it: --draft <file.gguf>")
@@ -2730,8 +2931,13 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     def measured_total(at_ctx: int, at_kv: str) -> Optional[int]:
         """A whole-process peak measured at exactly this rung, chain included,
         if the build has one. Only for the q8_0 ladder with no external
-        drafter, which is the configuration the measurements were taken in."""
-        if draft is not None or at_kv != "q8_0" or spec is None:
+        drafter, which is the configuration the measurements were taken in --
+        EXCEPT the certified sidecar, which was part of the measurement too
+        (the Gemma 4 build's 11,580 MiB was measured with the sidecar and the
+        chain both running -- BENCHMARKS.md s22), so it does not disqualify
+        the lookup the way a user-supplied --draft does."""
+        if (draft is not None and not is_cert_sidecar) or at_kv != "q8_0" \
+           or spec is None:
             return None
         table = spec.get("measured_peaks") or {}
         value = table.get(at_ctx)
@@ -2950,7 +3156,8 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
                       draft.path if draft else None, draft_spec_type,
                       ctx_checkpoints, n_cpu_moe, build_name, n_threads,
-                      "long" if long_spec is not None else None, streams)
+                      "long" if long_spec is not None else None, streams,
+                      is_cert_sidecar)
 
 
 def resolve_long_profile(build_name: Optional[str],
@@ -3094,13 +3301,19 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
             argv += thinking_off_flags(exe)
         if plan.draft_path:
             # An external drafter. draft-mtp when the file carries an MTP head,
-            # draft-simple for an ordinary small model used as the drafter.
+            # draft-simple for an ordinary small model used as the drafter --
+            # OR the full certified chain (ngram-simple,draft-mtp) when this
+            # is a build's own draft head shipped as a sidecar rather than
+            # embedded tensors (Gemma 4: BENCHMARKS.md s22), certified with
+            # exactly this flag set including the n-gram matcher below.
             argv += ["--spec-type", plan.draft_spec_type or "draft-simple",
                      "--spec-draft-model", plan.draft_path,
                      # Keep the drafter on the GPU; a CPU drafter's latency
                      # eats the entire speculation win at batch 1.
                      "--spec-draft-ngl", "99",
                      "--spec-draft-n-max", str(SPEC_N_MAX)]
+            if plan.draft_spec_type == SPEC_TYPE_CHAIN:
+                argv += ["--spec-ngram-simple-size-m", str(SPEC_NGRAM_SIZE_M)]
         elif plan.use_spec:
             # The certified drafter chain: stack an n-gram matcher in front
             # of MTP. Certified 2026-09-05 on BOTH builds -- originally
@@ -5066,7 +5279,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = sub.add_parser("get", help="download the certified model")
     g.add_argument("tier", nargs="?",
-                   help="moe / dense, or 12gb / 16gb / 24gb "
+                   help="moe / dense / gemma, or 12gb / 16gb / 24gb "
                         "(default: chosen from host RAM)")
     g.add_argument("--build", help="download a specific build: %s"
                    % ", ".join(sorted(BUILDS)))

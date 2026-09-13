@@ -12,6 +12,7 @@ if tests/fixtures/ is missing.
 """
 
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -117,6 +118,32 @@ class fake_host_ram(object):
         return False
 
 
+class fake_models_dir(object):
+    """Pin revv.MODELS_DIR to a scratch directory for the duration of a
+    block, then restore it.
+
+    Used only by the sidecar tests: plan_launch() looks for a build's
+    sidecar draft head in MODELS_DIR, so a "sidecar present" test has to
+    control that directory rather than depend on whatever is (or is not)
+    under the real ~/.revv/models on the machine running the suite.
+    """
+
+    def __init__(self):
+        self.saved = None
+        self.tmpdir = None
+
+    def __enter__(self):
+        self.saved = revv.MODELS_DIR
+        self.tmpdir = tempfile.mkdtemp(prefix="revv-test-models-")
+        revv.MODELS_DIR = self.tmpdir
+        return self.tmpdir
+
+    def __exit__(self, *exc):
+        revv.MODELS_DIR = self.saved
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        return False
+
+
 def test_build_names():
     """Build lines are named for what they are (moe / dense); the old names
     still work but are deprecated, because they were inverted against the
@@ -156,7 +183,7 @@ def test_build_names():
     check("an explicit line needs no explanation",
           revv.get_build_choice("moe")[1], None)
 
-    check("the two lines cover both certified builds",
+    check("the three lines cover every certified build",
           sorted(revv.MODEL_LINES.values()),
           sorted(n for n, s in revv.BUILDS.items() if s["certified"]))
     check("every build is labelled with a live line name",
@@ -411,6 +438,18 @@ def speed_like():
     return info
 
 
+def gemma_like():
+    """The Gemma 4 26B-A4B build: certified size and name, gemma4 arch, no
+    nextn head of its own (the head is the sidecar) -- exactly identify_build
+    ()'s and has_mtp_head's criteria for this file."""
+    info = revv.read_gguf(os.path.join(FIXTURES, "gemma_like.gguf"))
+    info.file_size = int(revv.BUILDS["GEMMA4_26B_A4B"]["size"])
+    info.path = "/models/" + str(revv.BUILDS["GEMMA4_26B_A4B"]["file"])
+    return info
+
+
+
+
 def test_speed_tier():
     """The MoE line keeps most of its weights in HOST RAM, so estimating its
     VRAM from file size over-counts by gigabytes and collapses the context."""
@@ -540,6 +579,129 @@ def test_speed_tier_drafter_stack():
                                      8080, revv.MODE_REVV, [])
     check("external drafter overrides the chain on the flagship too",
           "--spec-ngram-simple-size-m" in argv_df, False)
+
+
+def test_gemma_line():
+    """The third certified line, Gemma 4 26B-A4B (BENCHMARKS.md s22). Its
+    draft head is a separate sidecar file in the same HF repo, not tensors
+    inside the main GGUF, so plan_launch() has to go looking for it in
+    MODELS_DIR rather than trust info.has_mtp_head the way it does for the
+    other two builds -- and has to say plainly when it is not there, since
+    revv never downloads a drafter on its own."""
+    section("gemma line (Gemma 4 26B-A4B, sidecar drafter)")
+
+    spec = revv.BUILDS["GEMMA4_26B_A4B"]
+    check("registry: size", spec["size"], 12160200320)
+    check("registry: line", spec["line"], "gemma")
+    check("registry: certified", spec["certified"], True)
+    check("registry: humaneval", spec["humaneval"], 95.7)
+    check("registry: decode_ts", spec["decode_ts"], 70.7)
+    check("registry: peak_mib", spec["peak_mib"], 11580)
+    check("registry: n_cpu_moe", spec["n_cpu_moe"], 4)
+    check("registry: host_ram_mib", spec["host_ram_mib"], 4096)
+    check("registry: sidecar file",
+          spec["sidecar"]["file"],
+          "mtp-google_gemma-4-26B-A4B-it-Q4_0.gguf")
+    check("registry: sidecar size", spec["sidecar"]["size"], 321145344)
+
+    check("MODEL_LINES gains gemma", revv.MODEL_LINES["gemma"], "GEMMA4_26B_A4B")
+    check("resolve_model_line('gemma') resolves it",
+          revv.resolve_model_line("gemma"), "GEMMA4_26B_A4B")
+    check("get_build_choice('gemma') fetches it",
+          revv.get_build_choice("gemma")[0], "GEMMA4_26B_A4B")
+
+    info = gemma_like()
+    check("identify_build recognises the main file",
+          revv.identify_build(info), "GEMMA4_26B_A4B")
+    check("the main file itself has no head of its own (the sidecar has it)",
+          info.has_mtp_head, False)
+
+    # bench_reference: generic per-build lookup, same mechanism as the other
+    # two lines (test_bench_reference), so this is the one number specific
+    # to this build worth pinning here.
+    check("bench_reference reads 70.7",
+          revv.bench_reference("GEMMA4_26B_A4B", True)[1], 70.7)
+
+    # No sidecar on disk: plan_launch must not invent speculation, and must
+    # say plainly how to get it -- not silently serve slower with no note.
+    with fake_models_dir():
+        p_missing = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
+    check("missing sidecar: no draft attached", p_missing.draft_path, None)
+    argv_missing = revv.build_server_argv(
+        "/x/llama-server", info.path, p_missing, 8080, revv.MODE_REVV, [])
+    check("missing sidecar: argv carries no --spec-type",
+          "--spec-type" in argv_missing, False)
+    check("missing sidecar: a note says how to get it",
+          any("sidecar" in n and "revv get gemma" in n
+              for n in p_missing.notes), True)
+
+    # Sidecar present: plan_launch attaches it automatically (no --draft),
+    # runs the certified chain through it, and the registry's measured
+    # 11,580 MiB peak (measured WITH the sidecar and the chain both running)
+    # applies with the narrow margin, same as a build speculating through
+    # its own embedded head.
+    with fake_models_dir() as models_dir:
+        sidecar_path = os.path.join(models_dir, spec["sidecar"]["file"])
+        shutil.copyfile(os.path.join(FIXTURES, "qwen_like.gguf"), sidecar_path)
+        p = revv.plan_launch(info, "12gb", None, REF_3060_FREE_MIB)
+
+    check("sidecar present: ctx 16384", p.ctx, 16384)
+    check("sidecar present: kv q8_0", p.kv, "q8_0")
+    check("sidecar present: n_cpu_moe 4", p.n_cpu_moe, 4)
+    check("sidecar present: peak 11580 (measured, chain+sidecar included)",
+          p.estimated_peak, 11580)
+    check("sidecar present: ctx_checkpoints 0", p.ctx_checkpoints, 0)
+    check("sidecar present: draft attached automatically",
+          p.draft_path is not None, True)
+    check("sidecar present: recognised as the certified sidecar, not an "
+          "experimental drafter", p.draft_is_sidecar, True)
+    check("sidecar present: no WARNING (the measured peak fits the narrow "
+          "margin at 12,044 free)",
+          any(n.upper().startswith("WARNING") for n in p.notes), False)
+
+    argv = revv.build_server_argv("/x/llama-server", info.path, p, 8080,
+                                  revv.MODE_REVV, [])
+    check("sidecar present: argv carries --spec-draft-model (-md)",
+          "--spec-draft-model" in argv and
+          argv[argv.index("--spec-draft-model") + 1] == p.draft_path, True)
+    check("sidecar present: argv carries the full certified chain",
+          "--spec-type" in argv and
+          argv[argv.index("--spec-type") + 1] == revv.SPEC_TYPE_CHAIN, True)
+    check("sidecar present: argv carries --spec-draft-n-max 2",
+          "--spec-draft-n-max" in argv and
+          argv[argv.index("--spec-draft-n-max") + 1] == "2", True)
+    check("sidecar present: argv carries --spec-ngram-simple-size-m 256",
+          "--spec-ngram-simple-size-m" in argv and
+          argv[argv.index("--spec-ngram-simple-size-m") + 1] == "256", True)
+    check("sidecar present: argv carries --n-cpu-moe 4",
+          "--n-cpu-moe" in argv and argv[argv.index("--n-cpu-moe") + 1] == "4",
+          True)
+    check("sidecar present: argv carries -ctxcp 0",
+          "-ctxcp" in argv and argv[argv.index("-ctxcp") + 1] == "0", True)
+
+    # --long: no long profile is certified for this build.
+    try:
+        revv.resolve_long_profile("GEMMA4_26B_A4B", REF_3060_FREE_MIB)
+        refused = False
+    except SystemExit:
+        refused = True
+    check("--long refuses on the gemma build (no long profile certified)",
+          refused, True)
+
+    # `revv inspect` on this file, or any gemma4 file, must not headline
+    # "no draft head" -- it should point at the sidecar instead.
+    verdict, why = revv.classify(info, info.path)
+    check("the exact certified file classifies as CERTIFIED (gemma line)",
+          verdict, "CERTIFIED (gemma line)")
+    check("...not headlined as having no draft head",
+          "no draft head" in verdict, False)
+
+    other_quant = revv.read_gguf(os.path.join(FIXTURES, "gemma_like.gguf"))
+    verdict2, why2 = revv.classify(other_quant, other_quant.path)
+    check("a non-certified gemma4 file is not headlined 'no draft head' "
+          "either", "no draft head" in verdict2, False)
+    check("...it points at the sidecar and `revv get gemma`",
+          "sidecar" in verdict2 and "revv get gemma" in why2, True)
 
 
 def test_long_profile():
@@ -1062,6 +1224,7 @@ def main():
     test_speed_tier_is_the_mtp_build()
     test_thread_heuristic()
     test_speed_tier_drafter_stack()
+    test_gemma_line()
     test_long_profile()
     test_streams()
     test_flagship_ngram_chain()

@@ -4,6 +4,28 @@ All notable changes to revv are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-14
+
+### Added
+- **A third certified line: `gemma`.** Google Gemma 4 26B-A4B, bartowski
+  IQ3_XXS (11.3 GiB), the fastest configuration measured on the card: 70.7
+  t/s decode (+26% over the MoE build), 95.7% HumanEval-164, 4 of 30 expert
+  blocks on the CPU, ~4 GiB of host RAM, 11,580 MiB peak VRAM at 16,384
+  context (464 MiB headroom); stock does not fit on a 12GB card at all. Its
+  draft head ships as a separate sidecar file in the same HF repo rather
+  than tensors in the main GGUF -- `revv get gemma` downloads both
+  (resumable, size-checked), and `revv serve` finds the sidecar in
+  `~/.revv/models` and attaches it automatically, running the certified
+  n-gram+MTP chain through it with no `--draft` needed; missing the
+  sidecar, it serves without speculation and says how to get it. `revv
+  inspect` on a gemma4 file (this one or any other quant) now points at the
+  sidecar instead of just saying "no draft head". On our 34-task multi-file
+  editing instrument it scored 7/34 overall and 1/34 first-attempt against
+  the MoE build's 16/34 and 9/34 (paired p=0.012 / p=0.008) -- the speed
+  line, not the editor. `--long` is not certified for this build and
+  refuses outright; no `--streams` aggregates have been measured for it.
+  BENCHMARKS.md §22, results/gemma4_26b_cert.md.
+
 ## [1.1.2] - 2026-09-14
 
 ### Added
