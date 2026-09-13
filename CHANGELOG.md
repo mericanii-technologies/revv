@@ -4,6 +4,20 @@ All notable changes to revv are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-09-14
+
+### Added
+- **`--streams N` on `revv up`/`revv serve`** (2-8). Shares the context
+  across N `--parallel` slots for people running several agents or requests
+  at once. Speculation is off in that mode -- the shipped build cannot run
+  the draft head per slot, and fails outright if it tries -- so a single
+  stream is slower, but aggregate throughput is higher: 46.6/57.9 t/s
+  (dense/moe) at N=4, 57.1/78.7 at N=8; peak VRAM stayed under the builds'
+  own certified peaks at N=8 (BENCHMARKS.md §21). Conflicts with `--long`
+  (not measured together) and with an external `--draft` (speculation is
+  already off). `revv status` and the serve banner show `streams N`;
+  `revv bench` against a streams server skips the single-stream verdict.
+
 ## [1.1.1] - 2026-09-09
 
 ### Added

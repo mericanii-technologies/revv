@@ -631,6 +631,86 @@ def test_long_profile():
           ref_default[1], 55.9)
 
 
+def test_streams():
+    """--streams N (BENCHMARKS.md s21): speculation FAILS outright with the
+    shipped build once --parallel > 1 (the dense server cannot create a
+    second MTP draft context; the MoE drafter runs out of memory), so
+    plan_launch must turn the whole chain off rather than let it launch into
+    that failure -- and say so, with the aggregate figure the reference
+    measured at this N."""
+    section("streams (--streams N)")
+    with fake_host_ram(32768, 16384):
+        speed = speed_like()
+        p = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB, None,
+                             None, 4)
+        argv = revv.build_server_argv("/x/llama-server", speed.path, p, 8080,
+                                      revv.MODE_REVV, [])
+        check("argv carries --parallel 4",
+              "--parallel" in argv and
+              argv[argv.index("--parallel") + 1] == "4", True)
+        check("argv carries no --spec-type", "--spec-type" in argv, False)
+        check("plan.use_spec is off", p.use_spec, False)
+        check("streams note mentions the aggregate figure measured at N=4",
+              any("streams" in n and "speculation is off" in n
+                  and "69.2" in n and "N=4" in n for n in p.notes), True)
+
+        # An N with no measurement at this build says so instead of a number.
+        p3 = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB, None,
+                              None, 3)
+        check("streams note says 'not measured' for an unmeasured N",
+              any("not measured at this N" in n for n in p3.notes), True)
+
+        # streams=1 is a pure no-op: same plan and argv as not passing it.
+        p_default = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB)
+        p_explicit_1 = revv.plan_launch(speed, "12gb", None, REF_3060_FREE_MIB,
+                                        None, None, 1)
+        argv_default = revv.build_server_argv(
+            "/x/llama-server", speed.path, p_default, 8080, revv.MODE_REVV, [])
+        argv_explicit_1 = revv.build_server_argv(
+            "/x/llama-server", speed.path, p_explicit_1, 8080, revv.MODE_REVV, [])
+        check("streams=1 argv is identical to the default (no --streams)",
+              argv_explicit_1, argv_default)
+        check("streams=1 use_spec matches the default", p_explicit_1.use_spec,
+              p_default.use_spec)
+
+        # Dense build: same table, different figures.
+        dense = certified_like()
+        pd = revv.plan_launch(dense, "12gb", None, REF_3060_FREE_MIB, None,
+                              None, 8)
+        check("dense streams note carries the N=8 aggregate (57.1)",
+              any("57.1" in n and "N=8" in n for n in pd.notes), True)
+
+    # resolve_streams: the CLI-facing gate. Bounds and both conflicts refuse
+    # via die() (SystemExit), same pattern as resolve_long_profile.
+    check("resolve_streams passes through a valid N",
+          revv.resolve_streams(4, False, None), 4)
+    check("resolve_streams(None, ...) means 'not given'",
+          revv.resolve_streams(None, False, None), None)
+
+    for bad in (0, 1, 9):
+        try:
+            revv.resolve_streams(bad, False, None)
+            refused = False
+        except SystemExit:
+            refused = True
+        check("resolve_streams rejects %d" % bad, refused, True)
+
+    try:
+        revv.resolve_streams(4, True, None)
+        refused_long = False
+    except SystemExit:
+        refused_long = True
+    check("resolve_streams refuses --streams with --long", refused_long, True)
+
+    try:
+        revv.resolve_streams(4, False, "/models/drafter.gguf")
+        refused_draft = False
+    except SystemExit:
+        refused_draft = True
+    check("resolve_streams refuses --streams with an external --draft",
+          refused_draft, True)
+
+
 def test_flagship_ngram_chain():
     """Certified 2026-09-05: the n-gram+MTP chain, previously speed-tier
     only, now ships on the flagship. Editing workloads 40.3 -> 222.8 / 246.0
@@ -983,6 +1063,7 @@ def main():
     test_thread_heuristic()
     test_speed_tier_drafter_stack()
     test_long_profile()
+    test_streams()
     test_flagship_ngram_chain()
     test_real_hardware_fixtures()
     test_forced_tier_guard()

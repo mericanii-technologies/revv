@@ -31,6 +31,12 @@ here is measured; the protocols are in [BENCHMARKS.md](BENCHMARKS.md).
   context, ~17.0 t/s with the context full, against 55.9 t/s on the default
   16,384-context profile. One measured configuration, not a ladder -- it
   refuses outright rather than stepping down if VRAM is short.
+- **`up`/`serve --streams N`** (2-8) serves N requests at once by sharing the
+  context across N slots (`--parallel N`), for people running several agents
+  or requests at a time. Speculation is off in that mode -- the shipped build
+  cannot run the draft head per slot, and fails outright if it tries -- so a
+  single stream is slower, but aggregate throughput is higher: 69.2 t/s on
+  `moe` and 46.6 on `dense` at N=4, 78.7 and 57.1 at N=8. BENCHMARKS.md §21.
 - **A prebuilt binary with the CUDA runtime bundled**, so a first install needs
   no compiler and no CUDA toolkit.
 - **Context sized to the VRAM that is actually free**, not the total, with a

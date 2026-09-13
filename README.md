@@ -93,6 +93,12 @@ separately about the downloaded models.
 context, about 17 t/s with the context full, 22 expert blocks on the CPU.
 The default 16K profile is 56 t/s. Both measured; BENCHMARKS.md §20.
 
+`revv up moe --streams 4` serves four requests at once. Speculation is off in
+that mode (the shipped build cannot run the draft head per slot), so a single
+stream is slower, but total output is higher: measured 69 t/s aggregate on the
+MoE and 47 on the dense build at four streams, 79 and 57 at eight. Use it for
+parallel agents; use the default for one chat.
+
 ## Supported
 
 NVIDIA with 12 GB or more of free VRAM, Turing or newer; Linux, or Windows

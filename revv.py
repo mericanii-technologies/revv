@@ -29,7 +29,7 @@ from typing import (Any, BinaryIO, Callable, Dict, List, NamedTuple, Optional,
                     Sequence, Tuple)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 
 def _git_sha() -> Optional[str]:
@@ -423,6 +423,13 @@ BUILDS: Dict[str, Dict[str, object]] = {
         "note": "27B dense. Needs no host RAM beyond the VRAM. Slower than "
                 "the MoE build, and scored 4/34 against its 9/34 on our "
                 "multi-file editing instrument (p=0.039).",
+        # --streams N (BENCHMARKS.md s21): aggregate decode across N
+        # concurrent 400-token requests, speculation OFF (the shipped build
+        # cannot create a second MTP draft context once --parallel > 1).
+        # Whole-process peak stayed under 11,902 MiB at N=8, within this
+        # build's own certified peak_mib, so the planner's existing margin
+        # already covers it -- no separate VRAM accounting needed.
+        "streams_ts": {2: 34.8, 4: 46.6, 8: 57.1},
     },
     "Q3_K_35B_ABLITERATED": {
         # Huihui's abliterated Qwen3.6-35B-A3B, plain Q3_K with the MTP head
@@ -496,6 +503,11 @@ BUILDS: Dict[str, Dict[str, object]] = {
                 "against the dense build's 4/34 on our multi-file editing "
                 "instrument (p=0.039). Needs ~8 GiB of free host RAM on top "
                 "of the VRAM, because the experts stream from it.",
+        # --streams N (BENCHMARKS.md s21): same protocol as the dense build's
+        # streams_ts above. Speculation OFF -- the MoE build's drafter runs
+        # out of memory once --parallel > 1. Peak stayed under 11,432 MiB at
+        # N=8, within this build's certified peak_mib.
+        "streams_ts": {2: 57.9, 4: 69.2, 8: 78.7},
         # One measured long-context point, not a ladder: 131,072 context on
         # the reference RTX 3060 12GB (BENCHMARKS.md s20), q8_0 KV, 22 expert
         # blocks on the CPU (up from the default profile's 16 -- more experts
@@ -2525,7 +2537,8 @@ class LaunchPlan:
                  n_cpu_moe: Optional[int] = None,
                  build_name: Optional[str] = None,
                  n_threads: Optional[int] = None,
-                 profile: Optional[str] = None) -> None:
+                 profile: Optional[str] = None,
+                 streams: int = 1) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2557,6 +2570,11 @@ class LaunchPlan:
         # reference, and into the status line so a user does not mistake a
         # 17 t/s decode for a regression.
         self.profile = profile
+        # 1 = ordinary single-slot behaviour, llama-server's own default.
+        # >1 = --streams N: --parallel N slots share the context, and
+        # speculation is forced off (see plan_launch) because the shipped
+        # build cannot run the draft head per slot.
+        self.streams = streams
 
     @property
     def levers(self) -> List[str]:
@@ -2607,12 +2625,18 @@ def draft_overhead_mib(draft: Optional["GGUFInfo"], ctx: int,
 def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                 free_mib: Optional[int],
                 draft: Optional["GGUFInfo"] = None,
-                long_spec: Optional[Dict[str, object]] = None) -> LaunchPlan:
+                long_spec: Optional[Dict[str, object]] = None,
+                streams: int = 1) -> LaunchPlan:
     """long_spec is the build's "long" registry sub-spec, or None for the
     ordinary tier profile. It is resolved by the CLI (resolve_long_profile),
     which is also where an unsupported build or insufficient VRAM is refused
     -- this function trusts long_spec once given and never steps it down,
-    because it is one measured point, not a ladder rung."""
+    because it is one measured point, not a ladder rung.
+
+    streams is the CLI's --streams N, or 1 for ordinary single-slot behaviour.
+    It too is validated by the CLI (resolve_streams) before this runs -- the
+    conflict with --long and with an external --draft is refused there, not
+    here."""
     t = TIERS[tier]
     preferred = explicit_ctx if explicit_ctx is not None else int(t["ctx"])
     notes = []      # type: List[str]
@@ -2675,8 +2699,14 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                          % ("{:,}".format(info.n_vocab),
                             "{:,}".format(draft.n_vocab)))
 
-    use_spec = info.has_mtp_head
-    if not use_spec and draft is None:
+    # --streams N forces speculation off regardless of the file's own head:
+    # BENCHMARKS.md s21 measured the shipped build FAILING outright with
+    # --parallel > 1 -- the dense server cannot create a second MTP draft
+    # context ("failed to create MTP context"), and the MoE drafter runs out
+    # of memory. Keyed on the file's own head, not on the forced-off value,
+    # so a genuinely headless file still gets its usual note below.
+    use_spec = info.has_mtp_head and streams <= 1
+    if not info.has_mtp_head and draft is None:
         notes.append("no MTP draft head in this file, so speculative decoding "
                      "is off (that is where most of revv's speed comes from); "
                      "an external drafter can supply it: --draft <file.gguf>")
@@ -2828,6 +2858,23 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                                  "so the cache is %s to fit"
                                  % (mib(f16_peak), mib(free_mib), kv))
 
+    if streams > 1:
+        agg = (spec or {}).get("streams_ts") or {}
+        agg_ts = agg.get(streams)
+        if agg_ts is not None:
+            measured = ("measured aggregate %.1f t/s for the %s build at "
+                        "N=%d" % (float(agg_ts),
+                                 (spec or {}).get("line") or "unregistered",
+                                 streams))
+        else:
+            measured = "not measured at this N"
+        notes.append(
+            "%d streams: speculation is off because the shipped build "
+            "cannot run the draft head per slot; context %s is shared "
+            "across the %d slots (%s each); %s"
+            % (streams, "{:,}".format(ctx), streams,
+               "{:,}".format(ctx // streams), measured))
+
     if long_spec is not None:
         # The registry's measured whole-process peak for this profile, not
         # the generic anchor arithmetic (which has no idea 131,072 tokens of
@@ -2903,7 +2950,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     return LaunchPlan(ctx, kv, use_spec, thinking_off, notes, peak,
                       draft.path if draft else None, draft_spec_type,
                       ctx_checkpoints, n_cpu_moe, build_name, n_threads,
-                      "long" if long_spec is not None else None)
+                      "long" if long_spec is not None else None, streams)
 
 
 def resolve_long_profile(build_name: Optional[str],
@@ -2934,6 +2981,41 @@ def resolve_long_profile(build_name: Optional[str],
             "down -- free up VRAM, or drop --long for the default profile.")
         return {}       # unreachable
     return long_spec
+
+
+def resolve_streams(streams_arg: Optional[int], is_long: bool,
+                    draft_arg: Optional[str]) -> Optional[int]:
+    """--streams: 2..8, or None ("not given" -- ordinary single-slot
+    behaviour). Die trying, the same as resolve_long_profile, rather than
+    warn and launch into a config that BENCHMARKS.md s21 measured failing.
+
+    Two conflicts refused outright, not stepped around:
+    - --long: its certified figures were measured single-stream; there is no
+      run pairing 131,072 context with concurrency to fall back on.
+    - an external --draft: --streams already turns speculation off (the
+      shipped build cannot run any draft head, built-in or external, once
+      --parallel > 1), so an external drafter has nothing left to do.
+    """
+    if streams_arg is None:
+        return None
+    if not (2 <= streams_arg <= 8):
+        die("--streams must be between 2 and 8 (got %d)" % streams_arg,
+            "Pick a value in that range, or drop --streams for the default "
+            "single-stream behaviour.")
+        return None     # unreachable
+    if is_long:
+        die("streams and the long profile were not measured together",
+            "Drop --streams, or drop --long -- BENCHMARKS.md has no run "
+            "that combines the two.")
+        return None     # unreachable
+    if draft_arg:
+        die("--streams conflicts with an external --draft",
+            "--streams already turns speculation off (the shipped build "
+            "cannot run any draft head, built-in or external, once "
+            "--parallel > 1), so an external drafter has nothing left to "
+            "do. Drop one or the other.")
+        return None     # unreachable
+    return streams_arg
 
 
 # What STOCK means for a build that has no registry `stock` entry.
@@ -2973,9 +3055,10 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
     ngl = str(stock["n_gpu_layers"]) if stock else "99"
     ctx = str(stock["ctx"]) if stock else str(plan.ctx)
     argv = [exe, "-m", model, "-ngl", ngl, "-c", ctx,
-            # Certified at one slot. Concurrency splits the context and was
-            # never measured, and the 12GB tier has 86 MiB of headroom.
-            "--parallel", "1",
+            # Certified at one slot. --streams N (BENCHMARKS.md s21) is the
+            # only measured departure from that: llama-server shares -c
+            # across the N slots itself, so ctx above does not change.
+            "--parallel", str(plan.streams),
             # A stable id in /v1/models, so clients keep working across a mode
             # switch and users have one short name to configure. Cosmetic: it
             # is identical in both modes and cannot affect the measurement.
@@ -3339,6 +3422,10 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
                     # instead of grading a 128K-context run against the
                     # default profile's number.
                     "profile": plan.profile,
+                    # 1 for ordinary single-slot behaviour, >1 for --streams N
+                    # -- so `revv status` can show it and `revv bench` knows
+                    # to skip the single-stream verdict.
+                    "streams": plan.streams,
                     "line": (BUILDS[plan.build_name].get("line")
                              if plan.build_name in BUILDS else None),
                     # Which levers this model can actually use, so toggle and
@@ -3587,7 +3674,10 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
                 "Drop --ctx, or drop --long and size --ctx yourself.")
             return 1
         long_spec = resolve_long_profile(identify_build(info), free_mib)
-    plan = plan_launch(info, tier, args.ctx, free_mib, draft_info, long_spec)
+
+    streams = resolve_streams(args.streams, args.long, args.draft)
+    plan = plan_launch(info, tier, args.ctx, free_mib, draft_info, long_spec,
+                       streams or 1)
 
     # Resolved before anything binds or prints, so --print-command shows the
     # port the server would actually use.
@@ -3603,9 +3693,10 @@ def cmd_serve(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     if args.port is None and port != DEFAULT_PORT:
         print("  %s port %d was busy, using %d instead"
               % (yellow("note:"), DEFAULT_PORT, port))
-    print("  tier     %s   context %s   KV %s%s"
+    print("  tier     %s   context %s   KV %s%s%s"
           % (tier.upper(), "{:,}".format(plan.ctx), plan.kv,
-             "   profile long" if plan.profile else ""))
+             "   profile long" if plan.profile else "",
+             "   streams %d" % plan.streams if plan.streams > 1 else ""))
     if plan.estimated_peak:
         print("  vram     ~%s estimated peak%s"
               % (mib(plan.estimated_peak),
@@ -4084,7 +4175,7 @@ def cmd_up(args: argparse.Namespace) -> int:
               % (yellow("note:"), DEFAULT_PORT, port))
     for flag, value in (("--port", port), ("--host", args.host),
                         ("--ctx", args.ctx), ("--tier", args.tier),
-                        ("--draft", args.draft)):
+                        ("--draft", args.draft), ("--streams", args.streams)):
         if value is not None:
             argv += [flag, str(value)]
     if args.stock:
@@ -4243,10 +4334,12 @@ def cmd_status(args: argparse.Namespace) -> int:
           % (st["model"], MODEL_ALIAS))
     if st.get("line"):
         print("  line     %s" % str(st["line"]).upper())
-    print("  tier     %s   context %s   KV %s%s"
+    print("  tier     %s   context %s   KV %s%s%s"
           % (str(st["tier"]).upper(),
              "{:,}".format(int(st.get("context") or 0)), st.get("kv", "?"),
-             "   profile long" if st.get("profile") else ""))
+             "   profile long" if st.get("profile") else "",
+             "   streams %d" % int(st["streams"])
+             if int(st.get("streams") or 1) > 1 else ""))
     if st.get("tuning_is_noop"):
         print("  tuning   %s"
               % yellow("no lever applies to this model; serving stock config"))
@@ -4508,10 +4601,12 @@ def cmd_bench(args: argparse.Namespace) -> int:
     # dense stand-in and says so.
     build_name = None       # type: Optional[str]
     profile = None          # type: Optional[str]
+    streams = None          # type: Optional[int]
     try:
         st0 = _control(base, "status", timeout=5)
         build_name = st0.get("build")
         profile = st0.get("profile")
+        streams = st0.get("streams")
     except (urllib.error.URLError, OSError, ValueError):
         pass
 
@@ -4581,65 +4676,77 @@ def cmd_bench(args: argparse.Namespace) -> int:
         print("\n  " + red("thinking is LEAKING") + " -- the measured requests"
               " returned reasoning blocks.")
 
-    # Compare against the figure that matches the build actually installed,
-    # not the headline. Flagging a healthy stock build as "slow" would be noise.
-    manifest = read_build_manifest()
-    patched = bool(manifest and "mmvq_iquant_decode.patch"
-                   in (manifest.get("patches") or []))
-    target, ref_ts, ref_name = bench_reference(build_name, patched, profile)
-    target_label = ("kernel-patched build" if patched else
-                    "stock build" if manifest else
-                    "stock build (assumed: unknown provenance)")
-
-    print("\n  " + bold("reference (RTX 3060 12GB, sm_86, this same protocol)"))
-    print("    %-44s %6.1f t/s" % (ref_name, ref_ts))
-    if profile == "long":
-        # Not measured: the long profile's certification ran the usual
-        # protocol with speculation ON only. Printing the default profile's
-        # no-speculation figure here would compare a 128K-context run
-        # against a number from a different context entirely.
-        print("    %-44s %6s" % ("speculation off (what MTP buys you)",
-                                 "not measured"))
+    if streams and int(streams) > 1:
+        # bench sends ONE request at a time -- it cannot reproduce the N
+        # concurrent requests BENCHMARKS.md s21 measured, and grading this
+        # single stream against the no-streams reference would report a
+        # working --streams server as a regression it is not (per-stream
+        # throughput drops by design as N rises; aggregate is what went up).
+        print("\n  " + bold("reference"))
+        print("    streams=%d: single-stream reference not applicable; "
+              "aggregate throughput was measured in BENCHMARKS.md s21"
+              % int(streams))
     else:
-        nospec = float((BUILDS.get(build_name or "") or {}).get("nospec_ts")
-                       or BENCH_REF_NOSPEC)
-        print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
-                                       nospec))
-    print("    comparing against the %s (%.1f t/s)" % (target_label, target))
-    if build_name is None:
-        print(dim("    This model is not a registered build, so the dense"))
-        print(dim("    reference is used as a stand-in. Treat it loosely."))
-    if build_name in (None, "IQ3_XXS"):
-        print(dim("    Certification used a different prompt and reads 34.4-36.7"))
-        print(dim("    t/s for the dense build; see BENCHMARKS.md. Do not mix them."))
+        # Compare against the figure that matches the build actually
+        # installed, not the headline. Flagging a healthy stock build as
+        # "slow" would be noise.
+        manifest = read_build_manifest()
+        patched = bool(manifest and "mmvq_iquant_decode.patch"
+                       in (manifest.get("patches") or []))
+        target, ref_ts, ref_name = bench_reference(build_name, patched, profile)
+        target_label = ("kernel-patched build" if patched else
+                        "stock build" if manifest else
+                        "stock build (assumed: unknown provenance)")
 
-    print("\n  " + bold("reading"))
-    ratio = mean / target
-    if ratio > 1.05:
-        # Never a silent pass. Being far above the reference is a result that
-        # needs explaining -- a different protocol, a shorter prompt, an
-        # overclock, or a genuinely faster machine -- not a green tick.
-        print("    %s %.2f t/s is %.0f%% ABOVE the %.1f t/s reference."
-              % (yellow("above reference:"), mean, (ratio - 1.0) * 100, target))
-        print("    Verify the GPU and clocks (nvidia-smi --query-gpu=clocks.sm)")
-        print("    and that this is the build you think it is; then report it.")
-    elif ratio >= 0.95:
-        print("    %s within 5%% of the reference (%.1f t/s)."
-              % (green("on target:"), target))
-    elif mean < BENCH_REF_NOSPEC * 1.10:
-        print("    %s %.1f t/s sits in the no-speculation regime."
-              % (red("speculation is not running:"), mean))
-        print("    Almost always a model without the MTP draft head. Check:")
-        print("      revv inspect <your.gguf>")
-    elif ratio >= 0.85:
-        print("    %s %.0f%% of reference. Usual causes: a hotter or"
-              % (yellow("slightly low:"), ratio * 100))
-        print("    power-limited card, a slower CPU on the host-side draft")
-        print("    path, or another process sharing the GPU.")
-    else:
-        print("    %s %.0f%% of reference. Check nvidia-smi for other"
-              % (red("well below:"), ratio * 100))
-        print("    processes, and confirm -ngl put every layer on the GPU.")
+        print("\n  " + bold("reference (RTX 3060 12GB, sm_86, this same protocol)"))
+        print("    %-44s %6.1f t/s" % (ref_name, ref_ts))
+        if profile == "long":
+            # Not measured: the long profile's certification ran the usual
+            # protocol with speculation ON only. Printing the default profile's
+            # no-speculation figure here would compare a 128K-context run
+            # against a number from a different context entirely.
+            print("    %-44s %6s" % ("speculation off (what MTP buys you)",
+                                     "not measured"))
+        else:
+            nospec = float((BUILDS.get(build_name or "") or {}).get("nospec_ts")
+                           or BENCH_REF_NOSPEC)
+            print("    %-44s %6.1f t/s" % ("speculation off (what MTP buys you)",
+                                           nospec))
+        print("    comparing against the %s (%.1f t/s)" % (target_label, target))
+        if build_name is None:
+            print(dim("    This model is not a registered build, so the dense"))
+            print(dim("    reference is used as a stand-in. Treat it loosely."))
+        if build_name in (None, "IQ3_XXS"):
+            print(dim("    Certification used a different prompt and reads 34.4-36.7"))
+            print(dim("    t/s for the dense build; see BENCHMARKS.md. Do not mix them."))
+
+        print("\n  " + bold("reading"))
+        ratio = mean / target
+        if ratio > 1.05:
+            # Never a silent pass. Being far above the reference is a result that
+            # needs explaining -- a different protocol, a shorter prompt, an
+            # overclock, or a genuinely faster machine -- not a green tick.
+            print("    %s %.2f t/s is %.0f%% ABOVE the %.1f t/s reference."
+                  % (yellow("above reference:"), mean, (ratio - 1.0) * 100, target))
+            print("    Verify the GPU and clocks (nvidia-smi --query-gpu=clocks.sm)")
+            print("    and that this is the build you think it is; then report it.")
+        elif ratio >= 0.95:
+            print("    %s within 5%% of the reference (%.1f t/s)."
+                  % (green("on target:"), target))
+        elif mean < BENCH_REF_NOSPEC * 1.10:
+            print("    %s %.1f t/s sits in the no-speculation regime."
+                  % (red("speculation is not running:"), mean))
+            print("    Almost always a model without the MTP draft head. Check:")
+            print("      revv inspect <your.gguf>")
+        elif ratio >= 0.85:
+            print("    %s %.0f%% of reference. Usual causes: a hotter or"
+                  % (yellow("slightly low:"), ratio * 100))
+            print("    power-limited card, a slower CPU on the host-side draft")
+            print("    path, or another process sharing the GPU.")
+        else:
+            print("    %s %.0f%% of reference. Check nvidia-smi for other"
+                  % (red("well below:"), ratio * 100))
+            print("    processes, and confirm -ngl put every layer on the GPU.")
     print("\n  " + bold("thinking check") + dim("  (3 arms, ~%d tokens each)")
           % PROBE_MAX_TOKENS)
     ok, report = thinking_check(base, args.timeout)
@@ -4999,6 +5106,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "22 expert blocks on the CPU; slower decode in "
                              "exchange for the context). Conflicts with "
                              "--ctx")
+        sp.add_argument("--streams", type=int, metavar="N",
+                        help="serve N concurrent requests (2-8) by sharing "
+                             "the context across N slots (--parallel N). "
+                             "Speculation is off in this mode -- the shipped "
+                             "build cannot run the draft head per slot -- so "
+                             "a single stream is slower, but total output is "
+                             "higher. Conflicts with --long and --draft")
 
     s = sub.add_parser(
         "serve", help="run the stack in the foreground (verbose; for debugging)",

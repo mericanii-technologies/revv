@@ -855,6 +855,20 @@ Faster and roomier than the certified UD-Q3_K_XL file (55.9 t/s, 212 MiB), consi
 
 §17's finding that quantized KV is slower than f16 was measured on the dense 27B and does not carry to this hybrid MoE: at depth the q8_0 cache is 1.7× faster, at short context they tie. The planner no longer upgrades MoE-line builds to f16 when it fits; the dense rule stands for the dense build. The 25 t/s deep figure recorded through the endpoint before this A/B was the f16 configuration.
 
+## 21. Batching: several streams at once (2026-09-13)
+
+Every number above is one request at a time. Decode reads all the weights once per step, so a second request in the same step is nearly free until the kernels become compute-bound. Measured on the reference box with `llama-server --parallel N` (the certified `-c` is shared across the N slots), N concurrent 400-token requests on one fixed code prompt, one discarded warm-up burst then three timed bursts, aggregate = tokens produced by all streams divided by the burst's wall time. Peak VRAM sampled every second. Raw log: `ollama:/data/scratch/queue/logs/02_batching.log`.
+
+| streams | dense, speculation off: aggregate (per stream) | MoE, speculation off: aggregate (per stream) | peak VRAM dense / MoE |
+|---|---|---|---|
+| 1 | 22.3 (22.4) | 44.3 (45.7) | 10,850 / 11,140 |
+| 2 | 34.8 (17.5) | 57.9 (29.7) | 10,996 / 11,220 |
+| 4 | 46.6 (11.8) | 69.2 (17.8) | 11,296 / 11,186 |
+| 8 | **57.1** (7.2) | **78.7** (10.1) | 11,902 / 11,432 |
+| 1, speculation on (shipped) | 37.6 | 58.5 | 11,800 / 11,834 |
+
+Speculation does not combine with batching in this build. With N ≥ 2 the dense server fails at load ("failed to create MTP context") and the MoE runs out of memory inside the drafter, so every speculation-on cell above one stream is an error. Reading: for a single chat the shipped configuration is fastest; for parallel agents, four streams without speculation beat it in total output by 24 percent on the dense build and 18 percent on the MoE, eight streams by 52 and 35 percent, at the cost of per-stream speed. Shipped as `revv up --streams N` (1.1.2).
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:
