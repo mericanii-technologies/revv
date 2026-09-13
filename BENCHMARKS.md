@@ -869,6 +869,26 @@ Every number above is one request at a time. Decode reads all the weights once p
 
 Speculation does not combine with batching in this build. With N ≥ 2 the dense server fails at load ("failed to create MTP context") and the MoE runs out of memory inside the drafter, so every speculation-on cell above one stream is an error. Reading: for a single chat the shipped configuration is fastest; for parallel agents, four streams without speculation beat it in total output by 24 percent on the dense build and 18 percent on the MoE, eight streams by 52 and 35 percent, at the cost of per-stream speed. Shipped as `revv up --streams N` (1.1.2).
 
+## 22. Gemma 4 26B-A4B on the RTX 3060 (2026-09-13)
+
+Third model through the full protocol; full write-up in `results/gemma4_26b_cert.md`. File `bartowski/google_gemma-4-26B-A4B-it-GGUF` IQ3_XXS (12,160,200,320 B, 11.33 GiB, Apache-2.0) plus Google's sidecar draft head `mtp-google_gemma-4-26B-A4B-it-Q4_0.gguf` (0.30 GiB), loaded with `-md`. The chat template defaults thinking to off. Both findings refute §16's earlier Gemma note.
+
+Configuration that certified: `-ngl 99 --n-cpu-moe 4 -t 8 -c 16384 -fa on -ctk q8_0 -ctv q8_0 -ctxcp 0 --jinja --reasoning off --spec-type ngram-simple,draft-mtp --spec-draft-n-max 2 --spec-ngram-simple-size-m 256 -md <sidecar>`. Stock (`--n-cpu-moe 0`) runs out of memory; two blocks offloaded leaves 116 MiB and fails the standard.
+
+| | Gemma 4 26B-A4B, revv-style | Qwen3.6-35B-A3B, shipped |
+|---|---|---|
+| expert blocks on CPU | 4 of 30 | 16 of 41 |
+| context / peak VRAM / headroom | 16,384 / 11,580 / 464 MiB | 16,384 / 11,832 / 212 |
+| decode, 4 × 400 tokens | **70.7 t/s** (spread 0.2%) | 55.9 |
+| editing throughput | **287 t/s** | ~188 |
+| acceptance | 0.67 | 0.77 |
+| HumanEval-164 | 157 | 153 (not significant at n=164) |
+| editing instrument, 4,096-token budget | 7 / 34 overall, 1 / 34 first attempt, 30 / 34 format | 16 / 34, 9 / 34, 34 / 34 |
+
+Editing was run twice. At the 2,048-token budget calibrated on the 27B it scored 5/34 with seven attempts cut off mid-answer; at 4,096 it scored 7/34, and 19 of 66 attempts still hit the cap. The token distribution is bimodal (median 877, p75 at the cap): the model has a runaway mode on about a third of attempts, and clean runs solved no better than capped ones (16 vs 27 percent), so truncation does not explain the gap. Paired McNemar against the Qwen MoE on the same 34 tasks: overall p = 0.012, first attempt p = 0.008, with Gemma winning one task and losing ten.
+
+Reading: the fastest and most comfortable configuration measured on this card, tied on HumanEval, and a significantly weaker editor. A speed line, not the model for agent or edit-loop work. Open question worth one look: whether the runaway mode is a template or sampler defect rather than the weights.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:
