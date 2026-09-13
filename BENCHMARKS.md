@@ -889,6 +889,36 @@ Editing was run twice. At the 2,048-token budget calibrated on the 27B it scored
 
 Reading: the fastest and most comfortable configuration measured on this card, tied on HumanEval, and a significantly weaker editor. A speed line, not the model for agent or edit-loop work. Open question worth one look: whether the runaway mode is a template or sampler defect rather than the weights.
 
+## 23. The n-gram drafter and draft depth 3, re-measured (2026-09-13)
+
+Prompted by the head-tuning result (§24 of FINDINGS.md: the MTP head alone accepts 0.96 of its drafts; the 0.77 quoted earlier was the pooled figure with the n-gram drafter's misses in the denominator). Two questions: does the n-gram drafter cost generation speed, and does draft depth 3 beat depth 2 on the current binary. Raw logs: `ollama:/data/scratch/queue/logs/10_ngram_sweep.log`, `11_depth3_probe.log`.
+
+**Drafter sweep**, four generation prompts and three editing prompts, chain on and MTP-only, depths 2 and 3, certified contexts:
+
+| build | drafters | depth | generation t/s | editing t/s |
+|---|---|---|---|---|
+| MoE | MTP only | 2 | 62.3 | 60.2 |
+| MoE | n-gram + MTP | 2 | 62.3 | 194.9 |
+| dense | MTP only | 2 | 38.3 | 40.6 |
+| dense | n-gram + MTP | 2 | 37.8 | 287.7 |
+| MoE | n-gram + MTP | 3 | 62.7 | 198.4 |
+| dense | n-gram + MTP | 3 | 40.6 | 292.3 |
+
+The n-gram drafter costs nothing measurable on generation and is the whole editing gain. The chain stays.
+
+**Depth-3 probe**, bench-style decode (one fixed prompt, 4 × 400 tokens) with the peak sampled every second under two context-filling requests, chain on, `-ctxcp 0`:
+
+| build | context | depth | decode t/s | peak MiB | headroom MiB | verdict |
+|---|---|---|---|---|---|---|
+| dense | 12,288 | 2 | 37.9 | 11,835 | 208 | shipped |
+| dense | 12,288 | 3 | 40.0 | 11,989 | 54 | fails the standard |
+| dense | 8,192 | 3 | **40.1** | 11,833 | **210** | passes |
+| MoE | 16,384 | 2 | 58.6 | 11,849 | 194 | shipped (212 at certification; within noise) |
+| MoE | 16,384 | 3 | 51.1 | 11,917 | 126 | slower and fails |
+| MoE | 12,288 | 3 | 51.1 | 11,867 | 176 | slower |
+
+Depth 3 is worth 6 percent on the dense build at the cost of one context step (8K instead of 12K), because each extra draft position costs about 150 MiB. On the MoE it loses 13 percent on this prompt at any context, consistent with the original certification; the drafter sweep's parity at depth 3 was prompt-dependent. Nothing ships on speed alone: the dense 8K/depth-3 cell goes through paired HumanEval-164 and the editing instrument before it becomes an option.
+
 ## Appendix: exact artifacts
 
 For anyone trying to reproduce these results from byte-identical inputs:
