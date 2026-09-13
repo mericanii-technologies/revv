@@ -56,6 +56,8 @@ the display.
 | `gemma` generation | not shippable (OOM, 116 MiB headroom) | **70.7 t/s**, 16K context | not run |
 | `gemma` editing | not shippable (OOM) | 287 t/s | not run |
 
+At 8K context the dense build runs draft depth 3, 40 t/s instead of 38, measured quality-neutral.
+
 Quality: `moe` and `dense` tie their uncompressed anchor on HumanEval-164
 (153/164 and 152/164); `gemma` scores 157/164, tied with both within noise. On
 a 34-task multi-file editing instrument `moe` solved 9/34 first try against

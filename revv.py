@@ -29,7 +29,7 @@ from typing import (Any, BinaryIO, Callable, Dict, List, NamedTuple, Optional,
                     Sequence, Tuple)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 
 def _git_sha() -> Optional[str]:
@@ -442,6 +442,19 @@ BUILDS: Dict[str, Dict[str, object]] = {
         # both. These include the chain, unlike peak_mib's anchor arithmetic,
         # which is why plan_launch uses them directly with the narrow margin.
         "measured_peaks": {4096: 11307, 8192: 11307},
+        # Draft depth 3, re-measured 2026-09-13 (BENCHMARKS.md §23): same
+        # protocol as measured_peaks above -- whole-process, chain on, q8_0
+        # KV, -ctxcp 0, two consecutive context-filling requests -- but with
+        # --spec-draft-n-max 3 instead of 2. Each extra draft position costs
+        # ~150 MiB, so 12,288 (11,989 MiB, 54 MiB free) fails the headroom
+        # standard while 8,192 (11,833 MiB, 210 MiB free) passes; there is no
+        # ladder here, just the one context that clears it. 40.1 t/s against
+        # 37.9 at depth 2, quality-neutral: paired HumanEval-164 153 vs 152,
+        # editing 4/34 vs 4/34 first attempt (8/34 vs 9/34 overall),
+        # edit-format compliance 34/34 both. plan_launch turns this on
+        # automatically when the chosen context is 8,192.
+        "measured_peaks_depth3": {8192: 11833},
+        "decode_ts_depth3": {8192: 40.1},
         "note": "27B dense. Needs no host RAM beyond the VRAM. Slower than "
                 "the MoE build, and scored 4/34 against its 9/34 on our "
                 "multi-file editing instrument (p=0.039).",
@@ -733,8 +746,13 @@ TIERS: Dict[str, Dict[str, object]] = {
 TIER_ORDER = ["24gb", "16gb", "12gb"]  # highest first, for detection
 
 # Speculation is the whole speed story: MTP n=2 is +68% and measured
-# quality-neutral (135/164 with vs 136/164 without, p=1.0). n>=3 showed
-# greedy non-reproducibility in one observation and is not shipped.
+# quality-neutral (135/164 with vs 136/164 without, p=1.0). This is the
+# certified depth everywhere. n=3 was re-measured 2026-09-13 (BENCHMARKS.md
+# §23): quality-neutral and faster on the dense build too, but each extra
+# draft position costs ~150 MiB VRAM, so plan_launch only raises the dense
+# build's own drafter to depth 3 (LaunchPlan.draft_depth) at the one context
+# that clears the headroom standard with it -- everywhere else, and every
+# external drafter or sidecar, stays at this certified default.
 SPEC_TYPE = "draft-mtp"
 SPEC_N_MAX = 2
 
@@ -1943,6 +1961,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             detail += ("\nwould run at context %s, %s KV, ~%s peak"
                        % ("{:,}".format(plan.ctx), plan.kv,
                           mib(plan.estimated_peak)))
+            if plan.draft_depth != 2:
+                detail += ", draft depth %d" % plan.draft_depth
             if any(n.startswith("WARNING") for n in plan.notes):
                 detail += "  (with a warning; see revv serve)"
             # plan_launch already warns generically when host RAM is short
@@ -2690,7 +2710,8 @@ class LaunchPlan:
                  n_threads: Optional[int] = None,
                  profile: Optional[str] = None,
                  streams: int = 1,
-                 draft_is_sidecar: bool = False) -> None:
+                 draft_is_sidecar: bool = False,
+                 draft_depth: int = 2) -> None:
         self.ctx = ctx
         self.kv = kv
         self.use_spec = use_spec
@@ -2732,6 +2753,14 @@ class LaunchPlan:
         # speculation is forced off (see plan_launch) because the shipped
         # build cannot run the draft head per slot.
         self.streams = streams
+        # --spec-draft-n-max for THIS build's own MTP head (build_server_argv's
+        # `elif plan.use_spec:` branch only -- an external --draft or a
+        # certified sidecar always runs at the certified SPEC_N_MAX, because
+        # depth 3 was only measured for the dense build speculating alone).
+        # 2 is certified everywhere; plan_launch raises this to 3 only for the
+        # one build/context/KV combination BENCHMARKS.md §23 measured
+        # clearing the headroom standard.
+        self.draft_depth = draft_depth
 
     @property
     def levers(self) -> List[str]:
@@ -2748,7 +2777,7 @@ class LaunchPlan:
             # (first-success-wins), so this is a strict addition over MTP
             # alone, not a replacement.
             active.append("speculation (n-gram + MTP n=%d drafter chain)"
-                          % SPEC_N_MAX)
+                          % self.draft_depth)
         if self.thinking_off:
             active.append("thinking off")
         if self.kv != "f16":
@@ -2801,6 +2830,11 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
     t = TIERS[tier]
     preferred = explicit_ctx if explicit_ctx is not None else int(t["ctx"])
     notes = []      # type: List[str]
+    # 2 is certified everywhere; raised to 3 below only for the one
+    # build/context/KV combination BENCHMARKS.md §23 measured clearing the
+    # headroom standard (see the "Draft depth 3" block further down).
+    draft_depth = 2
+    depth3_peak = None      # type: Optional[int]
 
     # A recognised build brings its own certified settings. These are measured
     # for that specific file, so they beat anything the generic estimator
@@ -3064,6 +3098,39 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                                  "so the cache is %s to fit"
                                  % (mib(f16_peak), mib(free_mib), kv))
 
+        # Draft depth 3 (BENCHMARKS.md §23): 40.1 t/s against 37.9 at depth 2,
+        # quality-neutral by paired HumanEval-164 and the editing instrument,
+        # but each extra draft position costs ~150 MiB, so it only clears the
+        # headroom standard at the one context the registry has a depth-3
+        # measurement for -- 12,288 leaves just 54 MiB and fails it. Gated on
+        # exactly the configuration that was measured: this build's own MTP
+        # head speculating alone (no external --draft, no sidecar -- both
+        # already show up here as draft is not None), a single slot, q8_0
+        # KV, and the ordinary tier profile (long_spec is None, guaranteed by
+        # this being the non-long branch).
+        if (spec is not None and use_spec and draft is None and streams == 1
+                and kv == "q8_0"):
+            depth3_table = spec.get("measured_peaks_depth3") or {}
+            depth3_candidate = depth3_table.get(ctx)
+            if depth3_candidate is not None:
+                depth3_candidate = int(depth3_candidate)
+                if (free_mib is None
+                        or depth3_candidate + MEASURED_PEAK_MARGIN_MIB
+                           <= free_mib):
+                    draft_depth = 3
+                    depth3_peak = depth3_candidate
+                    ts3 = (spec.get("decode_ts_depth3") or {}).get(ctx)
+                    ts2 = spec.get("decode_ts")
+                    notes.append(
+                        "draft depth 3 at %s context: %s t/s against %s at "
+                        "depth 2, quality-neutral by paired HumanEval-164 "
+                        "and the editing instrument (BENCHMARKS.md §"
+                        "23); depth 3 does not clear the headroom standard "
+                        "at 12,288"
+                        % ("{:,}".format(ctx),
+                           ("%.1f" % float(ts3)) if ts3 is not None else "?",
+                           ("%.1f" % float(ts2)) if ts2 is not None else "?"))
+
     if streams > 1:
         agg = (spec or {}).get("streams_ts") or {}
         agg_ts = agg.get(streams)
@@ -3098,6 +3165,12 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
             % ("{:,}".format(ctx), n_cpu_moe or 0,
                float(long_spec["decode_ts"]), float(long_spec["deep_decode_ts"]),
                float(base) if base else 0.0, "{:,}".format(int(t["ctx"]))))
+    elif draft_depth == 3:
+        # The registry's measured whole-process peak for THIS depth, not the
+        # depth-2 measured_peaks table -- an extra draft position is real
+        # VRAM (see the "Draft depth 3" note appended above).
+        peak = depth3_peak
+        margin = MEASURED_PEAK_MARGIN_MIB
     else:
         peak = total_peak(ctx, kv)
         margin = margin_for(ctx, kv)
@@ -3157,7 +3230,7 @@ def plan_launch(info: "GGUFInfo", tier: str, explicit_ctx: Optional[int],
                       draft.path if draft else None, draft_spec_type,
                       ctx_checkpoints, n_cpu_moe, build_name, n_threads,
                       "long" if long_spec is not None else None, streams,
-                      is_cert_sidecar)
+                      is_cert_sidecar, draft_depth)
 
 
 def resolve_long_profile(build_name: Optional[str],
@@ -3323,7 +3396,7 @@ def build_server_argv(exe: str, model: str, plan: LaunchPlan, port: int,
             # build that speculates through its own MTP head" without
             # re-measuring; acceptance is a property of the target model.
             argv += ["--spec-type", SPEC_TYPE_CHAIN,
-                     "--spec-draft-n-max", str(SPEC_N_MAX),
+                     "--spec-draft-n-max", str(plan.draft_depth),
                      "--spec-ngram-simple-size-m", str(SPEC_NGRAM_SIZE_M)]
     argv += list(passthrough)
     return argv
@@ -3639,6 +3712,12 @@ def make_proxy_handler(backend: Backend, stats: _Stats, quiet: bool):
                     # -- so `revv status` can show it and `revv bench` knows
                     # to skip the single-stream verdict.
                     "streams": plan.streams,
+                    # --spec-draft-n-max for this build's own MTP head. 2 is
+                    # certified everywhere; 3 only when plan_launch found the
+                    # depth-3 measurement clears the headroom standard at
+                    # this context (BENCHMARKS.md §23) -- `revv bench` reads
+                    # this to grade against the matching reference.
+                    "draft_depth": plan.draft_depth,
                     "line": (BUILDS[plan.build_name].get("line")
                              if plan.build_name in BUILDS else None),
                     # Which levers this model can actually use, so toggle and
@@ -4764,7 +4843,9 @@ def thinking_check(base: str, timeout: float) -> Tuple[bool, str]:
 
 
 def bench_reference(build_name: Optional[str], patched: bool,
-                    profile: Optional[str] = None) -> Tuple[float, float, str]:
+                    profile: Optional[str] = None,
+                    draft_depth: Optional[int] = None
+                    ) -> Tuple[float, float, str]:
     """(target, reference t/s, human name) for the build actually loaded.
 
     Grading every build against the dense build's number made the instrument
@@ -4778,13 +4859,22 @@ def bench_reference(build_name: Optional[str], patched: bool,
     22 expert blocks on the CPU), and grading that against the default
     profile's 55.9 would report a real, working long-context server as a
     two-thirds regression.
+
+    draft_depth does it again for the dense build's conditional depth-3 lever
+    (BENCHMARKS.md §23): grading a depth-3 server (40.1 t/s) against the
+    depth-2 reference (37.9-ish) would report the faster, still-certified
+    configuration as an overshoot rather than what it is.
     """
     spec = BUILDS.get(build_name) if build_name else None
     long_spec = spec.get("long") if spec else None
+    depth3_ts = ((spec.get("decode_ts_depth3") or {}) if spec else {})
     if profile == "long" and isinstance(long_spec, dict):
         ref_ts = float(long_spec["decode_ts"])
         name = "%s long profile, %s context" % (
             build_name, "{:,}".format(int(long_spec["ctx"])))
+    elif (draft_depth == 3 and build_name == DEFAULT_BUILD and depth3_ts):
+        ref_ts = float(next(iter(depth3_ts.values())))
+        name = "27B dense, MTP depth 3 at 8,192 context"
     elif build_name == DEFAULT_BUILD:
         # The dense build has a figure measured under THIS protocol, which is
         # not the same as its registry decode_ts (37.86 vs the certification
@@ -4815,11 +4905,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
     build_name = None       # type: Optional[str]
     profile = None          # type: Optional[str]
     streams = None          # type: Optional[int]
+    draft_depth = None      # type: Optional[int]
     try:
         st0 = _control(base, "status", timeout=5)
         build_name = st0.get("build")
         profile = st0.get("profile")
         streams = st0.get("streams")
+        draft_depth = st0.get("draft_depth")
     except (urllib.error.URLError, OSError, ValueError):
         pass
 
@@ -4906,7 +4998,8 @@ def cmd_bench(args: argparse.Namespace) -> int:
         manifest = read_build_manifest()
         patched = bool(manifest and "mmvq_iquant_decode.patch"
                        in (manifest.get("patches") or []))
-        target, ref_ts, ref_name = bench_reference(build_name, patched, profile)
+        target, ref_ts, ref_name = bench_reference(build_name, patched, profile,
+                                                    draft_depth)
         target_label = ("kernel-patched build" if patched else
                         "stock build" if manifest else
                         "stock build (assumed: unknown provenance)")

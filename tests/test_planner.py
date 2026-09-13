@@ -1209,6 +1209,85 @@ def test_wsl2_detection():
         os.unlink(native_proc_version)
 
 
+def test_draft_depth_3():
+    """Draft depth 3 (BENCHMARKS.md s23): 40.1 t/s against 37.9 at depth 2 on
+    the dense build, quality-neutral by paired HumanEval-164 and the editing
+    instrument, but each extra draft position costs ~150 MiB -- so it only
+    clears the headroom standard at 8,192 context, not the ladder's own
+    12,288. plan_launch turns it on automatically only for that exact
+    configuration; everything else (the automatic ladder, the MoE build,
+    multiple streams, --long) stays at the certified depth 2."""
+    section("draft depth 3 (BENCHMARKS.md s23)")
+    dense = certified_like()
+
+    # The automatic ladder lands on 12288 on the reference 3060, which has no
+    # depth-3 measurement -- stays at depth 2.
+    p_ladder = revv.plan_launch(dense, "12gb", None, REF_3060_FREE_MIB)
+    check("automatic ladder -> ctx 12288", p_ladder.ctx, 12288)
+    check("automatic ladder -> depth 2 (no depth-3 measurement at 12288)",
+          p_ladder.draft_depth, 2)
+    check("automatic ladder -> no depth-3 note",
+          any("draft depth 3" in n for n in p_ladder.notes), False)
+
+    # Explicit --ctx 8192 at the reference card's 12,044 MiB free: the
+    # depth-3 measurement (11,833 MiB) clears the narrow margin (210 MiB to
+    # spare, matching BENCHMARKS.md s23) -- depth 3 turns on automatically.
+    p8 = revv.plan_launch(dense, "12gb", 8192, REF_3060_FREE_MIB)
+    check("--ctx 8192 at 12,044 free -> depth 3", p8.draft_depth, 3)
+    check("--ctx 8192 at 12,044 free -> estimated_peak 11833",
+          p8.estimated_peak, 11833)
+    check("--ctx 8192 at 12,044 free -> depth-3 note present",
+          any("draft depth 3" in n for n in p8.notes), True)
+    check("--ctx 8192 depth-3 note states the measured numbers",
+          any("40.1" in n and "37.9" in n and "12,288" in n
+              for n in p8.notes), True)
+
+    argv8 = revv.build_server_argv("/x/llama-server", dense.path, p8, 8080,
+                                   revv.MODE_REVV, [])
+    check("--ctx 8192 depth 3 argv carries --spec-draft-n-max 3",
+          "--spec-draft-n-max" in argv8 and
+          argv8[argv8.index("--spec-draft-n-max") + 1] == "3", True)
+
+    # 11,900 free: 11,833 + 150 = 11,983 > 11,900, so depth 3 does not clear
+    # the standard here -- stays at depth 2, and says nothing about depth 3.
+    p8_tight = revv.plan_launch(dense, "12gb", 8192, 11900)
+    check("--ctx 8192 at 11,900 free -> depth 2 (does not clear headroom)",
+          p8_tight.draft_depth, 2)
+    check("--ctx 8192 at 11,900 free -> no depth-3 note",
+          any("draft depth 3" in n for n in p8_tight.notes), False)
+
+    # The MoE build has no depth-3 measurement at any context -- stays at
+    # depth 2 regardless of context, and --long forces depth 2 too (the
+    # depth-3 gate only runs in plan_launch's ordinary, non-long branch).
+    with fake_host_ram(32768, 16384):
+        moe = speed_like()
+        p_moe = revv.plan_launch(moe, "12gb", None, REF_3060_FREE_MIB)
+        check("MoE automatic ladder -> depth 2", p_moe.draft_depth, 2)
+        p_moe8 = revv.plan_launch(moe, "12gb", 8192, REF_3060_FREE_MIB)
+        check("MoE --ctx 8192 -> depth 2 (no depth-3 measurement on this line)",
+              p_moe8.draft_depth, 2)
+
+        long_spec = revv.BUILDS["Q3_K_XL_35B"]["long"]
+        p_long = revv.plan_launch(moe, "12gb", None, REF_3060_FREE_MIB, None,
+                                  long_spec)
+        check("--long -> depth 2", p_long.draft_depth, 2)
+
+    # More than one stream forces speculation off entirely, so depth 3 must
+    # not turn on either -- even at the exact ctx/free combination that
+    # would otherwise qualify.
+    p_streams = revv.plan_launch(dense, "12gb", 8192, REF_3060_FREE_MIB, None,
+                                 None, 2)
+    check("--streams 2 at the depth-3-qualifying combination -> depth 2",
+          p_streams.draft_depth, 2)
+
+    # bench_reference grades a depth-3 server against 40.1, not the depth-2
+    # figure, and names it distinctly.
+    ref3 = revv.bench_reference("IQ3_XXS", True, None, 3)
+    check("bench_reference(draft_depth=3) reads 40.1", ref3[1], 40.1)
+    check("bench_reference(draft_depth=3) names it distinctly", ref3[2],
+          "27B dense, MTP depth 3 at 8,192 context")
+
+
 def main():
     if not os.path.isdir(FIXTURES):
         print("fixtures missing: run python3 tests/make_fixtures.py first")
@@ -1234,6 +1313,7 @@ def main():
     test_stock_is_per_build()
     test_modes_are_not_identical()
     test_bench_reference()
+    test_draft_depth_3()
     test_failed_start_does_not_move_the_mode()
     test_wsl2_detection()
     print("\n%s" % ("ALL PASSED" if not _failures

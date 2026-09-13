@@ -4,6 +4,24 @@ All notable changes to revv are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-09-14
+
+### Changed
+- **The dense build runs draft depth 3 at 8,192 context.** Re-measured
+  2026-09-13 (BENCHMARKS.md §23): depth 3 decodes 40.1 t/s against 37.9 at
+  depth 2, quality-neutral by paired HumanEval-164 (153 vs 152) and the
+  multi-file editing instrument (4/34 vs 4/34 first attempt, 8/34 vs 9/34
+  overall, 34/34 edit-format compliance both), and finishes those runs 7-13%
+  sooner. Each extra draft position costs ~150 MiB, so it only clears the
+  200 MiB headroom standard one context step down from the ladder's own
+  choice -- 12,288 leaves just 54 MiB free and stays at depth 2, 8,192 leaves
+  210 and gets depth 3. `plan_launch` turns this on automatically whenever
+  the chosen context is 8,192, KV is q8_0, speculation is on with no
+  external drafter, `--streams` is 1, and `--long` is not in effect (the
+  MoE build has no depth-3 measurement and is unaffected). `revv doctor` and
+  `revv serve` state which depth applies; `revv bench` grades a depth-3
+  server against 40.1 instead of the depth-2 figure.
+
 ## [1.2.0] - 2026-09-14
 
 ### Added

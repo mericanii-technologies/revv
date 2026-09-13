@@ -917,7 +917,14 @@ The n-gram drafter costs nothing measurable on generation and is the whole editi
 | MoE | 16,384 | 3 | 51.1 | 11,917 | 126 | slower and fails |
 | MoE | 12,288 | 3 | 51.1 | 11,867 | 176 | slower |
 
-Depth 3 is worth 6 percent on the dense build at the cost of one context step (8K instead of 12K), because each extra draft position costs about 150 MiB. On the MoE it loses 13 percent on this prompt at any context, consistent with the original certification; the drafter sweep's parity at depth 3 was prompt-dependent. Nothing ships on speed alone: the dense 8K/depth-3 cell goes through paired HumanEval-164 and the editing instrument before it becomes an option.
+Depth 3 is worth 6 percent on the dense build at the cost of one context step (8K instead of 12K), because each extra draft position costs about 150 MiB. On the MoE it loses 13 percent on this prompt at any context, consistent with the original certification; the drafter sweep's parity at depth 3 was prompt-dependent. Quality gate, paired at 8,192 context on the dense build, same binary and session (`ollama:/data/scratch/queue/logs/12_dense_depth3_quality.log`):
+
+| depth | HumanEval-164 | editing, first / overall | edit-format | HumanEval wall | editing wall |
+|---|---|---|---|---|---|
+| 2 | 153 | 4 / 8 | 34 | 786 s | 776 s |
+| 3 | 152 | 4 / 9 | 34 | 730 s | 673 s |
+
+One HumanEval task apart, one editing task apart in the other direction, compliance identical: quality-neutral within the instruments' resolution, and 7 to 13 percent sooner to finish. Shipped as a planner rule in 1.2.1: the dense build uses draft depth 3 when the chosen context is 8,192 and the measured depth-3 peak clears the headroom standard; at 12,288 it stays at depth 2.
 
 ## Appendix: exact artifacts
 

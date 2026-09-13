@@ -48,6 +48,14 @@ here is measured; the protocols are in [BENCHMARKS.md](BENCHMARKS.md).
   cannot run the draft head per slot, and fails outright if it tries -- so a
   single stream is slower, but aggregate throughput is higher: 69.2 t/s on
   `moe` and 46.6 on `dense` at N=4, 78.7 and 57.1 at N=8. BENCHMARKS.md §21.
+- **`dense` runs draft depth 3 automatically at 8,192 context**: 40.1 t/s
+  against 37.9 at depth 2, quality-neutral by paired HumanEval-164 and the
+  editing instrument, on whichever config (explicit `--ctx 8192` or the
+  automatic ladder) lands there with q8_0 KV, a single stream and no external
+  drafter -- each extra draft position costs ~150 MiB, so it does not clear
+  the headroom standard at 12,288 and stays at depth 2 there. `doctor` and
+  `serve` say which depth applies; `bench` grades a depth-3 server against
+  40.1. BENCHMARKS.md §23.
 - **A prebuilt binary with the CUDA runtime bundled**, so a first install needs
   no compiler and no CUDA toolkit.
 - **Context sized to the VRAM that is actually free**, not the total, with a
